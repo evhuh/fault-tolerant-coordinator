@@ -159,9 +159,7 @@ func (c *countingReader) Read(p []byte) (int, error) {
 // Transport: fire-and-forget HTTP POSTs of marshaled raftpb.Messages
 // No retries, no acks, no ordering (Raft tolerates drop, reorder, and duplication), BUT never Step() a corrupt message
 func startReceiver(node raft.Node, selfURL string) {
-	// Dedicated mux + server, NOT http.HandleFunc/DefaultServeMux: the global
-	// mux would panic on double registration if two nodes ever share a
-	// process (Day 8's simulator runs the whole cluster in one binary).
+	// Dedicated mux + server, NOT http.HandleFunc/DefaultServeMux: the global mux would panic on double registration if two nodes ever share a process (Day 8's simulator runs the whole cluster in one binary).
 	mux := http.NewServeMux()
 	mux.HandleFunc("/raft", func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(r.Body)
