@@ -1,0 +1,122 @@
+syntax = "proto3";
+
+// The REPLICATED LOG schema: the closed set of commands, and nothing else,
+// that may mutate the StateStore.
+//
+// Rules that do NOT apply to scheduler.proto but DO apply here:
+//
+//   1. Every field must be DECIDED before the command is proposed. apply()
+//      runs on every replica and must be deterministic — no ID generation,
+//      no clock reads, no randomness downstream of this struct.
+//   2. Never renumber a field. Never reuse a retired number. Once bytes are
+//      in the log they are there forever, and restart replays them.
+//   3. Adding a field is safe (old decoders skip unknown numbers). Changing
+//      the MEANING of an existing field is not — bump `version` instead.
+package command.v1;
+
+option go_package = "github.com/evazheng/fault-tolerant-coordinator/proto/commandpb";
+
+import "scheduler.proto";
+
+// Envelope written to the Raft log. `version` exists so Day 7 can add new
+// command shapes while old decoders still understand yesterday's entries.
+message Command {
+  uint32 version = 1;
+
+  oneof kind {
+    SubmitJob      submit_job      = 2;
+    CreateEval     create_eval     = 3;
+    ApplyPlan      apply_plan      = 4;
+    CompleteTask   complete_task   = 5;
+    FailTask       fail_task       = 6;
+    RegisterWorker register_worker = 7;
+    Tick           tick            = 8;
+  }
+}
+
+// job_id and task_ids are assigned by the LEADER before proposing — the
+// client's request carried none. created_ms likewise comes from the leader,
+// never from a replica's clock.
+message SubmitJob {
+  string   client_id  = 1;
+  string   request_id = 2;
+  string   job_id     = 3;
+  repeated TaskEntry tasks = 4;
+  int32    priority   = 5;
+  int64    created_ms = 6;
+}
+
+message TaskEntry {
+  string                task_id = 1;
+  scheduler.v1.TaskSpec spec    = 2;
+}
+
+// "Something changed; someone should think about this job."
+enum EvalTrigger {
+  EVAL_TRIGGER_UNSPECIFIED   = 0;
+  EVAL_TRIGGER_JOB_SUBMITTED = 1;
+  EVAL_TRIGGER_TASK_FAILED   = 2;
+  EVAL_TRIGGER_WORKER_LOST   = 3;
+  EVAL_TRIGGER_LEASE_EXPIRED = 4;
+}
+
+message CreateEval {
+  string      eval_id      = 1;
+  string      job_id       = 2;
+  int32       priority     = 3;
+  EvalTrigger triggered_by = 4;
+  int64       created_ms   = 5;
+}
+
+// One accepted plan commits as ONE entry, however many assignments it carries.
+// That batching is what amortizes fsync across many scheduling decisions.
+message Assignment {
+  string task_id         = 1;
+  string worker_id       = 2;
+  int32  attempt         = 3;
+  int64  lease_expiry_ms = 4;
+}
+
+message Stop {
+  string task_id = 1;
+  string reason  = 2;
+}
+
+message ApplyPlan {
+  string              eval_id     = 1;
+  repeated Assignment assignments = 2;
+  repeated Stop       stops       = 3;
+}
+
+// result_ref is a path on the worker's disk. The output itself never enters
+// the log — only the reference and the exit code.
+message CompleteTask {
+  string task_id    = 1;
+  int32  attempt    = 2;
+  string worker_id  = 3;
+  string result_ref = 4;
+  int32  exit_code  = 5;
+  int64  completed_ms = 6;
+}
+
+message FailTask {
+  string task_id   = 1;
+  int32  attempt   = 2;
+  string worker_id = 3;
+  string error     = 4;
+  bool   retryable = 5;
+  int64  failed_ms = 6;
+}
+
+message RegisterWorker {
+  string worker_id       = 1;
+  int64  registered_ms   = 2;
+  int64  lease_expiry_ms = 3;
+}
+
+// The clock. Proposed by the leader every ~200ms; lease expiry reads now_ms
+// from the committed entry so every replica expires the same leases at the
+// same log position. This is why apply() never calls time.Now().
+message Tick {
+  int64 now_ms = 1;
+}

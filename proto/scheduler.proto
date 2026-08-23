@@ -1,0 +1,133 @@
+syntax = "proto3";
+
+// The EXTERNAL API: what clients and workers call over gRPC.
+//
+// Distinct from command.proto, which defines what goes into the Raft log.
+// These two schemas evolve under different pressure — breaking this one breaks clients (upgradeable); breaking command.proto breaks replay of data already on disk (not upgradeable).
+package scheduler.v1;
+
+option go_package = "github.com/evazheng/fault-tolerant-coordinator/proto/schedulerpb";
+
+
+
+// Shared enums and value types
+
+enum TaskState {
+  TASK_STATE_UNSPECIFIED = 0;
+  TASK_STATE_PENDING     = 1; // submitted, not yet assigned
+  TASK_STATE_ASSIGNED    = 2; // in a committed plan, worker hasn't picked it up
+  TASK_STATE_RUNNING     = 3; // worker acknowledged, lease is live
+  TASK_STATE_COMPLETE    = 4; // terminal, succeeded
+  TASK_STATE_FAILED      = 5; // terminal, retries exhausted
+}
+
+enum JobState {
+  JOB_STATE_UNSPECIFIED = 0;
+  JOB_STATE_PENDING     = 1;
+  JOB_STATE_RUNNING     = 2;
+  JOB_STATE_COMPLETE    = 3;
+  JOB_STATE_FAILED      = 4;
+}
+
+// What a client asks to have run. Note there is no task_id: IDs are assigned
+// by the coordinator, because apply must be deterministic on every replica.
+message TaskSpec {
+  string          command = 1; // binary to exec
+  repeated string args    = 2;
+  int64           timeout_ms = 3;
+  int32           max_attempts = 4;
+}
+
+message Task {
+  string    task_id   = 1;
+  string    job_id    = 2;
+  TaskSpec  spec      = 3;
+  TaskState state     = 4;
+  int32     attempt   = 5; // increments per dispatch; (task_id, attempt) is the idempotency key
+  string    worker_id = 6; // empty unless assigned
+  int64     lease_expiry_ms = 7;
+  string    result_ref = 8; // path on the worker's disk — NOT the output itself
+  int32     exit_code  = 9;
+}
+
+message Job {
+  string            job_id     = 1;
+  JobState          state      = 2;
+  repeated Task     tasks      = 3;
+  int64             created_ms = 4;
+}
+
+
+
+// Client-facing RPCs
+
+// (client_id, request_id) is the dedup key: a retried SubmitJob returns the
+// original response rather than creating a second job. See Day 5.
+message SubmitJobRequest {
+  string            client_id  = 1;
+  string            request_id = 2;
+  repeated TaskSpec tasks      = 3;
+  int32             priority   = 4;
+}
+
+message SubmitJobResponse {
+  string job_id = 1;
+}
+
+message GetJobRequest  { string job_id = 1; }
+message GetJobResponse { Job job = 1; }
+
+message ListJobsRequest  { int32 limit = 1; }
+message ListJobsResponse { repeated Job jobs = 1; }
+
+
+
+// Worker-facing RPCs — workers always dial in; the coordinator never dials out
+
+message RegisterWorkerRequest  { string worker_id = 1; }
+message RegisterWorkerResponse { int64 lease_ttl_ms = 1; }
+
+// Long-poll. Delivers an assignment that was already decided and committed by
+// an ApplyPlan — this RPC does not itself mutate state.
+message RequestTaskRequest {
+  string worker_id  = 1;
+  int64  wait_ms    = 2;
+}
+
+message RequestTaskResponse {
+  Task task = 1; // unset if nothing available before wait_ms elapsed
+}
+
+message HeartbeatRequest {
+  string          worker_id = 1;
+  repeated string running_task_ids = 2;
+}
+
+message HeartbeatResponse {
+  int64 lease_expiry_ms = 1;
+}
+
+message ReportResultRequest {
+  string worker_id  = 1;
+  string task_id    = 2;
+  int32  attempt    = 3; // together with task_id, makes re-delivery idempotent
+  int32  exit_code  = 4;
+  string result_ref = 5; // reference only; output stays on the worker's disk
+  string error      = 6;
+  bool   retryable  = 7;
+}
+
+message ReportResultResponse {}
+
+service Scheduler {
+  // Client
+  rpc SubmitJob (SubmitJobRequest) returns (SubmitJobResponse);
+  rpc GetJob    (GetJobRequest)    returns (GetJobResponse);
+  rpc ListJobs  (ListJobsRequest)  returns (ListJobsResponse);
+
+  // Worker
+  rpc RegisterWorker (RegisterWorkerRequest) returns (RegisterWorkerResponse);
+  rpc RequestTask    (RequestTaskRequest)    returns (RequestTaskResponse);
+  rpc Heartbeat      (HeartbeatRequest)      returns (HeartbeatResponse);
+  rpc ReportResult   (ReportResultRequest)   returns (ReportResultResponse);
+}
