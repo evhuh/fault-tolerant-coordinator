@@ -106,6 +106,8 @@ message FailTask {
   string error     = 4;
   bool   retryable = 5;
   int64  failed_ms = 6;
+  // Added after field 6 existed in logs. A NEW number is always safe: decoders that predate it skip an unknown field and keep going
+  int32  exit_code = 7;
 }
 
 message RegisterWorker {

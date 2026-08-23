@@ -747,13 +747,16 @@ func (x *CompleteTask) GetCompletedMs() int64 {
 }
 
 type FailTask struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	TaskId        string                 `protobuf:"bytes,1,opt,name=task_id,json=taskId,proto3" json:"task_id,omitempty"`
-	Attempt       int32                  `protobuf:"varint,2,opt,name=attempt,proto3" json:"attempt,omitempty"`
-	WorkerId      string                 `protobuf:"bytes,3,opt,name=worker_id,json=workerId,proto3" json:"worker_id,omitempty"`
-	Error         string                 `protobuf:"bytes,4,opt,name=error,proto3" json:"error,omitempty"`
-	Retryable     bool                   `protobuf:"varint,5,opt,name=retryable,proto3" json:"retryable,omitempty"`
-	FailedMs      int64                  `protobuf:"varint,6,opt,name=failed_ms,json=failedMs,proto3" json:"failed_ms,omitempty"`
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	TaskId    string                 `protobuf:"bytes,1,opt,name=task_id,json=taskId,proto3" json:"task_id,omitempty"`
+	Attempt   int32                  `protobuf:"varint,2,opt,name=attempt,proto3" json:"attempt,omitempty"`
+	WorkerId  string                 `protobuf:"bytes,3,opt,name=worker_id,json=workerId,proto3" json:"worker_id,omitempty"`
+	Error     string                 `protobuf:"bytes,4,opt,name=error,proto3" json:"error,omitempty"`
+	Retryable bool                   `protobuf:"varint,5,opt,name=retryable,proto3" json:"retryable,omitempty"`
+	FailedMs  int64                  `protobuf:"varint,6,opt,name=failed_ms,json=failedMs,proto3" json:"failed_ms,omitempty"`
+	// Added after field 6 existed in logs. A NEW number is always safe: decoders
+	// that predate it skip an unknown field and keep going.
+	ExitCode      int32 `protobuf:"varint,7,opt,name=exit_code,json=exitCode,proto3" json:"exit_code,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -826,6 +829,13 @@ func (x *FailTask) GetRetryable() bool {
 func (x *FailTask) GetFailedMs() int64 {
 	if x != nil {
 		return x.FailedMs
+	}
+	return 0
+}
+
+func (x *FailTask) GetExitCode() int32 {
+	if x != nil {
+		return x.ExitCode
 	}
 	return 0
 }
@@ -996,14 +1006,15 @@ const file_command_proto_rawDesc = "" +
 	"\n" +
 	"result_ref\x18\x04 \x01(\tR\tresultRef\x12\x1b\n" +
 	"\texit_code\x18\x05 \x01(\x05R\bexitCode\x12!\n" +
-	"\fcompleted_ms\x18\x06 \x01(\x03R\vcompletedMs\"\xab\x01\n" +
+	"\fcompleted_ms\x18\x06 \x01(\x03R\vcompletedMs\"\xc8\x01\n" +
 	"\bFailTask\x12\x17\n" +
 	"\atask_id\x18\x01 \x01(\tR\x06taskId\x12\x18\n" +
 	"\aattempt\x18\x02 \x01(\x05R\aattempt\x12\x1b\n" +
 	"\tworker_id\x18\x03 \x01(\tR\bworkerId\x12\x14\n" +
 	"\x05error\x18\x04 \x01(\tR\x05error\x12\x1c\n" +
 	"\tretryable\x18\x05 \x01(\bR\tretryable\x12\x1b\n" +
-	"\tfailed_ms\x18\x06 \x01(\x03R\bfailedMs\"z\n" +
+	"\tfailed_ms\x18\x06 \x01(\x03R\bfailedMs\x12\x1b\n" +
+	"\texit_code\x18\a \x01(\x05R\bexitCode\"z\n" +
 	"\x0eRegisterWorker\x12\x1b\n" +
 	"\tworker_id\x18\x01 \x01(\tR\bworkerId\x12#\n" +
 	"\rregistered_ms\x18\x02 \x01(\x03R\fregisteredMs\x12&\n" +

@@ -7,9 +7,7 @@
 // The EXTERNAL API: what clients and workers call over gRPC.
 //
 // Distinct from command.proto, which defines what goes into the Raft log.
-// These two schemas evolve under different pressure — breaking this one
-// breaks clients (upgradeable); breaking command.proto breaks replay of data
-// already on disk (not upgradeable).
+// These two schemas evolve under different pressure — breaking this one breaks clients (upgradeable); breaking command.proto breaks replay of data already on disk (not upgradeable).
 
 package schedulerpb
 
