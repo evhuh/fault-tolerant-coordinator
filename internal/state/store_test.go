@@ -10,8 +10,6 @@ import (
 	schedulerpb "github.com/evazheng/fault-tolerant-coordinator/proto/schedulerpb"
 )
 
-
-
 // Helpers
 
 func submitJobCmd(jobID, clientID, requestID string, taskIDs ...string) *commandpb.Command {
@@ -185,8 +183,6 @@ func mustApply(t *testing.T, s *StateStore, cmd *commandpb.Command) Result {
 	return res
 }
 
-
-
 // SubmitJob
 func TestSubmitJobCreatesJobAndPendingTasks(t *testing.T) {
 	s := New()
@@ -346,8 +342,6 @@ func TestSubmitJobDefaultsMaxAttempts(t *testing.T) {
 		t.Errorf("MaxAttempts = %d, want default %d", task.Spec.MaxAttempts, defaultMaxAttempts)
 	}
 }
-
-
 
 // RegisterWorker
 
@@ -618,6 +612,52 @@ func TestTickExpiredLeaseReclaimsTaskWithoutTouchingAttempt(t *testing.T) {
 	}
 }
 
+// A task whose lease expires on its LAST permitted attempt must go terminal,
+// not back to PENDING. applyPlan rejects any assignment asking for
+// attempt > MaxAttempts, so a PENDING task at the attempt cap is
+// undispatchable forever: a scheduler scanning for PENDING work would pick it,
+// propose, be rejected, and spin. It would also never reach a terminal state,
+// which is one of the invariants the whole project claims.
+func TestTickExhaustedAttemptsGoesTerminalInsteadOfPending(t *testing.T) {
+	s := seedCluster(t, 1) // MaxAttempts = 3
+
+	// Attempts 1 and 2 are reclaimed normally: budget remains.
+	mustApply(t, s, applyPlanCmd("eval-1", []assign{{"task-1", "w-1", 1, 5000}}))
+	mustApply(t, s, tickCmd(5001))
+	mustApply(t, s, applyPlanCmd("eval-2", []assign{{"task-1", "w-1", 2, 8000}}))
+	res := mustApply(t, s, tickCmd(8001))
+	if task, _ := s.Task("task-1"); task.State != TaskPending {
+		t.Fatalf("state = %s after attempt 2 expired, want PENDING (budget remains)", task.State)
+	}
+	if len(res.EvalTriggers) != 1 {
+		t.Fatalf("EvalTriggers = %+v, want one while the task is still retryable", res.EvalTriggers)
+	}
+
+	// Attempt 3 is the last one MaxAttempts permits. Its expiry is terminal.
+	mustApply(t, s, registerWorkerCmd("w-1", 500, 20000))
+	mustApply(t, s, applyPlanCmd("eval-3", []assign{{"task-1", "w-1", 3, 15000}}))
+	res = mustApply(t, s, tickCmd(15001))
+
+	task, _ := s.Task("task-1")
+	if task.State != TaskFailed {
+		t.Errorf("state = %s after the last attempt expired, want FAILED", task.State)
+	}
+	if task.WorkerID != "" || task.LeaseExpiryMs != 0 {
+		t.Errorf("worker = %q lease = %d, want both cleared", task.WorkerID, task.LeaseExpiryMs)
+	}
+	if task.LastError == "" {
+		t.Error("LastError is empty; a terminal reclaim should record why")
+	}
+	// No eval: there is nothing left for a scheduler to decide about this task.
+	if len(res.EvalTriggers) != 0 {
+		t.Errorf("EvalTriggers = %+v, want none for an exhausted task", res.EvalTriggers)
+	}
+	// The job is derived from its tasks, so it must settle too.
+	if job, _ := s.Job("job-1"); job.State != JobFailed {
+		t.Errorf("job state = %s, want FAILED", job.State)
+	}
+}
+
 // CompleteTask / FailTask
 
 func TestCompleteTaskMarksCompleteAndFinishesJob(t *testing.T) {
@@ -640,8 +680,7 @@ func TestCompleteTaskMarksCompleteAndFinishesJob(t *testing.T) {
 	}
 }
 
-// The Day 5 checkpoint in miniature: a slow worker's late report must not
-// produce a second observable effect.
+// a slow worker's late report must not produce a second observable effect
 func TestStaleReportFromSlowWorkerIsIgnored(t *testing.T) {
 	s := seedCluster(t, 1)
 	mustApply(t, s, applyPlanCmd("eval-1", []assign{{"task-1", "w-1", 1, 5000}}))
@@ -911,8 +950,6 @@ func TestReadsReturnCopies(t *testing.T) {
 		t.Error("mutating a returned Task's Args corrupted live state")
 	}
 }
-
-
 
 // The closed command set
 

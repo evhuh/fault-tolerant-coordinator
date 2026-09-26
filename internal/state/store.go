@@ -409,6 +409,7 @@ func (s *StateStore) applyRegisterWorker(c *commandpb.RegisterWorker) (Result, e
 	(2) Expire worker leases:  ALIVE + lease < now  →  LOST
 	(3) Expire task leases:    ASSIGNED/RUNNING + lease < now  →  PENDING
 	        Attempt is NOT touched here — it is a dispatch counter, incremented only by ApplyPlan. That is what makes a slow worker's late report (carrying an older attempt) detectably stale rather than a duplicate.
+	        BUT reclaim must respect the same attempt budget ApplyPlan enforces: a task already at MaxAttempts goes terminal FAILED instead of PENDING. Otherwise it would sit PENDING forever — every plan naming it asks for attempt MaxAttempts+1, which applyPlan rejects — and a scheduler that scans for PENDING work would pick it, propose, be rejected, and spin. Permanently-PENDING also breaks "every submitted task reaches a terminal state".
 	Both scans are over SORTED ids
 */
 func (s *StateStore) applyTick(c *commandpb.Tick) (Result, error) {
@@ -450,9 +451,21 @@ func (s *StateStore) applyTick(c *commandpb.Tick) (Result, error) {
 		if workerLost {
 			reason = EvalWorkerLost
 		}
-		t.State = TaskPending
 		t.WorkerID = ""
 		t.LeaseExpiryMs = 0
+
+		// The attempt budget is shared by both failure paths. FailTask retries
+		// while Attempt < MaxAttempts; reclaim must agree, or it hands the
+		// scheduler a task no ApplyPlan can ever satisfy.
+		if t.Attempt >= t.Spec.MaxAttempts {
+			t.State = TaskFailed
+			t.LastError = fmt.Sprintf("lease expired on attempt %d of %d (%s)",
+				t.Attempt, t.Spec.MaxAttempts, reason)
+			s.recomputeJobState(t.JobID)
+			continue
+		}
+
+		t.State = TaskPending
 		res.EvalTriggers = append(res.EvalTriggers, EvalTrigger{
 			JobID:  t.JobID,
 			TaskID: t.ID,
