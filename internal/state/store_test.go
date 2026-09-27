@@ -53,6 +53,14 @@ func registerWorkerCmd(workerID string, registeredMs, leaseExpiryMs int64) *comm
 	}
 }
 
+// heartbeatCmd is a RegisterWorker carrying a claim. There is no Heartbeat
+// command: renewal and acknowledgement are the same idempotent path.
+func heartbeatCmd(workerID string, leaseExpiryMs int64, runningTaskIDs ...string) *commandpb.Command {
+	cmd := registerWorkerCmd(workerID, 500, leaseExpiryMs)
+	cmd.GetRegisterWorker().RunningTaskIds = runningTaskIDs
+	return cmd
+}
+
 func tickCmd(nowMs int64) *commandpb.Command {
 	return &commandpb.Command{
 		Version: 1,
@@ -382,6 +390,79 @@ func TestRegisterWorkerRenewsLeaseIdempotently(t *testing.T) {
 	// RegisteredMs records the FIRST registration and must not be overwritten.
 	if w.RegisteredMs != 1000 {
 		t.Errorf("registered = %d, want the original 1000", w.RegisteredMs)
+	}
+}
+
+// The heartbeat's claim is what produces RUNNING. Nothing else does
+func TestHeartbeatClaimPromotesAssignedToRunning(t *testing.T) {
+	s := seedCluster(t, 2)
+	mustApply(t, s, applyPlanCmd("eval-1", []assign{
+		{"task-1", "w-1", 1, 5000},
+		{"task-2", "w-1", 1, 5000},
+	}))
+
+	// The worker picked up task-1 and says so; task-2 is still just assigned
+	mustApply(t, s, heartbeatCmd("w-1", 12000, "task-1"))
+
+	if task, _ := s.Task("task-1"); task.State != TaskRunning {
+		t.Errorf("task-1 state = %s, want RUNNING (the worker claimed it)", task.State)
+	}
+	if task, _ := s.Task("task-2"); task.State != TaskAssigned {
+		t.Errorf("task-2 state = %s, want ASSIGNED (unclaimed)", task.State)
+	}
+	// Renewal still extends BOTH, or Tick would reclaim work from a healthy worker that simply has not started one of its tasks yet
+	for _, id := range []string{"task-1", "task-2"} {
+		if task, _ := s.Task(id); task.LeaseExpiryMs != 12000 {
+			t.Errorf("%s lease = %d, want 12000", id, task.LeaseExpiryMs)
+		}
+	}
+}
+
+// A worker may only speak for tasks it holds, and a claim never resurrects a terminal task. Both are silent no-ops: a heartbeat racing a reassignment is normal, not an error
+func TestHeartbeatClaimIgnoresTasksTheWorkerDoesNotHold(t *testing.T) {
+	s := seedCluster(t, 2)
+	mustApply(t, s, registerWorkerCmd("w-2", 500, 9000))
+	mustApply(t, s, applyPlanCmd("eval-1", []assign{
+		{"task-1", "w-1", 1, 5000},
+		{"task-2", "w-2", 1, 5000},
+	}))
+	mustApply(t, s, completeTaskCmd("task-1", "w-1", 1, "/out/1"))
+
+	// w-2 claims a task it lost AND one that is already complete
+	mustApply(t, s, heartbeatCmd("w-2", 12000, "task-1", "task-2"))
+
+	if task, _ := s.Task("task-1"); task.State != TaskComplete {
+		t.Errorf("task-1 state = %s, want COMPLETE — a foreign claim must not touch it", task.State)
+	}
+	if task, _ := s.Task("task-2"); task.State != TaskRunning {
+		t.Errorf("task-2 state = %s, want RUNNING", task.State)
+	}
+}
+
+// RUNNING is not a new lifecycle, just an earlier one: everything downstream of ASSIGNED must still work from RUNNING
+func TestRunningTaskStillCompletesAndReclaims(t *testing.T) {
+	s := seedCluster(t, 1)
+	mustApply(t, s, applyPlanCmd("eval-1", []assign{{"task-1", "w-1", 1, 5000}}))
+	mustApply(t, s, heartbeatCmd("w-1", 5000, "task-1"))
+
+	// Reclaim out of RUNNING, attempt untouched
+	mustApply(t, s, tickCmd(5001))
+	task, _ := s.Task("task-1")
+	if task.State != TaskPending || task.Attempt != 1 {
+		t.Fatalf("state = %s attempt = %d, want PENDING/1", task.State, task.Attempt)
+	}
+
+	// Redispatch, claim, complete
+	mustApply(t, s, registerWorkerCmd("w-1", 500, 20000))
+	mustApply(t, s, applyPlanCmd("eval-2", []assign{{"task-1", "w-1", 2, 15000}}))
+	mustApply(t, s, heartbeatCmd("w-1", 15000, "task-1"))
+	mustApply(t, s, completeTaskCmd("task-1", "w-1", 2, "/out/2"))
+
+	if task, _ := s.Task("task-1"); task.State != TaskComplete {
+		t.Errorf("state = %s, want COMPLETE from RUNNING", task.State)
+	}
+	if job, _ := s.Job("job-1"); job.State != JobComplete {
+		t.Errorf("job state = %s, want COMPLETE", job.State)
 	}
 }
 

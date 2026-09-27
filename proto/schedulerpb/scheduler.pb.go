@@ -220,6 +220,7 @@ type Task struct {
 	LeaseExpiryMs int64                  `protobuf:"varint,7,opt,name=lease_expiry_ms,json=leaseExpiryMs,proto3" json:"lease_expiry_ms,omitempty"`
 	ResultRef     string                 `protobuf:"bytes,8,opt,name=result_ref,json=resultRef,proto3" json:"result_ref,omitempty"` // path on the worker's disk — NOT the output itself
 	ExitCode      int32                  `protobuf:"varint,9,opt,name=exit_code,json=exitCode,proto3" json:"exit_code,omitempty"`
+	LastError     string                 `protobuf:"bytes,10,opt,name=last_error,json=lastError,proto3" json:"last_error,omitempty"` // why the last attempt failed; empty on success
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -315,6 +316,13 @@ func (x *Task) GetExitCode() int32 {
 		return x.ExitCode
 	}
 	return 0
+}
+
+func (x *Task) GetLastError() string {
+	if x != nil {
+		return x.LastError
+	}
+	return ""
 }
 
 type Job struct {
@@ -1095,7 +1103,7 @@ const file_scheduler_proto_rawDesc = "" +
 	"\x04args\x18\x02 \x03(\tR\x04args\x12\x1d\n" +
 	"\n" +
 	"timeout_ms\x18\x03 \x01(\x03R\ttimeoutMs\x12!\n" +
-	"\fmax_attempts\x18\x04 \x01(\x05R\vmaxAttempts\"\xac\x02\n" +
+	"\fmax_attempts\x18\x04 \x01(\x05R\vmaxAttempts\"\xcb\x02\n" +
 	"\x04Task\x12\x17\n" +
 	"\atask_id\x18\x01 \x01(\tR\x06taskId\x12\x15\n" +
 	"\x06job_id\x18\x02 \x01(\tR\x05jobId\x12*\n" +
@@ -1106,7 +1114,10 @@ const file_scheduler_proto_rawDesc = "" +
 	"\x0flease_expiry_ms\x18\a \x01(\x03R\rleaseExpiryMs\x12\x1d\n" +
 	"\n" +
 	"result_ref\x18\b \x01(\tR\tresultRef\x12\x1b\n" +
-	"\texit_code\x18\t \x01(\x05R\bexitCode\"\x93\x01\n" +
+	"\texit_code\x18\t \x01(\x05R\bexitCode\x12\x1d\n" +
+	"\n" +
+	"last_error\x18\n" +
+	" \x01(\tR\tlastError\"\x93\x01\n" +
 	"\x03Job\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\tR\x05jobId\x12,\n" +
 	"\x05state\x18\x02 \x01(\x0e2\x16.scheduler.v1.JobStateR\x05state\x12(\n" +

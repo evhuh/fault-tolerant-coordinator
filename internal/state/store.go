@@ -228,6 +228,15 @@ func (s *StateStore) sortedTaskIDs() []string {
 	return ids
 }
 
+func (s *StateStore) sortedJobIDs() []string {
+	ids := make([]string, 0, len(s.jobs))
+	for id := range s.jobs {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids
+}
+
 func (s *StateStore) sortedWorkerIDs() []string {
 	ids := make([]string, 0, len(s.workers))
 	for id := range s.workers {
@@ -361,9 +370,18 @@ func specFromProto(p *schedulerpb.TaskSpec) TaskSpec {
 	Renewal also extends the leases of that worker's live tasks. Otherwise Tick
 	would reclaim work out from under a perfectly healthy worker.
 
+	It is ALSO the worker's acknowledgement. running_task_ids names the tasks
+	the worker reports itself actively executing, and that is what promotes
+	ASSIGNED -> RUNNING. There is deliberately no eighth command and no ack
+	RPC: RequestTask only DELIVERS a decision ApplyPlan already committed, so
+	it must stay a pure read. Folding the ack into renewal keeps the command
+	set closed and makes registration, renewal, and acknowledgement one
+	idempotent path.
+
 	(1) Validate
 	(2) Create or revive the worker, set its lease
-	(3) Extend leases on its ASSIGNED/RUNNING tasks (sorted scan)
+	(3) Extend leases on its ASSIGNED/RUNNING tasks, and promote the ones it
+	    claims to be running (sorted scan)
 */
 func (s *StateStore) applyRegisterWorker(c *commandpb.RegisterWorker) (Result, error) {
 	if c == nil {
@@ -385,19 +403,29 @@ func (s *StateStore) applyRegisterWorker(c *commandpb.RegisterWorker) (Result, e
 	w.State = WorkerAlive
 	w.LeaseExpiryMs = c.GetLeaseExpiryMs()
 
+	// Membership set for the worker's claim. Building it is deterministic; only the SCAN below may influence state, and that is over sorted ids
+	claimed := make(map[string]bool, len(c.GetRunningTaskIds()))
+	for _, id := range c.GetRunningTaskIds() {
+		claimed[id] = true
+	}
+
 	// (3) Sorted scan: map order must never influence resulting state
 	for _, id := range s.sortedTaskIDs() {
 		t := s.tasks[id]
+		// A worker may only speak for tasks it actually holds. A claim on someone else's task, or on a task already terminal, is ignored silently- deterministically, on every replica- because a stale heartbeat from a worker whose lease already lapsed is normal
 		if t.WorkerID != w.ID {
 			continue
 		}
-		if t.State == TaskAssigned || t.State == TaskRunning {
-			t.LeaseExpiryMs = c.GetLeaseExpiryMs()
+		if t.State != TaskAssigned && t.State != TaskRunning {
+			continue
+		}
+		t.LeaseExpiryMs = c.GetLeaseExpiryMs()
+		if t.State == TaskAssigned && claimed[t.ID] {
+			t.State = TaskRunning
 		}
 	}
 	return Result{WorkerID: w.ID}, nil
 }
-
 
 // 3. Tick
 /*
@@ -474,7 +502,6 @@ func (s *StateStore) applyTick(c *commandpb.Tick) (Result, error) {
 	}
 	return res, nil
 }
-
 
 // 4. ApplyPlan
 /*
@@ -571,8 +598,7 @@ func (s *StateStore) applyPlan(c *commandpb.ApplyPlan) (Result, error) {
 	return res, nil
 }
 
-
-// staleReport reports whether a CompleteTask/FailTask names an attempt that is no longer the live one. This is the heart of effectively-once: 
+// staleReport reports whether a CompleteTask/FailTask names an attempt that is no longer the live one. This is the heart of effectively-once:
 // worker A gets attempt 1 -> goes slow (not dead) -> lease expires -> task reclaimed -> worker B gets attempt 2 → worker A finally reports A's report carries attempt 1 while the task is at 2. Ignoring it (silently, deterministically, on every replica) is what turns at-least-once DELIVERY into effectively-once EFFECTS
 func staleReport(t *Task, attempt int32) bool {
 	return attempt != t.Attempt
@@ -642,7 +668,6 @@ func (s *StateStore) applyCompleteTask(c *commandpb.CompleteTask) (Result, error
 	return Result{JobID: t.JobID}, nil
 }
 
-
 // 6. FailTask
 /*
 	A worker finished attempt N unsuccessfully — or the executor timed out.
@@ -689,7 +714,6 @@ func (s *StateStore) applyFailTask(c *commandpb.FailTask) (Result, error) {
 	s.recomputeJobState(t.JobID)
 	return res, nil
 }
-
 
 // 7. CreateEval
 /*
@@ -744,9 +768,6 @@ func evalReasonFromProto(t commandpb.EvalTrigger) EvalReason {
 	return EvalJobSubmitted
 }
 
-
-
-
 // Reads. All return copies: callers must never hold a pointer into live state, which is also the discipline scheduler workers (TOOD) depend on when they read a snapshot concurrently
 
 func (s *StateStore) NowMs() int64 { return s.nowMs }
@@ -786,6 +807,11 @@ func (s *StateStore) Eval(id string) (Eval, bool) {
 	}
 	return *e, true
 }
+
+// JobIDs, TaskIDs, and WorkerIDs enumerate state in sorted order, so a caller that scans them makes the same decision on every replica. Pair them with Job/Task/Worker, which return copies — never hold a pointer into live state
+func (s *StateStore) JobIDs() []string    { return s.sortedJobIDs() }
+func (s *StateStore) TaskIDs() []string   { return s.sortedTaskIDs() }
+func (s *StateStore) WorkerIDs() []string { return s.sortedWorkerIDs() }
 
 func (s *StateStore) JobCount() int    { return len(s.jobs) }
 func (s *StateStore) TaskCount() int   { return len(s.tasks) }

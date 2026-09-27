@@ -20,12 +20,13 @@
 package commandpb
 
 import (
-	schedulerpb "github.com/evazheng/fault-tolerant-coordinator/proto/schedulerpb"
-	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
-	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 	reflect "reflect"
 	sync "sync"
 	unsafe "unsafe"
+
+	schedulerpb "github.com/evazheng/fault-tolerant-coordinator/proto/schedulerpb"
+	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
+	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 )
 
 const (
@@ -754,8 +755,7 @@ type FailTask struct {
 	Error     string                 `protobuf:"bytes,4,opt,name=error,proto3" json:"error,omitempty"`
 	Retryable bool                   `protobuf:"varint,5,opt,name=retryable,proto3" json:"retryable,omitempty"`
 	FailedMs  int64                  `protobuf:"varint,6,opt,name=failed_ms,json=failedMs,proto3" json:"failed_ms,omitempty"`
-	// Added after field 6 existed in logs. A NEW number is always safe: decoders
-	// that predate it skip an unknown field and keep going.
+	// Added after field 6 existed in logs. A NEW number is always safe: decoders that predate it skip an unknown field and keep going
 	ExitCode      int32 `protobuf:"varint,7,opt,name=exit_code,json=exitCode,proto3" json:"exit_code,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -845,8 +845,15 @@ type RegisterWorker struct {
 	WorkerId      string                 `protobuf:"bytes,1,opt,name=worker_id,json=workerId,proto3" json:"worker_id,omitempty"`
 	RegisteredMs  int64                  `protobuf:"varint,2,opt,name=registered_ms,json=registeredMs,proto3" json:"registered_ms,omitempty"`
 	LeaseExpiryMs int64                  `protobuf:"varint,3,opt,name=lease_expiry_ms,json=leaseExpiryMs,proto3" json:"lease_expiry_ms,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	// Tasks this worker reports itself actively executing, carried up by the
+	// Heartbeat RPC. This is what promotes ASSIGNED -> RUNNING: there is no
+	// separate ack command, because the command set stays closed and
+	// RequestTask must remain a pure read.
+	//
+	// Added after fields 1-3 were already in logs. A new number is always safe.
+	RunningTaskIds []string `protobuf:"bytes,4,rep,name=running_task_ids,json=runningTaskIds,proto3" json:"running_task_ids,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *RegisterWorker) Reset() {
@@ -900,9 +907,14 @@ func (x *RegisterWorker) GetLeaseExpiryMs() int64 {
 	return 0
 }
 
-// The clock. Proposed by the leader every ~200ms; lease expiry reads now_ms
-// from the committed entry so every replica expires the same leases at the
-// same log position. This is why apply() never calls time.Now().
+func (x *RegisterWorker) GetRunningTaskIds() []string {
+	if x != nil {
+		return x.RunningTaskIds
+	}
+	return nil
+}
+
+// The clock. Proposed by the leader every ~200ms; lease expiry reads now_ms from the committed entry so every replica expires the same leases at the same log position. This is why apply() never calls time.Now()
 type Tick struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	NowMs         int64                  `protobuf:"varint,1,opt,name=now_ms,json=nowMs,proto3" json:"now_ms,omitempty"`
@@ -1014,11 +1026,12 @@ const file_command_proto_rawDesc = "" +
 	"\x05error\x18\x04 \x01(\tR\x05error\x12\x1c\n" +
 	"\tretryable\x18\x05 \x01(\bR\tretryable\x12\x1b\n" +
 	"\tfailed_ms\x18\x06 \x01(\x03R\bfailedMs\x12\x1b\n" +
-	"\texit_code\x18\a \x01(\x05R\bexitCode\"z\n" +
+	"\texit_code\x18\a \x01(\x05R\bexitCode\"\xa4\x01\n" +
 	"\x0eRegisterWorker\x12\x1b\n" +
 	"\tworker_id\x18\x01 \x01(\tR\bworkerId\x12#\n" +
 	"\rregistered_ms\x18\x02 \x01(\x03R\fregisteredMs\x12&\n" +
-	"\x0flease_expiry_ms\x18\x03 \x01(\x03R\rleaseExpiryMs\"\x1d\n" +
+	"\x0flease_expiry_ms\x18\x03 \x01(\x03R\rleaseExpiryMs\x12(\n" +
+	"\x10running_task_ids\x18\x04 \x03(\tR\x0erunningTaskIds\"\x1d\n" +
 	"\x04Tick\x12\x15\n" +
 	"\x06now_ms\x18\x01 \x01(\x03R\x05nowMs*\xa7\x01\n" +
 	"\vEvalTrigger\x12\x1c\n" +

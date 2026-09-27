@@ -48,6 +48,7 @@ message Task {
   int64     lease_expiry_ms = 7;
   string    result_ref = 8; // path on the worker's disk — NOT the output itself
   int32     exit_code  = 9;
+  string    last_error = 10; // why the last attempt failed; empty on success
 }
 
 message Job {
