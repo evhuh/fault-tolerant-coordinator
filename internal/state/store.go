@@ -137,6 +137,12 @@ type Result struct {
 	JobID    string
 	WorkerID string
 	EvalID   string
+	// PlanApplied and PlanSkipped report how much of an ApplyPlan took
+	// effect. A skip is an optimistic-concurrency conflict: the plan was built
+	// against state that moved before the entry committed. Computed
+	// identically on every replica; only the leader meters it.
+	PlanApplied int
+	PlanSkipped int
 	// WorkerAdmitted is true when a RegisterWorker CREATED or REVIVED a
 	// worker, as opposed to merely renewing a live one's lease. That
 	// distinction matters to the leader: new capacity should wake evals
@@ -602,12 +608,15 @@ func (s *StateStore) applyTick(c *commandpb.Tick) (Result, error) {
 
 	One accepted plan commits as ONE Raft entry however many assignments it carries- that batching is what amortizes fsync across many scheduling decisions, and it is the throughput argument the whole design rests on.
 
-	ALL-OR-NOTHING. The planner has already verified this plan against current state before proposing it (that is what optimistic concurrency means here), so by the time apply sees it, it should be valid. If any piece is not, the whole plan is rejected — a partially-applied plan would diverge replicas that gave up at different points.
+	DETERMINISTIC PARTIAL APPLY. The planner verified this plan against current state before proposing it, but under Raft there is a real gap between that check and this apply: Tick, CompleteTask, or FailTask can commit in between and invalidate a single assignment. Rejecting the whole batch for one stale entry would throw away 99 good assignments because one worker's lease lapsed 2ms earlier — a throughput cliff under fault injection.
 
-	(1) Validate every assignment and stop
-	(2) Apply stops:       ASSIGNED/RUNNING → PENDING, worker cleared
-	(3) Apply assignments: PENDING → ASSIGNED, Attempt := assignment.Attempt
-	(4) Promote the job to RUNNING on its first assignment
+	So invalid assignments are SKIPPED and the rest apply. This is still deterministic, which is the only property that matters: every replica sees the identical state at the identical log position, so every replica skips exactly the same assignments. Determinism does not require all-or-nothing; it requires that the decision be a pure function of (state, command), and skipping is.
+
+	Malformed commands are still errors — a nil payload or an empty eval_id is a bug in the proposer, not a race.
+
+	(1) Apply stops:       ASSIGNED/RUNNING → PENDING, worker cleared
+	(2) Apply assignments: PENDING → ASSIGNED, Attempt := assignment.Attempt
+	(3) Promote the job to RUNNING on its first assignment
 */
 func (s *StateStore) applyPlan(c *commandpb.ApplyPlan) (Result, error) {
 	if c == nil {
@@ -617,84 +626,77 @@ func (s *StateStore) applyPlan(c *commandpb.ApplyPlan) (Result, error) {
 		return Result{}, fmt.Errorf("apply plan: empty eval_id")
 	}
 
-	// (1) Validate everything first
-	seen := make(map[string]bool, len(c.GetAssignments()))
-	for _, a := range c.GetAssignments() {
-		t, ok := s.tasks[a.GetTaskId()]
-		if !ok {
-			return Result{}, fmt.Errorf("apply plan: unknown task %q", a.GetTaskId())
-		}
-		if seen[a.GetTaskId()] {
-			return Result{}, fmt.Errorf("apply plan: task %q assigned twice in one plan", a.GetTaskId())
-		}
-		seen[a.GetTaskId()] = true
-
-		if t.State != TaskPending {
-			return Result{}, fmt.Errorf("apply plan: task %q is %s, want PENDING", t.ID, t.State)
-		}
-		// Attempt is a strict dispatch counter. Anything else means the planner worked from a stale snapshot and the plan must not commit
-		if a.GetAttempt() != t.Attempt+1 {
-			return Result{}, fmt.Errorf("apply plan: task %q attempt %d, want %d (stale plan)",
-				t.ID, a.GetAttempt(), t.Attempt+1)
-		}
-		if a.GetAttempt() > t.Spec.MaxAttempts {
-			return Result{}, fmt.Errorf("apply plan: task %q attempt %d exceeds max_attempts %d",
-				t.ID, a.GetAttempt(), t.Spec.MaxAttempts)
-		}
-		w, ok := s.workers[a.GetWorkerId()]
-		if !ok {
-			return Result{}, fmt.Errorf("apply plan: unknown worker %q", a.GetWorkerId())
-		}
-		if w.State != WorkerAlive {
-			return Result{}, fmt.Errorf("apply plan: worker %q is %s, want ALIVE", w.ID, w.State)
-		}
-		if a.GetLeaseExpiryMs() <= s.nowMs {
-			return Result{}, fmt.Errorf("apply plan: task %q lease %d already expired at now=%d",
-				t.ID, a.GetLeaseExpiryMs(), s.nowMs)
-		}
-		// The scheduler filters these out and the planner re-checks; this is
-		// the backstop that makes the rule true on every replica regardless.
-		if t.NotBeforeMs > s.nowMs {
-			return Result{}, fmt.Errorf("apply plan: task %q is backing off until %d (now=%d)",
-				t.ID, t.NotBeforeMs, s.nowMs)
-		}
-	}
-	for _, st := range c.GetStops() {
-		t, ok := s.tasks[st.GetTaskId()]
-		if !ok {
-			return Result{}, fmt.Errorf("apply plan: stop names unknown task %q", st.GetTaskId())
-		}
-		if t.State != TaskAssigned && t.State != TaskRunning {
-			return Result{}, fmt.Errorf("apply plan: cannot stop task %q in state %s", t.ID, t.State)
-		}
-	}
-
 	var res Result
 	res.EvalID = c.GetEvalId()
 
-	// (2) Stops first: a plan may stop a task on one worker and re-assign it
+	// (1) Stops first: a plan may stop a task on one worker and re-assign it.
 	for _, st := range c.GetStops() {
-		t := s.tasks[st.GetTaskId()]
+		t, ok := s.tasks[st.GetTaskId()]
+		if !ok || (t.State != TaskAssigned && t.State != TaskRunning) {
+			res.PlanSkipped++
+			continue
+		}
 		t.State = TaskPending
 		t.WorkerID = ""
 		t.LeaseExpiryMs = 0
 		t.LastError = st.GetReason()
+		res.PlanApplied++
 	}
 
-	// (3) Assignments
+	// (2) Assignments. Each is validated on its own and skipped if it no
+	// longer holds; the rest still apply.
+	seen := make(map[string]bool, len(c.GetAssignments()))
 	for _, a := range c.GetAssignments() {
-		t := s.tasks[a.GetTaskId()]
+		if seen[a.GetTaskId()] {
+			res.PlanSkipped++ // the same task twice in one plan is a proposer bug
+			continue
+		}
+		t, ok := s.tasks[a.GetTaskId()]
+		if !ok {
+			res.PlanSkipped++
+			continue
+		}
+		// Someone else got there first: already assigned, running, terminal.
+		if t.State != TaskPending {
+			res.PlanSkipped++
+			continue
+		}
+		// Attempt is a strict dispatch counter. Anything else means the plan
+		// was built against a snapshot that predates a reclaim.
+		if a.GetAttempt() != t.Attempt+1 || a.GetAttempt() > t.Spec.MaxAttempts {
+			res.PlanSkipped++
+			continue
+		}
+		w, ok := s.workers[a.GetWorkerId()]
+		if !ok || w.State != WorkerAlive {
+			res.PlanSkipped++ // the worker died between verify and commit
+			continue
+		}
+		if a.GetLeaseExpiryMs() <= s.nowMs {
+			res.PlanSkipped++
+			continue
+		}
+		// The scheduler filters these and the planner re-checks; this is the
+		// backstop that makes the rule true on every replica regardless.
+		if t.NotBeforeMs > s.nowMs {
+			res.PlanSkipped++
+			continue
+		}
+
+		seen[a.GetTaskId()] = true
 		t.State = TaskAssigned
 		t.NotBeforeMs = 0 // dispatched; the backoff is spent
 		t.WorkerID = a.GetWorkerId()
 		t.Attempt = a.GetAttempt()
 		t.LeaseExpiryMs = a.GetLeaseExpiryMs()
+		res.PlanApplied++
 
-		// (4)
+		// (3) First assignment promotes the job.
 		if j, ok := s.jobs[t.JobID]; ok && j.State == JobPending {
 			j.State = JobRunning
 		}
 	}
+
 	return res, nil
 }
 

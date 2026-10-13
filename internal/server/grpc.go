@@ -34,6 +34,30 @@ type Service struct {
 
 func NewService(c *Coordinator) *Service { return &Service{c: c} }
 
+// notLeader is the redirect. Returning FAILED_PRECONDITION with the leader's
+// address in the message lets a client retry against the right node without
+// a discovery mechanism.
+//
+// Reads go through this too. A follower's state is a prefix of the leader's,
+// so serving a read from one would be stale by construction — and the LEADER
+// serving reads from local state is itself non-linearizable on the minority
+// side of a partition. That is Day 9's bug to hunt, and the fix (a ReadIndex
+// barrier) lands in Coordinator.read.
+func (s *Service) notLeader() error {
+	if addr, ok := s.c.LeaderAddr(); ok {
+		return status.Errorf(codes.FailedPrecondition, "NOT_LEADER: leader is at %s", addr)
+	}
+	return status.Error(codes.Unavailable, "NOT_LEADER: no leader elected")
+}
+
+// requireLeader guards every RPC that must not be served by a follower.
+func (s *Service) requireLeader() error {
+	if !s.c.IsLeader() {
+		return s.notLeader()
+	}
+	return nil
+}
+
 // Coordinator exposes the Service's owner so cmd/coordinator can run the
 // ticker alongside it.
 func (s *Service) Coordinator() *Coordinator { return s.c }
@@ -42,6 +66,9 @@ func (s *Service) Coordinator() *Coordinator { return s.c }
 // which nothing is left to compute. That is the RPC/command distinction: a
 // request is an ask, a command is a decided fact.
 func (s *Service) SubmitJob(ctx context.Context, req *schedulerpb.SubmitJobRequest) (*schedulerpb.SubmitJobResponse, error) {
+	if err := s.requireLeader(); err != nil {
+		return nil, err
+	}
 	if len(req.GetTasks()) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "job has no tasks")
 	}
@@ -82,6 +109,9 @@ func (s *Service) SubmitJob(ctx context.Context, req *schedulerpb.SubmitJobReque
 }
 
 func (s *Service) GetJob(ctx context.Context, req *schedulerpb.GetJobRequest) (*schedulerpb.GetJobResponse, error) {
+	if err := s.requireLeader(); err != nil {
+		return nil, err
+	}
 	var out *schedulerpb.Job
 	s.c.read(func(st *state.StateStore) {
 		if j, ok := st.Job(req.GetJobId()); ok {
@@ -95,6 +125,9 @@ func (s *Service) GetJob(ctx context.Context, req *schedulerpb.GetJobRequest) (*
 }
 
 func (s *Service) ListJobs(ctx context.Context, req *schedulerpb.ListJobsRequest) (*schedulerpb.ListJobsResponse, error) {
+	if err := s.requireLeader(); err != nil {
+		return nil, err
+	}
 	out := &schedulerpb.ListJobsResponse{}
 	s.c.read(func(st *state.StateStore) {
 		for _, id := range st.JobIDs() {
@@ -110,6 +143,9 @@ func (s *Service) ListJobs(ctx context.Context, req *schedulerpb.ListJobsRequest
 }
 
 func (s *Service) RegisterWorker(ctx context.Context, req *schedulerpb.RegisterWorkerRequest) (*schedulerpb.RegisterWorkerResponse, error) {
+	if err := s.requireLeader(); err != nil {
+		return nil, err
+	}
 	if req.GetWorkerId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "empty worker_id")
 	}
@@ -127,6 +163,9 @@ func (s *Service) RegisterWorker(ctx context.Context, req *schedulerpb.RegisterW
 // command, because keeping the set closed is what makes the log's shape
 // checkable by the compiler rather than by discipline.
 func (s *Service) Heartbeat(ctx context.Context, req *schedulerpb.HeartbeatRequest) (*schedulerpb.HeartbeatResponse, error) {
+	if err := s.requireLeader(); err != nil {
+		return nil, err
+	}
 	if req.GetWorkerId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "empty worker_id")
 	}
@@ -161,6 +200,10 @@ func (s *Service) RequestTask(ctx context.Context, req *schedulerpb.RequestTaskR
 		return nil, status.Error(codes.InvalidArgument, "empty worker_id")
 	}
 
+	if err := s.requireLeader(); err != nil {
+		return nil, err
+	}
+
 	wait := time.Duration(req.GetWaitMs()) * time.Millisecond
 	if wait > maxWait {
 		wait = maxWait
@@ -168,6 +211,13 @@ func (s *Service) RequestTask(ctx context.Context, req *schedulerpb.RequestTaskR
 	deadline := time.Now().Add(wait)
 
 	for {
+		// Re-checked every pass, not just on entry: a worker parked here for
+		// seconds must be told promptly when this node is deposed, rather
+		// than waiting out wait_ms against a node that can no longer assign
+		// it anything.
+		if !s.c.IsLeader() {
+			return nil, s.notLeader()
+		}
 		task, found := s.heldTask(req.GetWorkerId())
 		if found {
 			return &schedulerpb.RequestTaskResponse{Task: taskToProto(task)}, nil
@@ -216,6 +266,9 @@ func (s *Service) heldTask(workerID string) (state.Task, bool) {
 // exhausts. None of that is decided here, because all of it must be decided
 // identically on every replica.
 func (s *Service) ReportResult(ctx context.Context, req *schedulerpb.ReportResultRequest) (*schedulerpb.ReportResultResponse, error) {
+	if err := s.requireLeader(); err != nil {
+		return nil, err
+	}
 	now := s.c.nowMs()
 
 	var cmd *commandpb.Command

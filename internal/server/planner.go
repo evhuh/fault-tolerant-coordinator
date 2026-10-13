@@ -50,14 +50,19 @@ func (p *Planner) Submit(plan *sched.Plan) sched.PlanResult {
 	p.plannerMu.Lock()
 	defer p.plannerMu.Unlock()
 
-	// Verification and the commit happen under ONE acquisition of the store
-	// lock. If they did not, state could move between "I checked" and "I
-	// committed" and the check would be theatre.
+	// Verification reads CURRENT state under the store lock, then the lock is
+	// released and the plan is proposed.
 	//
-	// Day 6 note: once propose() goes through Raft there IS a real gap here,
-	// which is exactly why applyPlan re-validates on every replica. The
-	// planner's job is to make rejection rare; the state machine's job is to
-	// make it safe.
+	// Under Raft there is a REAL GAP between those two steps — a Tick or a
+	// CompleteTask can commit in between — and that gap cannot be closed:
+	// holding the store lock across a consensus round-trip would stop the
+	// apply loop that the round-trip depends on. So the gap is accepted, and
+	// applyPlan re-validates each assignment on every replica, skipping the
+	// ones that went stale.
+	//
+	// That is the division of labour the whole design rests on: the planner's
+	// job is to make conflicts RARE, the state machine's job is to make them
+	// SAFE.
 	p.c.mu.Lock()
 	now := p.c.store.NowMs()
 	leaseExpiry := now + p.c.cfg.LeaseTTL.Milliseconds()
@@ -149,16 +154,20 @@ func (p *Planner) Submit(plan *sched.Plan) sched.PlanResult {
 		stops = append(stops, &commandpb.Stop{TaskId: st.TaskID, Reason: st.Reason})
 	}
 
+	// Lock released BEFORE proposing. Everything below races other commands,
+	// by design.
+	p.c.mu.Unlock()
+
 	if len(accepted) == 0 && len(stops) == 0 {
-		p.c.mu.Unlock()
 		p.record(0, rejected, 0)
 		return sched.PlanResult{Rejected: rejected}
 	}
 
 	// One entry, however many assignments it carries. This is the batching
-	// that amortizes fsync across many scheduling decisions.
+	// that amortizes fsync across many scheduling decisions — and the reason
+	// paying one consensus round-trip per PLAN rather than per decision is
+	// the whole throughput argument.
 	cmd := &commandpb.Command{
-		Version: p.c.cfg.CommandVersion,
 		Kind: &commandpb.Command_ApplyPlan{
 			ApplyPlan: &commandpb.ApplyPlan{
 				EvalId:      plan.EvalID,
@@ -167,20 +176,24 @@ func (p *Planner) Submit(plan *sched.Plan) sched.PlanResult {
 			},
 		},
 	}
-	res, err := p.c.store.Apply(cmd)
-	p.c.mu.Unlock()
 
+	// propose() waits for the entry to be applied, and applyPlan is what
+	// decides how much of it survived the gap. plannerMu is still held, so
+	// no second plan verifies against state this one has not landed in yet.
+	res, err := p.c.propose(cmd)
 	if err != nil {
-		// Everything was verified against the state applyPlan just saw, so
-		// this should be unreachable. If it fires, the planner and the state
-		// machine disagree about what is valid, which is a bug worth seeing.
+		// Leadership loss or a lost proposal. The assignments did not happen;
+		// the eval blocks and a later leader re-plans them.
 		p.record(0, rejected+len(accepted), 0)
 		return sched.PlanResult{Rejected: rejected + len(accepted), Err: err}
 	}
 
-	p.c.afterApply(cmd, res)
-	p.record(len(accepted), rejected, len(accepted))
-	return sched.PlanResult{Accepted: len(accepted), Rejected: rejected}
+	// The state machine's own skips are optimistic-concurrency conflicts that
+	// opened AFTER verification — the ones the gap above makes unavoidable.
+	// Counting them here is what makes the rejection metric honest.
+	rejected += res.PlanSkipped
+	p.record(res.PlanApplied, rejected, res.PlanApplied)
+	return sched.PlanResult{Accepted: res.PlanApplied, Rejected: rejected}
 }
 
 func (p *Planner) record(accepted, rejected, planSize int) {

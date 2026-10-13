@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/evazheng/fault-tolerant-coordinator/internal/raftnode"
 	"github.com/evazheng/fault-tolerant-coordinator/internal/sched"
 	"github.com/evazheng/fault-tolerant-coordinator/internal/state"
 	commandpb "github.com/evazheng/fault-tolerant-coordinator/proto/commandpb"
@@ -35,6 +36,13 @@ type Config struct {
 	CommandVersion uint32
 	// Sched tunes the scheduling pipeline.
 	Sched sched.Config
+	// APIAddrs maps a raft node id to that node's gRPC address.
+	//
+	// It exists because the two address spaces are DIFFERENT: the raft peer
+	// set holds transport URLs (http://host:9021) that only Raft speaks, while
+	// a redirected client needs host:8080 to dial gRPC. Handing a client the
+	// raft address would point it at a port that does not serve its API.
+	APIAddrs map[uint64]string
 }
 
 func DefaultConfig() Config {
@@ -68,6 +76,13 @@ type Coordinator struct {
 	broker    *sched.Broker
 	planner   *Planner
 	scheduler *sched.Scheduler
+
+	// Raft. Nil until StartRaft, which keeps the whole stack runnable as a
+	// single node — every test below Day 6 depends on that.
+	raft     *raftnode.Node
+	proposer *raftProposer
+	// leaderCancel stops the leader-only goroutines on revocation.
+	leaderCancel context.CancelFunc
 }
 
 func New(cfg Config) *Coordinator {
@@ -80,11 +95,29 @@ func New(cfg Config) *Coordinator {
 
 func (c *Coordinator) nowMs() int64 { return c.now().UnixMilli() }
 
+// SetConfig replaces the config before the node starts serving. It exists so
+// cmd/coordinator can fill in APIAddrs once the peer flags are parsed.
+func (c *Coordinator) SetConfig(cfg Config) { c.cfg = cfg }
+
 // propose is the single mutation path. Every gRPC handler funnels through it.
 //
 // Day 6: replace the body with node.Propose(encoded) and block until the
 // entry is applied from rd.CommittedEntries. The signature stays.
 func (c *Coordinator) propose(cmd *commandpb.Command) (state.Result, error) {
+	if c.raft != nil {
+		// Through consensus: the entry commits, comes back via
+		// CommittedEntries, and applyCommitted hands the Result back here.
+		return c.proposeRaft(cmd)
+	}
+	return c.proposeLocal(cmd)
+}
+
+// proposeLocal applies directly, with no consensus.
+//
+// This is what propose() was through Day 5, and it stays because the state
+// machine, the scheduler, and every test below Day 6 are meaningful without
+// Raft. Day 6 did not delete the single-node path; it added a second one.
+func (c *Coordinator) proposeLocal(cmd *commandpb.Command) (state.Result, error) {
 	cmd.Version = c.cfg.CommandVersion
 	c.mu.Lock()
 	res, err := c.store.Apply(cmd)
@@ -117,9 +150,13 @@ func (c *Coordinator) afterApply(cmd *commandpb.Command, res state.Result) {
 	for _, trig := range res.EvalTriggers {
 		id := evalIDFor(trig)
 		prio := c.priorityOf(trig.JobID)
-		if _, err := c.propose(createEvalCmd(id, trig, prio, c.storeNowMs())); err != nil {
-			continue // a trigger for a vanished job; a rescan would find it anyway
-		}
+		// FIRE-AND-FORGET, and it has to be: under Raft, afterApply runs
+		// inside the apply loop. Waiting for this entry to commit would wait
+		// on the very loop that is sitting here — a guaranteed deadlock.
+		//
+		// Losing one is survivable: the broker is derived, so a new leader
+		// rediscovers the work by scanning committed state.
+		c.proposeAsync(createEvalCmd(id, trig, prio, c.storeNowMs()))
 		c.broker.Enqueue(sched.Eval{
 			ID:          id,
 			JobID:       trig.JobID,

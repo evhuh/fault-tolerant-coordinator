@@ -102,6 +102,14 @@ func (EvalTrigger) EnumDescriptor() ([]byte, []int) {
 type Command struct {
 	state   protoimpl.MessageState `protogen:"open.v1"`
 	Version uint32                 `protobuf:"varint,1,opt,name=version,proto3" json:"version,omitempty"`
+	// Correlates a proposal with the caller waiting for it. Raft's Propose is
+	// fire-and-forget; the entry reappears later through CommittedEntries, and
+	// this is how the leader finds whoever is blocked on it.
+	//
+	// METADATA ONLY. apply() must never read it: it differs between the leader
+	// and every follower replaying the same entry, so letting it influence
+	// state would diverge replicas on the very first command
+	ProposalId string `protobuf:"bytes,9,opt,name=proposal_id,json=proposalId,proto3" json:"proposal_id,omitempty"`
 	// Types that are valid to be assigned to Kind:
 	//
 	//	*Command_SubmitJob
@@ -151,6 +159,13 @@ func (x *Command) GetVersion() uint32 {
 		return x.Version
 	}
 	return 0
+}
+
+func (x *Command) GetProposalId() string {
+	if x != nil {
+		return x.ProposalId
+	}
+	return ""
 }
 
 func (x *Command) GetKind() isCommand_Kind {
@@ -976,9 +991,11 @@ var File_command_proto protoreflect.FileDescriptor
 const file_command_proto_rawDesc = "" +
 	"\n" +
 	"\rcommand.proto\x12\n" +
-	"command.v1\x1a\x0fscheduler.proto\"\xbb\x03\n" +
+	"command.v1\x1a\x0fscheduler.proto\"\xdc\x03\n" +
 	"\aCommand\x12\x18\n" +
-	"\aversion\x18\x01 \x01(\rR\aversion\x126\n" +
+	"\aversion\x18\x01 \x01(\rR\aversion\x12\x1f\n" +
+	"\vproposal_id\x18\t \x01(\tR\n" +
+	"proposalId\x126\n" +
 	"\n" +
 	"submit_job\x18\x02 \x01(\v2\x15.command.v1.SubmitJobH\x00R\tsubmitJob\x129\n" +
 	"\vcreate_eval\x18\x03 \x01(\v2\x16.command.v1.CreateEvalH\x00R\n" +

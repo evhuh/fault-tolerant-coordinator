@@ -22,6 +22,14 @@ import "scheduler.proto";
 // command shapes while old decoders still understand yesterday's entries.
 message Command {
   uint32 version = 1;
+  // Correlates a proposal with the caller waiting for it. Raft's Propose is
+  // fire-and-forget; the entry reappears later through CommittedEntries, and
+  // this is how the leader finds whoever is blocked on it.
+  //
+  // METADATA ONLY. apply() must never read it: it differs between the leader
+  // and every follower replaying the same entry, so letting it influence
+  // state would diverge replicas on the very first command
+  string proposal_id = 9;
 
   oneof kind {
     SubmitJob      submit_job      = 2;

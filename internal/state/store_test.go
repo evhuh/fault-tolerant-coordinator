@@ -600,47 +600,96 @@ func TestApplyPlanBatchesManyAssignmentsAsOneEntry(t *testing.T) {
 	}
 }
 
-func TestApplyPlanRejectsStalePlanWholesale(t *testing.T) {
+// A stale assignment is SKIPPED, not fatal to the batch.
+//
+// Under Raft there is a real gap between the planner's verify and this apply:
+// a Tick or a CompleteTask can commit in between. Rejecting the whole plan
+// then would throw away every good assignment because one went stale, which
+// is a throughput cliff under fault injection. Skipping is still fully
+// deterministic — every replica sees the same state at the same log position
+// and skips exactly the same entries.
+func TestApplyPlanSkipsStaleAssignmentsAndAppliesTheRest(t *testing.T) {
 	s := seedCluster(t, 2)
 	// task-1 was assigned by an earlier plan; a scheduler working from a stale
 	// snapshot still believes it is PENDING.
 	mustApply(t, s, applyPlanCmd("eval-1", []assign{{"task-1", "w-1", 1, 5000}}))
 
-	before := dump(s)
-	_, err := s.Apply(applyPlanCmd("eval-2", []assign{
+	res := mustApply(t, s, applyPlanCmd("eval-2", []assign{
 		{"task-2", "w-1", 1, 5000}, // valid
 		{"task-1", "w-1", 1, 5000}, // stale: task-1 is ASSIGNED, not PENDING
 	}))
-	if err == nil {
-		t.Fatal("stale plan = nil error, want rejection")
+	if res.PlanApplied != 1 || res.PlanSkipped != 1 {
+		t.Errorf("applied = %d skipped = %d, want 1 and 1", res.PlanApplied, res.PlanSkipped)
 	}
-	// All-or-nothing: the valid assignment must NOT have landed.
-	if after := dump(s); after != before {
-		t.Errorf("rejected plan partially applied\nbefore:\n%s\nafter:\n%s", before, after)
+
+	// The good assignment landed.
+	if task, _ := s.Task("task-2"); task.State != TaskAssigned || task.Attempt != 1 {
+		t.Errorf("task-2 state = %s attempt = %d, want ASSIGNED/1", task.State, task.Attempt)
+	}
+	// The stale one left its target untouched — still on its original worker
+	// at its original attempt.
+	if task, _ := s.Task("task-1"); task.State != TaskAssigned || task.Attempt != 1 {
+		t.Errorf("task-1 state = %s attempt = %d, want its first assignment intact", task.State, task.Attempt)
 	}
 }
 
-func TestApplyPlanRejectsWrongAttempt(t *testing.T) {
+// Skipping must be a pure function of (state, command): two replicas applying
+// the same partial plan to the same state must land on identical state.
+func TestPartialApplyIsDeterministicAcrossReplicas(t *testing.T) {
+	build := func() *StateStore {
+		st := seedCluster(t, 3)
+		mustApply(t, st, applyPlanCmd("eval-1", []assign{{"task-1", "w-1", 1, 5000}}))
+		mustApply(t, st, applyPlanCmd("eval-2", []assign{
+			{"task-2", "w-1", 1, 5000},
+			{"task-1", "w-1", 1, 5000}, // stale, skipped
+			{"task-3", "w-1", 9, 5000}, // wrong attempt, skipped
+			{"task-2", "w-1", 1, 5000}, // duplicate, skipped
+		}))
+		return st
+	}
+	a, b := build(), build()
+	if dump(a) != dump(b) {
+		t.Errorf("replicas diverged on a partial plan\nA:\n%s\nB:\n%s", dump(a), dump(b))
+	}
+}
+
+func TestApplyPlanSkipsWrongAttempt(t *testing.T) {
 	s := seedCluster(t, 1)
-	if _, err := s.Apply(applyPlanCmd("eval-1", []assign{{"task-1", "w-1", 2, 5000}})); err == nil {
-		t.Error("attempt=2 on a fresh task = nil error, want rejection")
+	res := mustApply(t, s, applyPlanCmd("eval-1", []assign{{"task-1", "w-1", 2, 5000}}))
+	if res.PlanApplied != 0 || res.PlanSkipped != 1 {
+		t.Errorf("attempt=2 on a fresh task: applied = %d skipped = %d, want 0 and 1",
+			res.PlanApplied, res.PlanSkipped)
 	}
-	if _, err := s.Apply(applyPlanCmd("eval-1", []assign{{"task-1", "w-1", 0, 5000}})); err == nil {
-		t.Error("attempt=0 = nil error, want rejection")
+	res = mustApply(t, s, applyPlanCmd("eval-1", []assign{{"task-1", "w-1", 0, 5000}}))
+	if res.PlanApplied != 0 || res.PlanSkipped != 1 {
+		t.Errorf("attempt=0: applied = %d skipped = %d, want 0 and 1", res.PlanApplied, res.PlanSkipped)
+	}
+	if task, _ := s.Task("task-1"); task.State != TaskPending {
+		t.Errorf("state = %s, want PENDING — neither assignment should have landed", task.State)
 	}
 }
 
-func TestApplyPlanRejectsDeadWorkerAndExpiredLease(t *testing.T) {
+func TestApplyPlanSkipsDeadWorkerAndExpiredLease(t *testing.T) {
 	s := seedCluster(t, 1)
 	mustApply(t, s, tickCmd(9500)) // w-1's lease (9000) lapses → LOST
-
-	if _, err := s.Apply(applyPlanCmd("eval-1", []assign{{"task-1", "w-1", 1, 20000}})); err == nil {
-		t.Error("assigning to a LOST worker = nil error, want rejection")
+	res := mustApply(t, s, applyPlanCmd("eval-1", []assign{{"task-1", "w-1", 1, 20000}}))
+	if res.PlanApplied != 0 || res.PlanSkipped != 1 {
+		t.Errorf("LOST worker: applied = %d skipped = %d, want 0 and 1", res.PlanApplied, res.PlanSkipped)
 	}
 
 	s2 := seedCluster(t, 1)
-	if _, err := s2.Apply(applyPlanCmd("eval-1", []assign{{"task-1", "w-1", 1, 500}})); err == nil {
-		t.Error("lease already in the past = nil error, want rejection")
+	res = mustApply(t, s2, applyPlanCmd("eval-1", []assign{{"task-1", "w-1", 1, 500}}))
+	if res.PlanApplied != 0 || res.PlanSkipped != 1 {
+		t.Errorf("expired lease: applied = %d skipped = %d, want 0 and 1", res.PlanApplied, res.PlanSkipped)
+	}
+}
+
+// Malformed commands are still ERRORS — a nil payload or an empty eval_id is
+// a bug in the proposer, not a lost race.
+func TestApplyPlanStillErrorsOnMalformedCommand(t *testing.T) {
+	s := seedCluster(t, 1)
+	if _, err := s.Apply(applyPlanCmd("", []assign{{"task-1", "w-1", 1, 5000}})); err == nil {
+		t.Error("empty eval_id = nil error, want an error")
 	}
 }
 
@@ -1129,14 +1178,19 @@ func TestBackoffBlocksDispatchUntilTickReleasesIt(t *testing.T) {
 	task, _ := s.Task("task-1")
 	deadline := task.NotBeforeMs
 
-	// Too early: the backstop refuses.
+	// Too early: the backstop skips it.
 	mustApply(t, s, registerWorkerCmd("w-1", 500, 90000))
-	if _, err := s.Apply(applyPlanCmd("eval-2", []assign{{"task-1", "w-1", 2, 50000}})); err == nil {
-		t.Fatal("applyPlan accepted a task still serving its backoff")
+	res := mustApply(t, s, applyPlanCmd("eval-2", []assign{{"task-1", "w-1", 2, 50000}}))
+	if res.PlanApplied != 0 || res.PlanSkipped != 1 {
+		t.Fatalf("applied = %d skipped = %d, want the backing-off task skipped",
+			res.PlanApplied, res.PlanSkipped)
+	}
+	if task, _ := s.Task("task-1"); task.State != TaskPending {
+		t.Fatalf("state = %s, want PENDING", task.State)
 	}
 
 	// A tick before the deadline releases nothing.
-	res := mustApply(t, s, tickCmd(deadline-1))
+	res = mustApply(t, s, tickCmd(deadline-1))
 	for _, trig := range res.EvalTriggers {
 		if trig.Reason == EvalBackoffElapsed {
 			t.Error("backoff released early")

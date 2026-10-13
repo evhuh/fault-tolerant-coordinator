@@ -9,15 +9,19 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
 	"net"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
 	"google.golang.org/grpc"
 
+	"github.com/evazheng/fault-tolerant-coordinator/internal/raftnode"
 	"github.com/evazheng/fault-tolerant-coordinator/internal/server"
 	schedulerpb "github.com/evazheng/fault-tolerant-coordinator/proto/schedulerpb"
 )
@@ -28,6 +32,12 @@ func main() {
 	tickPeriod := flag.Duration("tick", 200*time.Millisecond, "how often to propose Tick{nowMs}")
 	schedWorkers := flag.Int("scheduler-workers", 4, "evals decided concurrently")
 	maxPlanSize := flag.Int("max-plan-size", 1000, "assignments per committed plan")
+	raftID := flag.Uint64("id", 0, "this node's raft id; 0 runs single-node with no Raft")
+	peerSpec := flag.String("peers", "", "comma-separated id=url raft peers, including this node")
+	dataDir := flag.String("data-dir", "", "WAL directory (default ./raft-<id>)")
+	apiPeerSpec := flag.String("api-peers", "", "comma-separated id=host:port gRPC addresses, for NOT_LEADER redirects")
+	raftTick := flag.Duration("raft-tick", 100*time.Millisecond, "raft tick interval; the time unit for election/heartbeat ticks")
+	electionTick := flag.Int("election-tick", 10, "election timeout in raft ticks")
 	flag.Parse()
 
 	cfg := server.DefaultConfig()
@@ -39,6 +49,44 @@ func main() {
 
 	coord := server.New(cfg)
 	svc := server.NewService(coord)
+
+	// Raft is opt-in by -id, so the single-node path every earlier day
+	// depended on still works unchanged.
+	raftEnabled := *raftID != 0
+	if raftEnabled {
+		peers, err := parsePeers(*peerSpec)
+		if err != nil {
+			log.Fatalf("peers: %v", err)
+		}
+		if _, ok := peers[*raftID]; !ok {
+			log.Fatalf("node id %d is not in -peers", *raftID)
+		}
+		dir := *dataDir
+		if dir == "" {
+			dir = fmt.Sprintf("./raft-%d", *raftID)
+		}
+		// The gRPC address space is separate from raft's: a redirected client
+		// dials host:8080, not the raft transport URL.
+		if *apiPeerSpec != "" {
+			apiPeers, err := parsePeers(*apiPeerSpec)
+			if err != nil {
+				log.Fatalf("api-peers: %v", err)
+			}
+			cfg.APIAddrs = apiPeers
+			coord.SetConfig(cfg)
+		}
+
+		rcfg := raftnode.DefaultConfig()
+		rcfg.ID = *raftID
+		rcfg.Peers = peers
+		rcfg.DataDir = dir
+		rcfg.TickInterval = *raftTick
+		rcfg.ElectionTick = *electionTick
+		if err := coord.StartRaft(rcfg); err != nil {
+			log.Fatalf("start raft: %v", err)
+		}
+		defer coord.StopRaft()
+	}
 
 	lis, err := net.Listen("tcp", *addr)
 	if err != nil {
@@ -52,13 +100,16 @@ func main() {
 	// election and stops on loss, alongside the eval broker and the planner.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	go coord.RunTicker(ctx)
 
-	// Leader-only components. On Day 6 these move under establishLeadership,
-	// and StopScheduling runs on leadership loss — stopping cleanly is what
-	// prevents two leaders scheduling against the same state.
-	coord.StartScheduling(ctx)
-	defer coord.StopScheduling()
+	// With Raft, the leader-only components (eval broker, scheduler workers,
+	// planner, Tick proposer) are started by establishLeadership and stopped
+	// by revokeLeadership. Without it, this node always leads, so they start
+	// here and never stop.
+	if !raftEnabled {
+		go coord.RunTicker(ctx)
+		coord.StartScheduling(ctx)
+		defer coord.StopScheduling()
+	}
 
 	go func() {
 		<-ctx.Done()
@@ -66,9 +117,34 @@ func main() {
 		gs.GracefulStop()
 	}()
 
-	log.Printf("coordinator: listening on %s (lease=%s tick=%s schedulers=%d max-plan=%d)",
-		*addr, cfg.LeaseTTL, cfg.TickPeriod, cfg.Sched.Workers, cfg.Sched.MaxPlanSize)
+	mode := "single-node (no raft)"
+	if raftEnabled {
+		mode = fmt.Sprintf("raft id=%d", *raftID)
+	}
+	log.Printf("coordinator: listening on %s [%s] (lease=%s tick=%s schedulers=%d max-plan=%d)",
+		*addr, mode, cfg.LeaseTTL, cfg.TickPeriod, cfg.Sched.Workers, cfg.Sched.MaxPlanSize)
 	if err := gs.Serve(lis); err != nil {
 		log.Fatalf("serve: %v", err)
 	}
+}
+
+// parsePeers reads a "1=http://host:port,2=..." spec. Membership is fixed at
+// startup — cluster changes are deliberately out of scope.
+func parsePeers(spec string) (map[uint64]string, error) {
+	if spec == "" {
+		return nil, fmt.Errorf("-peers is required with -id")
+	}
+	out := map[uint64]string{}
+	for _, kv := range strings.Split(spec, ",") {
+		k, v, ok := strings.Cut(kv, "=")
+		if !ok {
+			return nil, fmt.Errorf("bad peer spec %q, want id=url", kv)
+		}
+		id, err := strconv.ParseUint(k, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("bad peer id %q: %w", k, err)
+		}
+		out[id] = v
+	}
+	return out, nil
 }
