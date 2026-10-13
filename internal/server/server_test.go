@@ -2,11 +2,13 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/evazheng/fault-tolerant-coordinator/internal/sched"
 	"github.com/evazheng/fault-tolerant-coordinator/internal/state"
 	schedulerpb "github.com/evazheng/fault-tolerant-coordinator/proto/schedulerpb"
 )
@@ -20,14 +22,76 @@ func (c *testClock) now() time.Time  { return time.UnixMilli(c.ms.Load()) }
 func (c *testClock) advance(d int64) { c.ms.Add(d) }
 func (c *testClock) set(ms int64)    { c.ms.Store(ms) }
 
-func newTestService(t *testing.T) (*Service, *testClock) {
+// newTestService starts the full leader-only pipeline: broker, planner, and
+// scheduler workers. Day 4 inverted the control flow — assignment no longer
+// happens on a worker's poll, it happens when an eval fires — so a test that
+// does not run the pipeline will see nothing dispatched, ever.
+//
+// One scheduler worker by default, so ordering is deterministic. Tests that
+// care about concurrent deciding ask for more.
+func newTestService(t *testing.T, schedWorkers ...int) (*Service, *testClock) {
 	t.Helper()
 	clk := &testClock{}
 	clk.set(1_700_000_000_000)
 	cfg := DefaultConfig()
+	cfg.Sched.Workers = 1
+	if len(schedWorkers) > 0 {
+		cfg.Sched.Workers = schedWorkers[0]
+	}
+	cfg.Sched.LeaseTTLMs = cfg.LeaseTTL.Milliseconds()
+
 	c := New(cfg)
 	c.now = clk.now
+
+	ctx, cancel := context.WithCancel(context.Background())
+	c.StartScheduling(ctx)
+	t.Cleanup(func() {
+		cancel()
+		c.StopScheduling()
+	})
 	return NewService(c), clk
+}
+
+// awaitTask waits for the planner to assign something to this worker.
+// Assignment is ASYNCHRONOUS now: SubmitJob returns as soon as the command
+// commits, and the eval is decided on a scheduler goroutine afterwards.
+func awaitTask(t *testing.T, s *Service, workerID string) *schedulerpb.Task {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if task := requestNow(t, s, workerID); task != nil {
+			return task
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("no task assigned to %s within the deadline", workerID)
+	return nil
+}
+
+// awaitNoTask asserts nothing is assigned, giving the pipeline a moment to be
+// wrong. Used where the correct behaviour is to dispatch nothing.
+func awaitNoTask(t *testing.T, s *Service, workerID string) {
+	t.Helper()
+	time.Sleep(100 * time.Millisecond)
+	if task := requestNow(t, s, workerID); task != nil {
+		t.Fatalf("dispatched %q to %s, want nothing", task.GetTaskId(), workerID)
+	}
+}
+
+// awaitState waits for a task to reach a given state.
+func awaitState(t *testing.T, s *Service, taskID string, want state.TaskState) state.Task {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	var got state.Task
+	for time.Now().Before(deadline) {
+		s.c.read(func(st *state.StateStore) { got, _ = st.Task(taskID) })
+		if got.State == want {
+			return got
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("task %s is %s, want %s", taskID, got.State, want)
+	return got
 }
 
 // tick drives the state machine's clock the way RunTicker does, but
@@ -54,9 +118,27 @@ func submit(t *testing.T, s *Service, requestID string, n int) string {
 	return resp.GetJobId()
 }
 
-func register(t *testing.T, s *Service, workerID string) {
+// heartbeat renews a worker's lease. It is the same command as registration —
+// there is no Heartbeat command — so it also REVIVES a worker Tick marked
+// LOST, which is what wakes evals blocked for want of capacity.
+func heartbeat(t *testing.T, s *Service, workerID string, runningTaskIDs ...string) {
 	t.Helper()
-	if _, err := s.RegisterWorker(context.Background(), &schedulerpb.RegisterWorkerRequest{WorkerId: workerID}); err != nil {
+	if _, err := s.Heartbeat(context.Background(), &schedulerpb.HeartbeatRequest{
+		WorkerId: workerID, RunningTaskIds: runningTaskIDs,
+	}); err != nil {
+		t.Fatalf("heartbeat %s: %v", workerID, err)
+	}
+}
+
+func register(t *testing.T, s *Service, workerID string, capacity ...int32) {
+	t.Helper()
+	var cap int32 = 1
+	if len(capacity) > 0 {
+		cap = capacity[0]
+	}
+	if _, err := s.RegisterWorker(context.Background(), &schedulerpb.RegisterWorkerRequest{
+		WorkerId: workerID, Capacity: cap,
+	}); err != nil {
 		t.Fatalf("register %s: %v", workerID, err)
 	}
 }
@@ -74,13 +156,10 @@ func requestNow(t *testing.T, s *Service, workerID string) *schedulerpb.Task {
 
 func TestSubmitDispatchCompleteEndToEnd(t *testing.T) {
 	s, _ := newTestService(t)
-	jobID := submit(t, s, "req-1", 1)
 	register(t, s, "w-1")
+	jobID := submit(t, s, "req-1", 1)
 
-	task := requestNow(t, s, "w-1")
-	if task == nil {
-		t.Fatal("no task dispatched")
-	}
+	task := awaitTask(t, s, "w-1")
 	if task.GetAttempt() != 1 {
 		t.Errorf("attempt = %d, want 1 on first dispatch", task.GetAttempt())
 	}
@@ -90,13 +169,11 @@ func TestSubmitDispatchCompleteEndToEnd(t *testing.T) {
 
 	// The heartbeat's claim is the worker's ack, and the only thing that
 	// produces RUNNING.
-	if _, err := s.Heartbeat(context.Background(), &schedulerpb.HeartbeatRequest{
-		WorkerId: "w-1", RunningTaskIds: []string{task.GetTaskId()},
-	}); err != nil {
-		t.Fatalf("heartbeat: %v", err)
-	}
-	if got := requestNow(t, s, "w-1"); got.GetState() != schedulerpb.TaskState_TASK_STATE_RUNNING {
-		t.Errorf("state = %s, want RUNNING after the heartbeat claim", got.GetState())
+	heartbeat(t, s, "w-1", task.GetTaskId())
+	// RequestTask only offers ASSIGNED tasks — a RUNNING one is already being
+	// executed — so the promotion is checked against state directly.
+	if got := awaitState(t, s, task.GetTaskId(), state.TaskRunning); got.State != state.TaskRunning {
+		t.Errorf("state = %s, want RUNNING after the heartbeat claim", got.State)
 	}
 
 	if _, err := s.ReportResult(context.Background(), &schedulerpb.ReportResultRequest{
@@ -139,10 +216,10 @@ func TestSubmitJobDedupsOnRequestID(t *testing.T) {
 // returns the SAME task rather than dispatching a second one.
 func TestRequestTaskReturnsTheTaskAlreadyHeld(t *testing.T) {
 	s, _ := newTestService(t)
-	submit(t, s, "req-1", 5)
 	register(t, s, "w-1")
+	submit(t, s, "req-1", 5)
 
-	first := requestNow(t, s, "w-1")
+	first := awaitTask(t, s, "w-1")
 	second := requestNow(t, s, "w-1")
 	if first.GetTaskId() != second.GetTaskId() {
 		t.Errorf("got %q then %q; a worker holding a task must be handed the same one",
@@ -166,9 +243,7 @@ func TestRequestTaskIsEmptyWhenNothingPending(t *testing.T) {
 func TestRequestTaskRefusesUnknownWorker(t *testing.T) {
 	s, _ := newTestService(t)
 	submit(t, s, "req-1", 1)
-	if task := requestNow(t, s, "ghost"); task != nil {
-		t.Errorf("dispatched %q to an unregistered worker", task.GetTaskId())
-	}
+	awaitNoTask(t, s, "ghost")
 }
 
 // The Day 3 checkpoint, without the subprocesses: a worker goes away, its
@@ -176,37 +251,24 @@ func TestRequestTaskRefusesUnknownWorker(t *testing.T) {
 // NEXT attempt.
 func TestLeaseExpiryRedispatchesToAnotherWorker(t *testing.T) {
 	s, clk := newTestService(t)
-	submit(t, s, "req-1", 1)
 	register(t, s, "w-1")
+	submit(t, s, "req-1", 1)
+	task := awaitTask(t, s, "w-1")
 	register(t, s, "w-2")
-
-	task := requestNow(t, s, "w-1")
-	if task == nil {
-		t.Fatal("no initial dispatch")
-	}
 
 	// w-1 dies: no more heartbeats. Past the lease, Tick reclaims.
 	clk.advance(DefaultConfig().LeaseTTL.Milliseconds() + 1)
 	tick(t, s)
 
-	var reclaimed state.Task
-	s.c.read(func(st *state.StateStore) { reclaimed, _ = st.Task(task.GetTaskId()) })
-	if reclaimed.State != state.TaskPending {
-		t.Fatalf("state = %s after lease expiry, want PENDING", reclaimed.State)
-	}
-	// Attempt is a dispatch counter: expiry must not bump it.
-	if reclaimed.Attempt != 1 {
-		t.Errorf("attempt = %d, want it unchanged at 1 across reclaim", reclaimed.Attempt)
-	}
+	// w-2 is alive and heartbeating. It has to be: the clock jumped past
+	// every lease, so without a renewal Tick marks w-2 LOST as well and
+	// there is nowhere to redispatch to.
+	heartbeat(t, s, "w-2")
 
-	// w-2 heartbeats to keep its own lease alive, then picks the task up.
-	if _, err := s.Heartbeat(context.Background(), &schedulerpb.HeartbeatRequest{WorkerId: "w-2"}); err != nil {
-		t.Fatalf("heartbeat: %v", err)
-	}
-	redispatched := requestNow(t, s, "w-2")
-	if redispatched == nil {
-		t.Fatal("reclaimed task was not redispatched")
-	}
+	// The reclaim emits an EvalTrigger, which becomes a CreateEval, which the
+	// broker hands to a scheduler worker — so the redispatch happens without
+	// anyone polling for it.
+	redispatched := awaitTask(t, s, "w-2")
 	if redispatched.GetTaskId() != task.GetTaskId() {
 		t.Errorf("redispatched %q, want %q", redispatched.GetTaskId(), task.GetTaskId())
 	}
@@ -220,17 +282,15 @@ func TestLeaseExpiryRedispatchesToAnotherWorker(t *testing.T) {
 // one. This is the at-least-once delivery / effectively-once effect boundary.
 func TestStaleReportFromEvictedWorkerIsIgnored(t *testing.T) {
 	s, clk := newTestService(t)
-	submit(t, s, "req-1", 1)
 	register(t, s, "w-1")
-	register(t, s, "w-2")
+	submit(t, s, "req-1", 1)
+	slow := awaitTask(t, s, "w-1")
 
-	slow := requestNow(t, s, "w-1")
+	register(t, s, "w-2")
 	clk.advance(DefaultConfig().LeaseTTL.Milliseconds() + 1)
 	tick(t, s)
-	if _, err := s.Heartbeat(context.Background(), &schedulerpb.HeartbeatRequest{WorkerId: "w-2"}); err != nil {
-		t.Fatalf("heartbeat: %v", err)
-	}
-	fresh := requestNow(t, s, "w-2")
+	heartbeat(t, s, "w-2")
+	fresh := awaitTask(t, s, "w-2")
 
 	// w-1 was slow, not dead, and finally reports attempt 1.
 	if _, err := s.ReportResult(context.Background(), &schedulerpb.ReportResultRequest{
@@ -262,35 +322,47 @@ func TestStaleReportFromEvictedWorkerIsIgnored(t *testing.T) {
 	}
 }
 
-// The reason this package owns a mutex at all.
+// The reason this package owns a mutex at all, restated for Day 4.
 //
 // StateStore has no lock and is correct only under a single writer, while
-// gRPC hands every RPC its own goroutine. This drives many workers at one
-// task pool concurrently and asserts the property that must hold: NO TASK IS
-// EVER DISPATCHED TO TWO WORKERS. Run under -race, it is also what catches an
-// unguarded read of the store's maps.
-func TestConcurrentPollsNeverDoubleDispatch(t *testing.T) {
+// gRPC hands every RPC its own goroutine AND the scheduler now runs N more.
+// This drives many workers against one task pool and asserts the property
+// that must hold: NO TASK IS EVER HANDED TO TWO WORKERS. Under -race it is
+// also what catches an unguarded read of the store's maps.
+func TestConcurrentWorkersNeverDoubleDispatch(t *testing.T) {
 	const (
 		workers = 8
 		tasks   = 200
 	)
-	s, _ := newTestService(t)
+	s, _ := newTestService(t, 4) // 4 scheduler workers deciding in parallel
+
+	ids := make([]string, 0, workers)
+	for i := 0; i < workers; i++ {
+		id := "w-" + string(rune('a'+i))
+		ids = append(ids, id)
+		register(t, s, id, 2)
+	}
 	submit(t, s, "req-1", tasks)
 
 	var mu sync.Mutex
 	owner := make(map[string]string, tasks)
+	done := make(chan struct{})
 
 	var wg sync.WaitGroup
-	for i := 0; i < workers; i++ {
-		id := "w-" + string(rune('a'+i))
-		register(t, s, id)
+	for _, id := range ids {
 		wg.Add(1)
-		go func() {
+		go func(id string) {
 			defer wg.Done()
 			for {
+				select {
+				case <-done:
+					return
+				default:
+				}
 				task := requestNow(t, s, id)
 				if task == nil {
-					return // pool drained
+					time.Sleep(2 * time.Millisecond)
+					continue
 				}
 				mu.Lock()
 				prev, seen := owner[task.GetTaskId()]
@@ -299,10 +371,9 @@ func TestConcurrentPollsNeverDoubleDispatch(t *testing.T) {
 				}
 				mu.Unlock()
 				if seen && prev != id {
-					t.Errorf("task %s dispatched to both %s and %s", task.GetTaskId(), prev, id)
+					t.Errorf("task %s handed to both %s and %s", task.GetTaskId(), prev, id)
 					return
 				}
-
 				if _, err := s.ReportResult(context.Background(), &schedulerpb.ReportResultRequest{
 					WorkerId: id, TaskId: task.GetTaskId(), Attempt: task.GetAttempt(),
 					ExitCode: 0, ResultRef: "/data/" + id,
@@ -311,8 +382,11 @@ func TestConcurrentPollsNeverDoubleDispatch(t *testing.T) {
 					return
 				}
 			}
-		}()
+		}(id)
 	}
+
+	awaitAllTerminal(t, s, tasks, 10*time.Second)
+	close(done)
 	wg.Wait()
 
 	if len(owner) != tasks {
@@ -325,8 +399,291 @@ func TestConcurrentPollsNeverDoubleDispatch(t *testing.T) {
 				t.Errorf("task %s is %s, want COMPLETE", id, task.State)
 			}
 			if task.Attempt != 1 {
-				t.Errorf("task %s attempt = %d, want 1 — no task should have been retried", id, task.Attempt)
+				t.Errorf("task %s attempt = %d, want 1 — nothing should have been retried", id, task.Attempt)
 			}
 		}
 	})
+}
+
+func awaitAllTerminal(t *testing.T, s *Service, want int, within time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(within)
+	for time.Now().Before(deadline) {
+		n := 0
+		s.c.read(func(st *state.StateStore) {
+			for _, id := range st.TaskIDs() {
+				task, _ := st.Task(id)
+				if task.State == state.TaskComplete || task.State == state.TaskFailed {
+					n++
+				}
+			}
+		})
+		if n >= want {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("not all %d tasks reached a terminal state within %s", want, within)
+}
+
+// ---------------------------------------------------------------------------
+// Day 4 checkpoints
+// ---------------------------------------------------------------------------
+
+// THE BATCHING CHECKPOINT: one plan carrying 100 assignments commits as ONE
+// entry. That is the whole throughput argument — the expensive part (deciding)
+// ran in parallel on a snapshot, and a single fsync is amortized across every
+// assignment in the batch.
+func TestOnePlanCarriesManyAssignments(t *testing.T) {
+	const (
+		pool     = 10
+		capacity = 10
+		tasks    = pool * capacity // exactly fills the cluster
+	)
+	s, _ := newTestService(t)
+	for i := 0; i < pool; i++ {
+		register(t, s, fmt.Sprintf("w-%02d", i), capacity)
+	}
+	submit(t, s, "req-1", tasks)
+
+	// Wait for the pool to fill.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, _, _, largest := s.c.Planner().Stats(); largest >= tasks {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	plans, accepted, rejected, largest := s.c.Planner().Stats()
+	if largest != tasks {
+		t.Errorf("largest plan = %d assignments, want %d in a single entry", largest, tasks)
+	}
+	if accepted != tasks {
+		t.Errorf("accepted = %d, want %d", accepted, tasks)
+	}
+	if rejected != 0 {
+		t.Errorf("rejected = %d, want 0 — nothing was contending", rejected)
+	}
+	// The point of batching: far fewer entries than assignments.
+	if plans >= tasks {
+		t.Errorf("committed %d plans for %d assignments; batching bought nothing", plans, tasks)
+	}
+	t.Logf("%d assignments committed in %d plan(s), largest %d", accepted, plans, largest)
+}
+
+// THE OPTIMISTIC-CONCURRENCY CHECKPOINT: a plan built against a snapshot and
+// invalidated before submission is rejected rather than committed.
+//
+// This is what the planner is FOR. Scheduler workers decide in parallel
+// against snapshots that can go stale; the planner is the referee that checks
+// against current state before anything commits.
+func TestStalePlanIsRejected(t *testing.T) {
+	s, _ := newTestService(t)
+	register(t, s, "w-1", 1)
+	register(t, s, "w-2", 1)
+	submit(t, s, "req-1", 1)
+
+	// Let the pipeline place the task on someone.
+	assigned := awaitTask(t, s, "w-1")
+
+	// Now build a plan from a snapshot taken BEFORE that assignment — i.e.
+	// one that still believes the task is PENDING at attempt 0.
+	stale := &sched.Plan{
+		EvalID: "eval/stale",
+		JobID:  assigned.GetJobId(),
+		Assignments: []sched.Assignment{{
+			TaskID:        assigned.GetTaskId(),
+			WorkerID:      "w-2",
+			Attempt:       1, // the live attempt is already 1 and ASSIGNED
+			LeaseExpiryMs: 1 << 40,
+		}},
+	}
+	res := s.c.Planner().Submit(stale)
+
+	if res.Accepted != 0 {
+		t.Errorf("accepted = %d, want 0 — the task was no longer PENDING", res.Accepted)
+	}
+	if res.Rejected != 1 {
+		t.Errorf("rejected = %d, want 1", res.Rejected)
+	}
+	// And the live assignment is untouched.
+	after := awaitState(t, s, assigned.GetTaskId(), state.TaskAssigned)
+	if after.WorkerID != "w-1" {
+		t.Errorf("worker = %q, want w-1 — a stale plan must not steal a task", after.WorkerID)
+	}
+}
+
+// A plan that partially holds commits the part that does. Rejecting the whole
+// batch because one assignment went stale would throw away good work.
+func TestPlannerPartiallyAcceptsPlan(t *testing.T) {
+	s, _ := newTestService(t)
+	register(t, s, "w-1", 1)
+	submit(t, s, "req-1", 3)
+	taken := awaitTask(t, s, "w-1")
+
+	// Find a task that is still pending.
+	var pending string
+	s.c.read(func(st *state.StateStore) {
+		for _, id := range st.TaskIDs() {
+			if tk, _ := st.Task(id); tk.State == state.TaskPending {
+				pending = id
+				return
+			}
+		}
+	})
+	if pending == "" {
+		t.Fatal("expected a pending task to remain")
+	}
+
+	register(t, s, "w-2", 1)
+	mixed := &sched.Plan{
+		EvalID: "eval/mixed",
+		JobID:  taken.GetJobId(),
+		Assignments: []sched.Assignment{
+			{TaskID: taken.GetTaskId(), WorkerID: "w-2", Attempt: 1, LeaseExpiryMs: 1 << 40}, // stale
+			{TaskID: pending, WorkerID: "w-2", Attempt: 1, LeaseExpiryMs: 1 << 40},           // good
+		},
+	}
+	res := s.c.Planner().Submit(mixed)
+	if res.Accepted != 1 || res.Rejected != 1 {
+		t.Errorf("accepted = %d rejected = %d, want 1 and 1", res.Accepted, res.Rejected)
+	}
+	if got := awaitState(t, s, pending, state.TaskAssigned); got.WorkerID != "w-2" {
+		t.Errorf("worker = %q, want w-2", got.WorkerID)
+	}
+}
+
+// BLOCKED EVALUATIONS: more work than capacity must not starve.
+//
+// An eval that cannot place everything is blocked rather than dropped, and a
+// completing task releases it. Without this the tasks beyond the first
+// capacity-worth sit PENDING forever, because CompleteTask emits no trigger.
+func TestBlockedEvalDrainsAsCapacityFrees(t *testing.T) {
+	const tasks = 6
+	s, _ := newTestService(t)
+	register(t, s, "w-1", 1) // one slot for six tasks
+	submit(t, s, "req-1", tasks)
+
+	// First task placed; the rest have nowhere to go, so the eval blocks.
+	first := awaitTask(t, s, "w-1")
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, blocked := s.c.BrokerStats(); blocked > 0 {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if _, blocked := s.c.BrokerStats(); blocked == 0 {
+		t.Fatal("no eval blocked; the remaining tasks would starve")
+	}
+
+	// Drain by completing one at a time. Each completion unblocks the eval,
+	// which re-plans against the freed slot.
+	seen := map[string]bool{first.GetTaskId(): true}
+	current := first
+	for i := 0; i < tasks; i++ {
+		if _, err := s.ReportResult(context.Background(), &schedulerpb.ReportResultRequest{
+			WorkerId: "w-1", TaskId: current.GetTaskId(), Attempt: current.GetAttempt(),
+			ExitCode: 0, ResultRef: "/data/w-1",
+		}); err != nil {
+			t.Fatalf("report: %v", err)
+		}
+		if i == tasks-1 {
+			break
+		}
+		current = awaitTask(t, s, "w-1")
+		if seen[current.GetTaskId()] {
+			t.Fatalf("task %s dispatched twice", current.GetTaskId())
+		}
+		seen[current.GetTaskId()] = true
+	}
+
+	awaitAllTerminal(t, s, tasks, 5*time.Second)
+	if len(seen) != tasks {
+		t.Errorf("ran %d distinct tasks, want %d", len(seen), tasks)
+	}
+}
+
+// A worker JOINING is new capacity, and must wake a blocked eval. Otherwise a
+// job submitted before any worker existed would never run.
+func TestBlockedEvalWakesWhenAWorkerJoins(t *testing.T) {
+	s, _ := newTestService(t)
+	submit(t, s, "req-1", 2) // no workers at all yet
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, blocked := s.c.BrokerStats(); blocked > 0 {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if _, blocked := s.c.BrokerStats(); blocked == 0 {
+		t.Fatal("eval did not block with no workers available")
+	}
+
+	register(t, s, "w-1", 2)
+	if task := awaitTask(t, s, "w-1"); task == nil {
+		t.Fatal("blocked eval never woke after a worker joined")
+	}
+}
+
+// DERIVED, NOT REPLICATED: a new leader rebuilds the broker by SCANNING
+// COMMITTED STATE, with none of the previous leader's in-memory queue.
+//
+// This simulates the failover Day 6 makes real: tear the pipeline down
+// (losing every queued and blocked eval) and start a fresh one.
+func TestBrokerRebuildsFromCommittedState(t *testing.T) {
+	s, _ := newTestService(t)
+	submit(t, s, "req-1", 4) // no workers; everything pends, eval blocks
+
+	// Leadership lost: the entire in-memory queue goes away.
+	s.c.StopScheduling()
+	if ready, blocked := s.c.BrokerStats(); ready != 0 || blocked != 0 {
+		t.Fatalf("broker survived teardown: ready=%d blocked=%d", ready, blocked)
+	}
+
+	// Leadership acquired: rebuild from state alone.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s.c.StartScheduling(ctx)
+	t.Cleanup(s.c.StopScheduling)
+
+	register(t, s, "w-1", 4)
+	if task := awaitTask(t, s, "w-1"); task == nil {
+		t.Fatal("rebuilt broker found no pending work")
+	}
+	awaitAllTerminalAfterCompleting(t, s, "w-1", 4)
+}
+
+// awaitAllTerminalAfterCompleting drains a worker's queue by reporting
+// success on whatever it is handed.
+func awaitAllTerminalAfterCompleting(t *testing.T, s *Service, workerID string, n int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		task := requestNow(t, s, workerID)
+		if task == nil {
+			done := 0
+			s.c.read(func(st *state.StateStore) {
+				for _, id := range st.TaskIDs() {
+					if tk, _ := st.Task(id); tk.State == state.TaskComplete {
+						done++
+					}
+				}
+			})
+			if done >= n {
+				return
+			}
+			time.Sleep(2 * time.Millisecond)
+			continue
+		}
+		if _, err := s.ReportResult(context.Background(), &schedulerpb.ReportResultRequest{
+			WorkerId: workerID, TaskId: task.GetTaskId(), Attempt: task.GetAttempt(),
+			ExitCode: 0, ResultRef: "/data/" + workerID,
+		}); err != nil {
+			t.Fatalf("report: %v", err)
+		}
+	}
+	t.Fatalf("did not complete %d tasks in time", n)
 }

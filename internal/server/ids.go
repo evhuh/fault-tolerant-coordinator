@@ -4,6 +4,8 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+
+	"github.com/evazheng/fault-tolerant-coordinator/internal/state"
 )
 
 // IDs are minted by the LEADER, before proposing, and baked into the command.
@@ -33,9 +35,35 @@ func taskID(jobID string, index int) string {
 	return fmt.Sprintf("%s/%04d", jobID, index)
 }
 
-// placeholderEvalID exists only because applyPlan requires a non-empty
-// eval_id and Day 3 has no evaluations yet. Day 4 deletes it along with
-// assign(): every plan will then carry the id of the eval it came from.
-func placeholderEvalID(taskID string, attempt int32) string {
-	return fmt.Sprintf("placeholder/%s/%d", taskID, attempt)
+// evalIDFor derives an eval id from the trigger that caused it.
+//
+// It must be DETERMINISTIC and unique per occurrence. Deterministic because
+// applyCreateEval is an idempotent no-op on a repeated id, so a leader that
+// re-proposes after an ambiguous outcome must land on the same id rather than
+// creating a second eval. Unique per occurrence because the reverse failure —
+// two genuinely different events colliding on one id — would silently drop
+// the second one.
+//
+// (taskID, attempt, reason) satisfies both: a given dispatch attempt can have
+// its lease expire once and fail once, and those are different reasons.
+func evalIDFor(t state.EvalTrigger) string {
+	if t.TaskID == "" {
+		// Job-level: a job is submitted exactly once.
+		return fmt.Sprintf("eval/%s/%s", t.JobID, reasonSlug(t.Reason))
+	}
+	return fmt.Sprintf("eval/%s/%d/%s", t.TaskID, t.Attempt, reasonSlug(t.Reason))
+}
+
+func reasonSlug(r state.EvalReason) string {
+	switch r {
+	case state.EvalJobSubmitted:
+		return "submitted"
+	case state.EvalTaskFailed:
+		return "failed"
+	case state.EvalWorkerLost:
+		return "worker-lost"
+	case state.EvalLeaseExpired:
+		return "lease-expired"
+	}
+	return "unknown"
 }

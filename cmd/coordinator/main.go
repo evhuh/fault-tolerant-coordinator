@@ -26,11 +26,16 @@ func main() {
 	addr := flag.String("addr", ":8080", "gRPC listen address")
 	leaseTTL := flag.Duration("lease-ttl", 2000*time.Millisecond, "worker lease TTL (4 missed heartbeats at H=500ms)")
 	tickPeriod := flag.Duration("tick", 200*time.Millisecond, "how often to propose Tick{nowMs}")
+	schedWorkers := flag.Int("scheduler-workers", 4, "evals decided concurrently")
+	maxPlanSize := flag.Int("max-plan-size", 1000, "assignments per committed plan")
 	flag.Parse()
 
 	cfg := server.DefaultConfig()
 	cfg.LeaseTTL = *leaseTTL
 	cfg.TickPeriod = *tickPeriod
+	cfg.Sched.Workers = *schedWorkers
+	cfg.Sched.MaxPlanSize = *maxPlanSize
+	cfg.Sched.LeaseTTLMs = leaseTTL.Milliseconds()
 
 	coord := server.New(cfg)
 	svc := server.NewService(coord)
@@ -49,13 +54,20 @@ func main() {
 	defer stop()
 	go coord.RunTicker(ctx)
 
+	// Leader-only components. On Day 6 these move under establishLeadership,
+	// and StopScheduling runs on leadership loss — stopping cleanly is what
+	// prevents two leaders scheduling against the same state.
+	coord.StartScheduling(ctx)
+	defer coord.StopScheduling()
+
 	go func() {
 		<-ctx.Done()
 		log.Print("coordinator: shutting down")
 		gs.GracefulStop()
 	}()
 
-	log.Printf("coordinator: listening on %s (lease=%s tick=%s)", *addr, cfg.LeaseTTL, cfg.TickPeriod)
+	log.Printf("coordinator: listening on %s (lease=%s tick=%s schedulers=%d max-plan=%d)",
+		*addr, cfg.LeaseTTL, cfg.TickPeriod, cfg.Sched.Workers, cfg.Sched.MaxPlanSize)
 	if err := gs.Serve(lis); err != nil {
 		log.Fatalf("serve: %v", err)
 	}

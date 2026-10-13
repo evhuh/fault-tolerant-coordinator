@@ -19,6 +19,9 @@ import (
 // defaultMaxAttempts applies when a TaskSpec omits it. Any defaulting done here must be a constant, never a configured or environment-derived value: a replica configured differently would diverge
 const defaultMaxAttempts int32 = 3
 
+// defaultCapacity applies when a worker registers without declaring one. Like defaultMaxAttempts it must be a CONSTANT: a replica that defaulted differently would diverge
+const defaultCapacity int32 = 1
+
 // TaskState and JobState are the state machine's own types, deliberately not the generated API enums. The API schema evolves for clients; this one evolves for the log. Conversion happens at the server boundary.
 type TaskState uint8
 
@@ -106,6 +109,13 @@ type Result struct {
 	JobID    string
 	WorkerID string
 	EvalID   string
+	// WorkerAdmitted is true when a RegisterWorker CREATED or REVIVED a
+	// worker, as opposed to merely renewing a live one's lease. That
+	// distinction matters to the leader: new capacity should wake evals
+	// blocked for want of a worker, but a routine heartbeat should not — at
+	// H=500ms per worker, unblocking on every renewal would turn blocked
+	// evals into a polling loop.
+	WorkerAdmitted bool
 	// EvalTriggers are evals the leader should propose as a consequence of this
 	// command. Deterministically computed on every replica; only the leader
 	// acts on them.
@@ -136,6 +146,8 @@ type Worker struct {
 	State         WorkerState
 	RegisteredMs  int64
 	LeaseExpiryMs int64
+	// Capacity is how many tasks this worker runs at once. The planner needs it to decide whether a worker has room; the state machine only stores it, because "is this worker full" is a scheduling POLICY question and policy lives in the planner, not in apply
+	Capacity int32
 }
 
 // EvalReason mirrors commandpb.EvalTrigger: why someone should re-think a job.
@@ -183,6 +195,8 @@ type EvalTrigger struct {
 	JobID  string
 	TaskID string // empty when the trigger is job-level
 	Reason EvalReason
+	// Attempt is the task's dispatch counter at the moment the trigger fired. It exists to make the eval id DERIVABLE: applyCreateEval is idempotent only on a repeated eval_id, so a random id would create a duplicate whenever the leader re-proposes. (taskID, attempt, reason) is unique per occurrence, because a given attempt can expire once and fail once
+	Attempt int32
 }
 
 type sessionKey struct {
@@ -396,12 +410,20 @@ func (s *StateStore) applyRegisterWorker(c *commandpb.RegisterWorker) (Result, e
 
 	// (2) A worker that was marked LOST and comes back is revived, not rejected: a restarted worker re-registering is normal operation
 	w, exists := s.workers[c.GetWorkerId()]
+	admitted := !exists || w.State != WorkerAlive
 	if !exists {
 		w = &Worker{ID: c.GetWorkerId(), RegisteredMs: c.GetRegisteredMs()}
 		s.workers[w.ID] = w
 	}
 	w.State = WorkerAlive
 	w.LeaseExpiryMs = c.GetLeaseExpiryMs()
+	// Capacity is re-read on every renewal, so a restarted worker running with
+	// a different -concurrency takes effect without a separate command.
+	if cap := c.GetCapacity(); cap > 0 {
+		w.Capacity = cap
+	} else if w.Capacity == 0 {
+		w.Capacity = defaultCapacity
+	}
 
 	// Membership set for the worker's claim. Building it is deterministic; only the SCAN below may influence state, and that is over sorted ids
 	claimed := make(map[string]bool, len(c.GetRunningTaskIds()))
@@ -424,7 +446,7 @@ func (s *StateStore) applyRegisterWorker(c *commandpb.RegisterWorker) (Result, e
 			t.State = TaskRunning
 		}
 	}
-	return Result{WorkerID: w.ID}, nil
+	return Result{WorkerID: w.ID, WorkerAdmitted: admitted}, nil
 }
 
 // 3. Tick
@@ -495,9 +517,10 @@ func (s *StateStore) applyTick(c *commandpb.Tick) (Result, error) {
 
 		t.State = TaskPending
 		res.EvalTriggers = append(res.EvalTriggers, EvalTrigger{
-			JobID:  t.JobID,
-			TaskID: t.ID,
-			Reason: reason,
+			JobID:   t.JobID,
+			TaskID:  t.ID,
+			Reason:  reason,
+			Attempt: t.Attempt,
 		})
 	}
 	return res, nil
@@ -702,9 +725,10 @@ func (s *StateStore) applyFailTask(c *commandpb.FailTask) (Result, error) {
 	if c.GetRetryable() && t.Attempt < t.Spec.MaxAttempts {
 		t.State = TaskPending
 		res.EvalTriggers = append(res.EvalTriggers, EvalTrigger{
-			JobID:  t.JobID,
-			TaskID: t.ID,
-			Reason: EvalTaskFailed,
+			JobID:   t.JobID,
+			TaskID:  t.ID,
+			Reason:  EvalTaskFailed,
+			Attempt: t.Attempt,
 		})
 	} else {
 		t.State = TaskFailed

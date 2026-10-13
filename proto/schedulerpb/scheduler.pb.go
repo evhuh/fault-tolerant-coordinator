@@ -684,8 +684,12 @@ func (x *ListJobsResponse) GetJobs() []*Job {
 }
 
 type RegisterWorkerRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	WorkerId      string                 `protobuf:"bytes,1,opt,name=worker_id,json=workerId,proto3" json:"worker_id,omitempty"`
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	WorkerId string                 `protobuf:"bytes,1,opt,name=worker_id,json=workerId,proto3" json:"worker_id,omitempty"`
+	// How many tasks this worker runs at once. The planner needs it to decide
+	// whether a worker has room, because Day 4 assigns proactively rather than
+	// waiting for the worker to pull.
+	Capacity      int32 `protobuf:"varint,2,opt,name=capacity,proto3" json:"capacity,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -725,6 +729,13 @@ func (x *RegisterWorkerRequest) GetWorkerId() string {
 		return x.WorkerId
 	}
 	return ""
+}
+
+func (x *RegisterWorkerRequest) GetCapacity() int32 {
+	if x != nil {
+		return x.Capacity
+	}
+	return 0
 }
 
 type RegisterWorkerResponse struct {
@@ -1139,9 +1150,10 @@ const file_scheduler_proto_rawDesc = "" +
 	"\x0fListJobsRequest\x12\x14\n" +
 	"\x05limit\x18\x01 \x01(\x05R\x05limit\"9\n" +
 	"\x10ListJobsResponse\x12%\n" +
-	"\x04jobs\x18\x01 \x03(\v2\x11.scheduler.v1.JobR\x04jobs\"4\n" +
+	"\x04jobs\x18\x01 \x03(\v2\x11.scheduler.v1.JobR\x04jobs\"P\n" +
 	"\x15RegisterWorkerRequest\x12\x1b\n" +
-	"\tworker_id\x18\x01 \x01(\tR\bworkerId\":\n" +
+	"\tworker_id\x18\x01 \x01(\tR\bworkerId\x12\x1a\n" +
+	"\bcapacity\x18\x02 \x01(\x05R\bcapacity\":\n" +
 	"\x16RegisterWorkerResponse\x12 \n" +
 	"\flease_ttl_ms\x18\x01 \x01(\x03R\n" +
 	"leaseTtlMs\"J\n" +

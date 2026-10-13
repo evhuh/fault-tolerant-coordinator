@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/evazheng/fault-tolerant-coordinator/internal/sched"
 	"github.com/evazheng/fault-tolerant-coordinator/internal/state"
 	commandpb "github.com/evazheng/fault-tolerant-coordinator/proto/commandpb"
 )
@@ -32,6 +33,8 @@ type Config struct {
 	TickPeriod time.Duration
 	// CommandVersion is stamped on every command this build proposes.
 	CommandVersion uint32
+	// Sched tunes the scheduling pipeline.
+	Sched sched.Config
 }
 
 func DefaultConfig() Config {
@@ -39,6 +42,7 @@ func DefaultConfig() Config {
 		LeaseTTL:       2000 * time.Millisecond, // 4 missed heartbeats at H=500ms
 		TickPeriod:     200 * time.Millisecond,
 		CommandVersion: 1,
+		Sched:          sched.DefaultConfig(),
 	}
 }
 
@@ -56,6 +60,14 @@ type Coordinator struct {
 	// time from Tick-carried timestamps instead. Held as a field so Day 8 can
 	// replace it with an injected clock without touching call sites.
 	now func() time.Time
+
+	// The scheduling pipeline. LEADER-ONLY and in-memory: none of it is
+	// replicated, and on Day 6 it starts on election and stops on loss.
+	// Nil until StartScheduling, which is what keeps the state machine
+	// usable on its own in tests.
+	broker    *sched.Broker
+	planner   *Planner
+	scheduler *sched.Scheduler
 }
 
 func New(cfg Config) *Coordinator {
@@ -75,8 +87,89 @@ func (c *Coordinator) nowMs() int64 { return c.now().UnixMilli() }
 func (c *Coordinator) propose(cmd *commandpb.Command) (state.Result, error) {
 	cmd.Version = c.cfg.CommandVersion
 	c.mu.Lock()
+	res, err := c.store.Apply(cmd)
+	c.mu.Unlock()
+	if err != nil {
+		return res, err
+	}
+	// Outside the lock, deliberately: afterApply proposes further commands
+	// and touches the broker, and doing either under c.mu would deadlock.
+	c.afterApply(cmd, res)
+	return res, nil
+}
+
+// afterApply is the leader's reaction to state it just committed.
+//
+// Two things happen here, and both are LEADER-ONLY. Followers compute the
+// identical Result and discard it — that is why the state machine returns
+// EvalTriggers instead of acting on them.
+//
+// Day 6 moves this to the Ready loop, where it runs on committed entries
+// rather than on a direct Apply, guarded by whether this node leads.
+func (c *Coordinator) afterApply(cmd *commandpb.Command, res state.Result) {
+	if c.broker == nil {
+		return // scheduling pipeline not started (tests, or a follower)
+	}
+
+	// (1) Every trigger becomes an evaluation. The id is DERIVED from what
+	// caused it, never random: applyCreateEval is idempotent only on a
+	// repeated eval_id, so a random one would duplicate on re-propose.
+	for _, trig := range res.EvalTriggers {
+		id := evalIDFor(trig)
+		prio := c.priorityOf(trig.JobID)
+		if _, err := c.propose(createEvalCmd(id, trig, prio, c.storeNowMs())); err != nil {
+			continue // a trigger for a vanished job; a rescan would find it anyway
+		}
+		c.broker.Enqueue(sched.Eval{
+			ID:          id,
+			JobID:       trig.JobID,
+			Priority:    prio,
+			TriggeredBy: trig.Reason,
+			CreatedMs:   c.storeNowMs(),
+		})
+	}
+
+	// (2) Capacity changed. CompleteTask emits no trigger — finishing a task
+	// is not a reason to re-think a job — but it IS a reason to re-think the
+	// jobs that had nowhere to run. Without this, blocked evals never wake
+	// and pending tasks starve.
+	//
+	// A worker JOINING is new capacity too, so it unblocks as well. But only
+	// a genuine admission: at one heartbeat per worker per 500ms, unblocking
+	// on every lease renewal would make blocked evals a polling loop.
+	switch cmd.GetKind().(type) {
+	case *commandpb.Command_CompleteTask, *commandpb.Command_FailTask:
+		c.broker.Unblock()
+	case *commandpb.Command_RegisterWorker:
+		if res.WorkerAdmitted {
+			c.broker.Unblock()
+		}
+	}
+}
+
+func (c *Coordinator) storeNowMs() int64 {
+	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.store.Apply(cmd)
+	return c.store.NowMs()
+}
+
+// priorityOf reads a job's priority so an eval inherits it. A missing job
+// sorts at zero rather than erroring: the eval is about to be rejected by
+// applyCreateEval anyway.
+func (c *Coordinator) priorityOf(jobID string) int32 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if j, ok := c.store.Job(jobID); ok {
+		return j.Priority
+	}
+	return 0
+}
+
+// Snapshot satisfies sched.Snapshotter.
+func (c *Coordinator) Snapshot() *state.Snapshot {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.store.Snapshot()
 }
 
 // read runs fn under the same lock as propose. Every read of the store goes
@@ -105,9 +198,10 @@ func (c *Coordinator) RunTicker(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			// A Tick whose lease expiries produce EvalTriggers is the normal
-			// case; Day 3 drops them, because assign() rediscovers pending
-			// work by scanning state. Day 4's broker consumes them.
+			// A Tick whose lease expiries produce EvalTriggers is the
+			// normal case: afterApply turns each into a CreateEval and
+			// hands it to the broker, which is how a reclaimed task gets
+			// rescheduled.
 			if _, err := c.propose(tickCmd(c.nowMs())); err != nil {
 				// Tick has no failure mode other than a malformed payload,
 				// which would be a bug in this file.
@@ -115,63 +209,6 @@ func (c *Coordinator) RunTicker(ctx context.Context) {
 			}
 		}
 	}
-}
-
-// ---------------------------------------------------------------------------
-// The assignment placeholder — DELETE ALL OF THIS ON DAY 4.
-//
-// This is the mechanism ("task, meet worker") with none of the policy. It is
-// deliberately naive:
-//
-//   - It scans the StateStore instead of popping a queue, because the source
-//     of truth for "what is pending" is committed state. A mutable side list
-//     would be a wrong proto-eval-broker; the real broker is DERIVED from
-//     committed state and rebuilt on leadership change.
-//   - It has no priority ordering, no batching, and no conflict checking
-//     beyond what applyPlan already does.
-//   - It does not referee races. If two workers reach for the same task, the
-//     second ApplyPlan fails its PENDING check and that worker polls again.
-//     The state machine is already the backstop, so the placeholder is
-//     allowed to be dumb.
-//
-// Day 4 replaces the body with the eval-broker -> scheduler -> planner
-// pipeline and deletes the call from RequestTask. The worker binary, the
-// executor, ApplyPlan/applyPlan, and the proto surface must not move.
-// ---------------------------------------------------------------------------
-
-// assign finds the first dispatchable task and returns a one-assignment plan.
-// The caller must hold c.mu.
-func (c *Coordinator) assign(workerID string) (*commandpb.Command, bool) {
-	w, ok := c.store.Worker(workerID)
-	if !ok || w.State != state.WorkerAlive {
-		// An unregistered or lease-lapsed worker gets nothing; it must
-		// re-register first. Assigning to it would only be rejected by
-		// applyPlan's ALIVE check anyway.
-		return nil, false
-	}
-
-	for _, id := range c.store.TaskIDs() {
-		t, ok := c.store.Task(id)
-		if !ok || t.State != state.TaskPending {
-			continue
-		}
-		// Respect the attempt budget applyPlan enforces, or we would propose
-		// a plan that can only ever be rejected and spin on it. Tick's
-		// reclaim path already takes exhausted tasks terminal; an ApplyPlan
-		// stop does not, which is a Day 4 gap noted in the roadmap.
-		if t.Attempt >= t.Spec.MaxAttempts {
-			continue
-		}
-
-		attempt := t.Attempt + 1
-		return applyPlanCmd(placeholderEvalID(t.ID, attempt), &commandpb.Assignment{
-			TaskId:        t.ID,
-			WorkerId:      workerID,
-			Attempt:       attempt,
-			LeaseExpiryMs: c.nowMs() + c.cfg.LeaseTTL.Milliseconds(),
-		}), true
-	}
-	return nil, false
 }
 
 // ---------------------------------------------------------------------------
@@ -196,7 +233,7 @@ func applyPlanCmd(evalID string, assignments ...*commandpb.Assignment) *commandp
 // registerWorkerCmd doubles as the heartbeat: there is no Heartbeat command,
 // so renewal is re-registration with a fresh lease, and runningTaskIDs is the
 // worker's acknowledgement that promotes ASSIGNED -> RUNNING.
-func (c *Coordinator) registerWorkerCmd(workerID string, runningTaskIDs []string) *commandpb.Command {
+func (c *Coordinator) registerWorkerCmd(workerID string, runningTaskIDs []string, capacity int32) *commandpb.Command {
 	now := c.nowMs()
 	return &commandpb.Command{
 		Kind: &commandpb.Command_RegisterWorker{
@@ -205,7 +242,81 @@ func (c *Coordinator) registerWorkerCmd(workerID string, runningTaskIDs []string
 				RegisteredMs:   now,
 				LeaseExpiryMs:  now + c.cfg.LeaseTTL.Milliseconds(),
 				RunningTaskIds: runningTaskIDs,
+				Capacity:       capacity,
 			},
 		},
 	}
+}
+
+// createEvalCmd turns a trigger into the one command that puts an Eval in
+// state. The eval id is derived, never random — see evalIDFor.
+func createEvalCmd(evalID string, trig state.EvalTrigger, priority int32, nowMs int64) *commandpb.Command {
+	return &commandpb.Command{
+		Kind: &commandpb.Command_CreateEval{
+			CreateEval: &commandpb.CreateEval{
+				EvalId:      evalID,
+				JobId:       trig.JobID,
+				Priority:    priority,
+				TriggeredBy: evalReasonToProto(trig.Reason),
+				CreatedMs:   nowMs,
+			},
+		},
+	}
+}
+
+func evalReasonToProto(r state.EvalReason) commandpb.EvalTrigger {
+	switch r {
+	case state.EvalJobSubmitted:
+		return commandpb.EvalTrigger_EVAL_TRIGGER_JOB_SUBMITTED
+	case state.EvalTaskFailed:
+		return commandpb.EvalTrigger_EVAL_TRIGGER_TASK_FAILED
+	case state.EvalWorkerLost:
+		return commandpb.EvalTrigger_EVAL_TRIGGER_WORKER_LOST
+	case state.EvalLeaseExpired:
+		return commandpb.EvalTrigger_EVAL_TRIGGER_LEASE_EXPIRED
+	}
+	return commandpb.EvalTrigger_EVAL_TRIGGER_UNSPECIFIED
+}
+
+// ---------------------------------------------------------------------------
+// Leader-only lifecycle. Day 6 calls these from establishLeadership and
+// revokeLeadership; stopping cleanly is what prevents split-brain scheduling.
+// ---------------------------------------------------------------------------
+
+// StartScheduling builds the broker, rebuilds it from committed state, and
+// launches the planner and scheduler workers.
+//
+// The rebuild is the point: a brand-new leader reconstructs its queue by
+// SCANNING STATE, with none of the previous leader's memory. That is what
+// makes derived-not-replicated correct.
+func (c *Coordinator) StartScheduling(ctx context.Context) {
+	c.broker = sched.NewBroker()
+	c.planner = NewPlanner(c)
+	c.scheduler = sched.NewScheduler(c.cfg.Sched, c.broker, c, c.planner)
+
+	c.broker.Rebuild(c.Snapshot(), func(jobID string) string {
+		return "eval/" + jobID + "/rebuild"
+	})
+	c.scheduler.Start(ctx)
+}
+
+// StopScheduling tears the pipeline down and waits for the workers to exit.
+func (c *Coordinator) StopScheduling() {
+	if c.broker == nil {
+		return
+	}
+	c.broker.Close()
+	c.scheduler.Wait()
+	c.broker, c.scheduler, c.planner = nil, nil, nil
+}
+
+// Planner exposes the planner's counters for tests and metrics.
+func (c *Coordinator) Planner() *Planner { return c.planner }
+
+// BrokerStats reports queue depth: ready evals and blocked ones.
+func (c *Coordinator) BrokerStats() (ready, blocked int) {
+	if c.broker == nil {
+		return 0, 0
+	}
+	return c.broker.Stats()
 }

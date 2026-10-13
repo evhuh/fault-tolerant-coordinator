@@ -85,7 +85,13 @@ message ListJobsResponse { repeated Job jobs = 1; }
 
 // Worker-facing RPCs — workers always dial in; the coordinator never dials out
 
-message RegisterWorkerRequest  { string worker_id = 1; }
+message RegisterWorkerRequest {
+  string worker_id = 1;
+  // How many tasks this worker runs at once. The planner needs it to decide
+  // whether a worker has room, because Day 4 assigns proactively rather than
+  // waiting for the worker to pull.
+  int32  capacity  = 2;
+}
 message RegisterWorkerResponse { int64 lease_ttl_ms = 1; }
 
 // Long-poll. Delivers an assignment that was already decided and committed by

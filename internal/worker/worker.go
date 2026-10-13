@@ -91,8 +91,11 @@ func (w *Worker) Run(ctx context.Context) error {
 }
 
 func (w *Worker) register(ctx context.Context) error {
+	// Declaring capacity is what lets the planner assign proactively. Day 3
+	// did not need it: workers pulled, so they self-limited by construction.
 	_, err := w.client.RegisterWorker(ctx, &schedulerpb.RegisterWorkerRequest{
 		WorkerId: w.cfg.WorkerID,
+		Capacity: int32(w.cfg.Concurrency),
 	})
 	return err
 }

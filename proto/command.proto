@@ -117,6 +117,8 @@ message RegisterWorker {
   // Tasks this worker reports itself actively executing, carried up by the Heartbeat RPC. This is what promotes ASSIGNED -> RUNNING: there is no separate ack command, because the command set stays closed and RequestTask must remain a pure read
   // Added after fields 1-3 were already in logs. A new number is always safe
   repeated string running_task_ids = 4;
+  // How many tasks this worker runs at once. Day 3 did not need it: workers PULLED, so they self-limited. Day 4's planner assigns PROACTIVELY, so it must know how much room a worker has to verify "worker already busy". Reported by the worker at registration
+  int32 capacity = 5;
 }
 
 // The clock. Proposed by the leader every ~200ms; lease expiry reads now_ms

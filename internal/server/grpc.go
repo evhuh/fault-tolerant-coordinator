@@ -113,7 +113,10 @@ func (s *Service) RegisterWorker(ctx context.Context, req *schedulerpb.RegisterW
 	if req.GetWorkerId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "empty worker_id")
 	}
-	if _, err := s.c.propose(s.c.registerWorkerCmd(req.GetWorkerId(), nil)); err != nil {
+	// The worker declares how many tasks it runs at once. The planner needs
+	// it to answer "does this worker have room" — Day 3 did not, because
+	// workers pulled and self-limited.
+	if _, err := s.c.propose(s.c.registerWorkerCmd(req.GetWorkerId(), nil, req.GetCapacity())); err != nil {
 		return nil, status.Errorf(codes.Internal, "register worker: %v", err)
 	}
 	return &schedulerpb.RegisterWorkerResponse{LeaseTtlMs: s.c.cfg.LeaseTTL.Milliseconds()}, nil
@@ -127,7 +130,9 @@ func (s *Service) Heartbeat(ctx context.Context, req *schedulerpb.HeartbeatReque
 	if req.GetWorkerId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "empty worker_id")
 	}
-	if _, err := s.c.propose(s.c.registerWorkerCmd(req.GetWorkerId(), req.GetRunningTaskIds())); err != nil {
+	// Capacity 0 means "unchanged": a heartbeat renews the lease and
+	// republishes the running claim, it does not redeclare the worker.
+	if _, err := s.c.propose(s.c.registerWorkerCmd(req.GetWorkerId(), req.GetRunningTaskIds(), 0)); err != nil {
 		return nil, status.Errorf(codes.Internal, "heartbeat: %v", err)
 	}
 
@@ -140,16 +145,17 @@ func (s *Service) Heartbeat(ctx context.Context, req *schedulerpb.HeartbeatReque
 	return &schedulerpb.HeartbeatResponse{LeaseExpiryMs: expiry}, nil
 }
 
-// RequestTask has two clauses, and the split is the Day 4 seam.
+// RequestTask is a PURE READ.
 //
-//	(1) return a task already assigned to this worker — a PURE READ, because
-//	    the assignment was decided and committed by an ApplyPlan already;
-//	    delivering a decision is not a mutation.
-//	(2) only if there is none, run the placeholder assigner.
+// It hands a worker a task the planner already decided on and committed via
+// ApplyPlan. Delivering a decision is not making one, so this RPC mutates
+// nothing — which is why there is no eighth command for it.
 //
-// On Day 4 clause (2) is DELETED: the planner produces ASSIGNED tasks
-// proactively and this handler keeps only its read half. The seam is a branch
-// removed, not a handler rewritten.
+// This is what the Day 3 seam became. That version had a second clause that
+// called assign() inline, scanning for a PENDING task and dispatching it on
+// the worker's poll. Day 4 deleted it: the planner now produces ASSIGNED
+// tasks proactively, so the handler keeps only its read half. The worker
+// binary, the executor, and the ApplyPlan command did not move.
 func (s *Service) RequestTask(ctx context.Context, req *schedulerpb.RequestTaskRequest) (*schedulerpb.RequestTaskResponse, error) {
 	if req.GetWorkerId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "empty worker_id")
@@ -162,9 +168,7 @@ func (s *Service) RequestTask(ctx context.Context, req *schedulerpb.RequestTaskR
 	deadline := time.Now().Add(wait)
 
 	for {
-		// Clause (1) and (2) share one lock acquisition, so a task assigned
-		// to this worker by a concurrent poll cannot be missed between them.
-		task, found := s.tryDispatch(req.GetWorkerId())
+		task, found := s.heldTask(req.GetWorkerId())
 		if found {
 			return &schedulerpb.RequestTaskResponse{Task: taskToProto(task)}, nil
 		}
@@ -182,41 +186,25 @@ func (s *Service) RequestTask(ctx context.Context, req *schedulerpb.RequestTaskR
 	}
 }
 
-// tryDispatch runs both RequestTask clauses under one lock.
-func (s *Service) tryDispatch(workerID string) (state.Task, bool) {
-	s.c.mu.Lock()
-	// (1) Already mine? Sorted scan, so the answer does not depend on map
-	// iteration order.
-	for _, id := range s.c.store.TaskIDs() {
-		t, ok := s.c.store.Task(id)
-		if !ok || t.WorkerID != workerID {
-			continue
-		}
-		if t.State == state.TaskAssigned || t.State == state.TaskRunning {
-			s.c.mu.Unlock()
-			return t, true
-		}
-	}
-	// (2) Otherwise, the placeholder. DELETE ON DAY 4.
-	plan, ok := s.c.assign(workerID)
-	s.c.mu.Unlock()
-	if !ok {
-		return state.Task{}, false
-	}
-
-	if _, err := s.c.propose(plan); err != nil {
-		// A rejected plan is not an error worth reporting. Two workers racing
-		// for the same task is exactly what applyPlan's PENDING check is for:
-		// the loser just polls again. The placeholder is allowed to be naive
-		// because the state machine is already the referee.
-		return state.Task{}, false
-	}
-
-	assigned := plan.GetApplyPlan().GetAssignments()[0].GetTaskId()
+// heldTask returns the task this worker currently holds, if any.
+//
+// The scan is over SORTED ids so the answer never depends on map iteration
+// order. A worker holding several tasks (capacity > 1) gets the lowest-sorted
+// one it has not yet claimed locally; the worker dedups its own claims.
+func (s *Service) heldTask(workerID string) (state.Task, bool) {
 	var out state.Task
 	var found bool
 	s.c.read(func(st *state.StateStore) {
-		out, found = st.Task(assigned)
+		for _, id := range st.TaskIDs() {
+			t, ok := st.Task(id)
+			if !ok || t.WorkerID != workerID {
+				continue
+			}
+			if t.State == state.TaskAssigned {
+				out, found = t, true
+				return
+			}
+		}
 	})
 	return out, found
 }
