@@ -111,6 +111,11 @@ func (p *Planner) Submit(plan *sched.Plan) sched.PlanResult {
 			rejected++
 			continue
 		}
+		// The task picked up a retry backoff after the snapshot was taken.
+		if t.NotBeforeMs > now {
+			rejected++
+			continue
+		}
 		w, ok := p.c.store.Worker(a.WorkerID)
 		if !ok || w.State != state.WorkerAlive {
 			rejected++ // the worker died between snapshot and commit

@@ -274,6 +274,8 @@ func evalReasonToProto(r state.EvalReason) commandpb.EvalTrigger {
 		return commandpb.EvalTrigger_EVAL_TRIGGER_WORKER_LOST
 	case state.EvalLeaseExpired:
 		return commandpb.EvalTrigger_EVAL_TRIGGER_LEASE_EXPIRED
+	case state.EvalBackoffElapsed:
+		return commandpb.EvalTrigger_EVAL_TRIGGER_BACKOFF_ELAPSED
 	}
 	return commandpb.EvalTrigger_EVAL_TRIGGER_UNSPECIFIED
 }

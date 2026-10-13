@@ -10,6 +10,7 @@ package state
 
 import (
 	"fmt"
+	"hash/fnv"
 	"sort"
 
 	commandpb "github.com/evazheng/fault-tolerant-coordinator/proto/commandpb"
@@ -21,6 +22,25 @@ const defaultMaxAttempts int32 = 3
 
 // defaultCapacity applies when a worker registers without declaring one. Like defaultMaxAttempts it must be a CONSTANT: a replica that defaulted differently would diverge
 const defaultCapacity int32 = 1
+
+// Retry backoff policy. These are CONSTANTS for the same reason as the two
+// above: the backoff deadline is computed inside apply, so a replica
+// configured with a different base would place tasks at different times and
+// diverge. Policy that affects state cannot be configuration.
+const (
+	baseBackoffMs int64 = 200
+	maxBackoffMs  int64 = 30_000
+)
+
+// sessionTTLMs bounds (clientID, requestID) dedup. Without it the sessions
+// map grows forever, which is a real leak in an always-on coordinator.
+//
+// The honest consequence: dedup is bounded IN TIME, not absolute. A client
+// that retries a submission more than this long after the original would get
+// a second job. So the TTL must comfortably exceed any sane client retry
+// window, and the guarantee is worth stating that way rather than as
+// "exactly once, forever".
+const sessionTTLMs int64 = 10 * 60 * 1000 // 10 minutes
 
 // TaskState and JobState are the state machine's own types, deliberately not the generated API enums. The API schema evolves for clients; this one evolves for the log. Conversion happens at the server boundary.
 type TaskState uint8
@@ -90,6 +110,14 @@ type Task struct {
 	ResultRef     string // path on the worker's disk; the output never enters the log
 	ExitCode      int32
 	LastError     string
+	// NotBeforeMs holds a retry back off: the task is PENDING but must not be
+	// dispatched until the state machine's clock passes this. Zero means
+	// dispatchable now.
+	//
+	// It lives on derived state rather than in a command because Task is not
+	// log content — only commands are — so this costs no schema change. It is
+	// computed deterministically (see backoffFor), never rolled by the leader.
+	NotBeforeMs int64
 }
 
 type Job struct {
@@ -158,6 +186,7 @@ const (
 	EvalTaskFailed
 	EvalWorkerLost
 	EvalLeaseExpired
+	EvalBackoffElapsed
 )
 
 func (r EvalReason) String() string {
@@ -170,6 +199,8 @@ func (r EvalReason) String() string {
 		return "WORKER_LOST"
 	case EvalLeaseExpired:
 		return "LEASE_EXPIRED"
+	case EvalBackoffElapsed:
+		return "BACKOFF_ELAPSED"
 	}
 	return "UNKNOWN"
 }
@@ -204,6 +235,13 @@ type sessionKey struct {
 	requestID string
 }
 
+// session is a remembered response plus when it was remembered, so Tick can
+// expire it. The timestamp comes from the log, never from a replica's clock.
+type session struct {
+	result    Result
+	createdMs int64
+}
+
 type StateStore struct {
 	jobs    map[string]*Job
 	tasks   map[string]*Task
@@ -216,7 +254,7 @@ type StateStore struct {
 	// sessions maps (clientID, requestID) to the Result first produced for it, so a retried SubmitJob returns the original response instead of creating a second job.
 
 	// TOOD: bound this: expire sessions on a TTL carried by Tick, or it grows without lim
-	sessions map[sessionKey]Result
+	sessions map[sessionKey]session
 }
 
 func New() *StateStore {
@@ -225,7 +263,7 @@ func New() *StateStore {
 		tasks:    make(map[string]*Task),
 		workers:  make(map[string]*Worker),
 		evals:    make(map[string]*Eval),
-		sessions: make(map[sessionKey]Result), // for (clientID, requestID) dedup
+		sessions: make(map[sessionKey]session), // for (clientID, requestID) dedup
 	}
 }
 
@@ -304,7 +342,7 @@ func (s *StateStore) applySubmitJob(c *commandpb.SubmitJob) (Result, error) {
 	dedupable := key.clientID != "" && key.requestID != ""
 	if dedupable {
 		if prev, ok := s.sessions[key]; ok {
-			return prev, nil
+			return prev.result, nil
 		}
 	}
 
@@ -357,7 +395,7 @@ func (s *StateStore) applySubmitJob(c *commandpb.SubmitJob) (Result, error) {
 	})
 	if dedupable {
 		// Store the response WITHOUT triggers: a retry must return the original answer, but must not cause the eval to be created a second time
-		s.sessions[key] = Result{JobID: job.ID}
+		s.sessions[key] = session{result: Result{JobID: job.ID}, createdMs: s.nowMs}
 	}
 	return res, nil
 }
@@ -457,7 +495,9 @@ func (s *StateStore) applyRegisterWorker(c *commandpb.RegisterWorker) (Result, e
 
 	(1) Clamp nowMs forward
 	(2) Expire worker leases:  ALIVE + lease < now  →  LOST
-	(3) Expire task leases:    ASSIGNED/RUNNING + lease < now  →  PENDING
+	(3) Elapsed retry backoffs  →  clear, and emit an eval so the scheduler looks again
+	(4) Expired dedup sessions  →  delete
+	(5) Expire task leases:    ASSIGNED/RUNNING + lease < now  →  PENDING
 	        Attempt is NOT touched here — it is a dispatch counter, incremented only by ApplyPlan. That is what makes a slow worker's late report (carrying an older attempt) detectably stale rather than a duplicate.
 	        BUT reclaim must respect the same attempt budget ApplyPlan enforces: a task already at MaxAttempts goes terminal FAILED instead of PENDING. Otherwise it would sit PENDING forever — every plan naming it asks for attempt MaxAttempts+1, which applyPlan rejects — and a scheduler that scans for PENDING work would pick it, propose, be rejected, and spin. Permanently-PENDING also breaks "every submitted task reaches a terminal state".
 	Both scans are over SORTED ids
@@ -483,7 +523,34 @@ func (s *StateStore) applyTick(c *commandpb.Tick) (Result, error) {
 		}
 	}
 
-	// (3) Reclaim tasks whose lease lapsed, or whose worker is gone
+	// (3) Backoffs that have elapsed. Clearing NotBeforeMs makes this
+	// one-shot, and the trigger is what wakes the scheduler: time passing is
+	// otherwise invisible to it, so a task waiting out a retry would sit
+	// PENDING with nothing coming to dispatch it.
+	for _, id := range s.sortedTaskIDs() {
+		t := s.tasks[id]
+		if t.State != TaskPending || t.NotBeforeMs == 0 || t.NotBeforeMs > now {
+			continue
+		}
+		t.NotBeforeMs = 0
+		res.EvalTriggers = append(res.EvalTriggers, EvalTrigger{
+			JobID:   t.JobID,
+			TaskID:  t.ID,
+			Reason:  EvalBackoffElapsed,
+			Attempt: t.Attempt,
+		})
+	}
+
+	// (4) Expire dedup sessions. Unbounded growth is a real leak in a
+	// long-running coordinator, and the sweep must be deterministic: it reads
+	// the Tick-carried clock, never time.Now().
+	for key, sess := range s.sessions {
+		if sess.createdMs+sessionTTLMs < now {
+			delete(s.sessions, key)
+		}
+	}
+
+	// (5) Reclaim tasks whose lease lapsed, or whose worker is gone
 	for _, id := range s.sortedTaskIDs() {
 		t := s.tasks[id]
 		if t.State != TaskAssigned && t.State != TaskRunning {
@@ -515,7 +582,10 @@ func (s *StateStore) applyTick(c *commandpb.Tick) (Result, error) {
 			continue
 		}
 
+		// NO BACKOFF HERE, deliberately. The worker died; the task never had
+		// its chance, so delaying the retry only burns the reclaim budget.
 		t.State = TaskPending
+		t.NotBeforeMs = 0
 		res.EvalTriggers = append(res.EvalTriggers, EvalTrigger{
 			JobID:   t.JobID,
 			TaskID:  t.ID,
@@ -582,6 +652,12 @@ func (s *StateStore) applyPlan(c *commandpb.ApplyPlan) (Result, error) {
 			return Result{}, fmt.Errorf("apply plan: task %q lease %d already expired at now=%d",
 				t.ID, a.GetLeaseExpiryMs(), s.nowMs)
 		}
+		// The scheduler filters these out and the planner re-checks; this is
+		// the backstop that makes the rule true on every replica regardless.
+		if t.NotBeforeMs > s.nowMs {
+			return Result{}, fmt.Errorf("apply plan: task %q is backing off until %d (now=%d)",
+				t.ID, t.NotBeforeMs, s.nowMs)
+		}
 	}
 	for _, st := range c.GetStops() {
 		t, ok := s.tasks[st.GetTaskId()]
@@ -609,6 +685,7 @@ func (s *StateStore) applyPlan(c *commandpb.ApplyPlan) (Result, error) {
 	for _, a := range c.GetAssignments() {
 		t := s.tasks[a.GetTaskId()]
 		t.State = TaskAssigned
+		t.NotBeforeMs = 0 // dispatched; the backoff is spent
 		t.WorkerID = a.GetWorkerId()
 		t.Attempt = a.GetAttempt()
 		t.LeaseExpiryMs = a.GetLeaseExpiryMs()
@@ -724,6 +801,11 @@ func (s *StateStore) applyFailTask(c *commandpb.FailTask) (Result, error) {
 
 	if c.GetRetryable() && t.Attempt < t.Spec.MaxAttempts {
 		t.State = TaskPending
+		// The task RAN and failed, which may be a crash loop — back off before
+		// trying again. Lease expiry deliberately does NOT do this: there the
+		// worker died, the task never got its chance, and the reclaim budget
+		// ("within 3s of a missed heartbeat") has no room for a backoff.
+		t.NotBeforeMs = s.nowMs + backoffFor(t.ID, t.Attempt)
 		res.EvalTriggers = append(res.EvalTriggers, EvalTrigger{
 			JobID:   t.JobID,
 			TaskID:  t.ID,
@@ -788,6 +870,8 @@ func evalReasonFromProto(t commandpb.EvalTrigger) EvalReason {
 		return EvalWorkerLost
 	case commandpb.EvalTrigger_EVAL_TRIGGER_LEASE_EXPIRED:
 		return EvalLeaseExpired
+	case commandpb.EvalTrigger_EVAL_TRIGGER_BACKOFF_ELAPSED:
+		return EvalBackoffElapsed
 	}
 	return EvalJobSubmitted
 }
@@ -841,3 +925,36 @@ func (s *StateStore) JobCount() int    { return len(s.jobs) }
 func (s *StateStore) TaskCount() int   { return len(s.tasks) }
 func (s *StateStore) WorkerCount() int { return len(s.workers) }
 func (s *StateStore) EvalCount() int   { return len(s.evals) }
+
+// SessionCount reports how many dedup entries are held. It exists so a test
+// can prove the TTL sweep actually bounds the map.
+func (s *StateStore) SessionCount() int { return len(s.sessions) }
+
+// backoffFor computes how long a task must wait before its next dispatch.
+//
+// THE JITTER IS DETERMINISTIC. apply runs on every replica, so a real random
+// roll here would place the same task at different times on different nodes —
+// the exact divergence the Tick design exists to prevent. Instead the spread
+// is derived by hashing (taskID, attempt): identical everywhere, but
+// decorrelated across tasks, so N tasks that fail together do not retry in
+// lockstep. That is the property jitter is actually for.
+//
+// Exponential in the attempt number, capped, plus up to 50% spread.
+func backoffFor(taskID string, attempt int32) int64 {
+	if attempt < 1 {
+		attempt = 1
+	}
+	base := baseBackoffMs
+	for i := int32(1); i < attempt && base < maxBackoffMs; i++ {
+		base *= 2
+	}
+	if base > maxBackoffMs {
+		base = maxBackoffMs
+	}
+
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(taskID))
+	_, _ = h.Write([]byte{byte(attempt), byte(attempt >> 8), byte(attempt >> 16), byte(attempt >> 24)})
+	spread := int64(h.Sum64() % uint64(base/2+1))
+	return base + spread
+}

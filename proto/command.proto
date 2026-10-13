@@ -58,6 +58,10 @@ enum EvalTrigger {
   EVAL_TRIGGER_TASK_FAILED   = 2;
   EVAL_TRIGGER_WORKER_LOST   = 3;
   EVAL_TRIGGER_LEASE_EXPIRED = 4;
+  // A retry's backoff elapsed and the task is dispatchable again. Emitted by
+  // Tick, because time passing is otherwise invisible to the scheduler: a
+  // task waiting out a backoff has nothing else coming to wake it
+  EVAL_TRIGGER_BACKOFF_ELAPSED = 5;
 }
 
 message CreateEval {

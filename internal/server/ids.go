@@ -64,6 +64,8 @@ func reasonSlug(r state.EvalReason) string {
 		return "worker-lost"
 	case state.EvalLeaseExpired:
 		return "lease-expired"
+	case state.EvalBackoffElapsed:
+		return "backoff-elapsed"
 	}
 	return "unknown"
 }

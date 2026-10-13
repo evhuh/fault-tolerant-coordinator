@@ -687,3 +687,147 @@ func awaitAllTerminalAfterCompleting(t *testing.T, s *Service, workerID string, 
 	}
 	t.Fatalf("did not complete %d tasks in time", n)
 }
+
+// ---------------------------------------------------------------------------
+// Day 5 checkpoints
+// ---------------------------------------------------------------------------
+
+// THE CHECKPOINT: the same request submitted 5× CONCURRENTLY yields exactly
+// one job.
+//
+// Every handler mints its own job id before proposing — it has to, because
+// ids are decided facts baked into the command. What makes this safe is that
+// propose() serializes, so the first one through creates the job and records
+// the session, and the other four hit dedup and get the original id back.
+// Their minted ids are simply discarded, never having entered state.
+func TestConcurrentIdenticalSubmitsYieldOneJob(t *testing.T) {
+	s, _ := newTestService(t)
+
+	const n = 5
+	ids := make([]string, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			resp, err := s.SubmitJob(context.Background(), &schedulerpb.SubmitJobRequest{
+				ClientId:  "client-a",
+				RequestId: "req-1",
+				Tasks: []*schedulerpb.TaskSpec{
+					{Command: "/bin/true", MaxAttempts: 3},
+				},
+			})
+			if err != nil {
+				t.Errorf("submit %d: %v", i, err)
+				return
+			}
+			ids[i] = resp.GetJobId()
+		}(i)
+	}
+	wg.Wait()
+
+	for i, id := range ids {
+		if id != ids[0] {
+			t.Errorf("submit %d returned %q, want %q — all five must agree", i, id, ids[0])
+		}
+	}
+
+	list, err := s.ListJobs(context.Background(), &schedulerpb.ListJobsRequest{})
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(list.GetJobs()) != 1 {
+		t.Errorf("job count = %d, want exactly 1", len(list.GetJobs()))
+	}
+	var tasks int
+	s.c.read(func(st *state.StateStore) { tasks = st.TaskCount() })
+	if tasks != 1 {
+		t.Errorf("task count = %d, want 1 — four submissions created nothing", tasks)
+	}
+}
+
+// A retryable failure must not redispatch instantly. Without a backoff a
+// fast-failing task burns its whole attempt budget in milliseconds, which is
+// exactly what Day 8's fault injection would surface as a spin.
+func TestRetryIsDelayedByBackoff(t *testing.T) {
+	s, clk := newTestService(t)
+	register(t, s, "w-1", 1)
+	submit(t, s, "req-1", 1)
+	task := awaitTask(t, s, "w-1")
+
+	if _, err := s.ReportResult(context.Background(), &schedulerpb.ReportResultRequest{
+		WorkerId: "w-1", TaskId: task.GetTaskId(), Attempt: task.GetAttempt(),
+		ExitCode: 1, Error: "boom", Retryable: true,
+	}); err != nil {
+		t.Fatalf("report: %v", err)
+	}
+
+	// The task is pending again, but held back.
+	var backing state.Task
+	s.c.read(func(st *state.StateStore) { backing, _ = st.Task(task.GetTaskId()) })
+	if backing.State != state.TaskPending {
+		t.Fatalf("state = %s, want PENDING", backing.State)
+	}
+	if backing.NotBeforeMs == 0 {
+		t.Fatal("no backoff set; a crash-looping task would spin")
+	}
+	awaitNoTask(t, s, "w-1")
+
+	// Advance past the deadline and tick: the sweep wakes the scheduler.
+	clk.set(backing.NotBeforeMs + 1)
+	heartbeat(t, s, "w-1")
+	tick(t, s)
+
+	retried := awaitTask(t, s, "w-1")
+	if retried.GetAttempt() != 2 {
+		t.Errorf("attempt = %d, want 2", retried.GetAttempt())
+	}
+}
+
+// THE CHECKPOINT: work done but never reported yields ONE observable result.
+//
+// Both attempts ran — at-least-once delivery means that is normal, and the
+// per-attempt ledger on disk records both. The effect is singular because only
+// one attempt is ever live, so only one result_ref is ever committed.
+func TestKilledBeforeReportYieldsOneObservableResult(t *testing.T) {
+	s, clk := newTestService(t)
+	register(t, s, "w-1", 1)
+	register(t, s, "w-2", 1)
+	submit(t, s, "req-1", 1)
+
+	// w-1 is handed the task, does the work, and dies before reporting.
+	lost := awaitTask(t, s, "w-1")
+
+	clk.advance(DefaultConfig().LeaseTTL.Milliseconds() + 1)
+	tick(t, s)
+	heartbeat(t, s, "w-2")
+
+	// w-2 picks it up as attempt 2 and reports.
+	fresh := awaitTask(t, s, "w-2")
+	if fresh.GetTaskId() != lost.GetTaskId() || fresh.GetAttempt() != 2 {
+		t.Fatalf("redispatch = %s attempt %d, want %s attempt 2",
+			fresh.GetTaskId(), fresh.GetAttempt(), lost.GetTaskId())
+	}
+	if _, err := s.ReportResult(context.Background(), &schedulerpb.ReportResultRequest{
+		WorkerId: "w-2", TaskId: fresh.GetTaskId(), Attempt: 2,
+		ExitCode: 0, ResultRef: "/data/w-2/attempt-2",
+	}); err != nil {
+		t.Fatalf("report: %v", err)
+	}
+
+	// w-1's report finally lands, carrying the dead attempt.
+	if _, err := s.ReportResult(context.Background(), &schedulerpb.ReportResultRequest{
+		WorkerId: "w-1", TaskId: lost.GetTaskId(), Attempt: 1,
+		ExitCode: 0, ResultRef: "/data/w-1/attempt-1",
+	}); err != nil {
+		t.Fatalf("late report: %v", err)
+	}
+
+	final := awaitState(t, s, lost.GetTaskId(), state.TaskComplete)
+	if final.ResultRef != "/data/w-2/attempt-2" {
+		t.Errorf("result_ref = %q, want w-2's — exactly one committed effect", final.ResultRef)
+	}
+	if final.Attempt != 2 {
+		t.Errorf("attempt = %d, want 2", final.Attempt)
+	}
+}

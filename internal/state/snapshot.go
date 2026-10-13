@@ -106,7 +106,8 @@ func (sn *Snapshot) InFlight(workerID string) int32 {
 // PendingTaskIDs returns the dispatchable PENDING tasks, in sorted order.
 // Tasks at the attempt cap are excluded: applyPlan rejects any assignment
 // asking for attempt > MaxAttempts, so proposing one could only ever be
-// rejected and spun on.
+// rejected and spun on. Tasks still serving a retry backoff are excluded for
+// the same reason.
 //
 // Passing a jobID narrows to that job; empty returns every job's.
 func (sn *Snapshot) PendingTaskIDs(jobID string) []string {
@@ -120,6 +121,12 @@ func (sn *Snapshot) PendingTaskIDs(jobID string) []string {
 			continue
 		}
 		if t.Attempt >= t.Spec.MaxAttempts {
+			continue
+		}
+		// Still serving a retry backoff. Proposing it would only be rejected
+		// by applyPlan's backstop, and the Tick sweep will emit an eval when
+		// the deadline passes.
+		if t.NotBeforeMs > sn.NowMs {
 			continue
 		}
 		out = append(out, id)

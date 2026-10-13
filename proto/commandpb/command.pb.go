@@ -44,6 +44,10 @@ const (
 	EvalTrigger_EVAL_TRIGGER_TASK_FAILED   EvalTrigger = 2
 	EvalTrigger_EVAL_TRIGGER_WORKER_LOST   EvalTrigger = 3
 	EvalTrigger_EVAL_TRIGGER_LEASE_EXPIRED EvalTrigger = 4
+	// A retry's backoff elapsed and the task is dispatchable again. Emitted by
+	// Tick, because time passing is otherwise invisible to the scheduler: a
+	// task waiting out a backoff has nothing else coming to wake it
+	EvalTrigger_EVAL_TRIGGER_BACKOFF_ELAPSED EvalTrigger = 5
 )
 
 // Enum value maps for EvalTrigger.
@@ -54,13 +58,15 @@ var (
 		2: "EVAL_TRIGGER_TASK_FAILED",
 		3: "EVAL_TRIGGER_WORKER_LOST",
 		4: "EVAL_TRIGGER_LEASE_EXPIRED",
+		5: "EVAL_TRIGGER_BACKOFF_ELAPSED",
 	}
 	EvalTrigger_value = map[string]int32{
-		"EVAL_TRIGGER_UNSPECIFIED":   0,
-		"EVAL_TRIGGER_JOB_SUBMITTED": 1,
-		"EVAL_TRIGGER_TASK_FAILED":   2,
-		"EVAL_TRIGGER_WORKER_LOST":   3,
-		"EVAL_TRIGGER_LEASE_EXPIRED": 4,
+		"EVAL_TRIGGER_UNSPECIFIED":     0,
+		"EVAL_TRIGGER_JOB_SUBMITTED":   1,
+		"EVAL_TRIGGER_TASK_FAILED":     2,
+		"EVAL_TRIGGER_WORKER_LOST":     3,
+		"EVAL_TRIGGER_LEASE_EXPIRED":   4,
+		"EVAL_TRIGGER_BACKOFF_ELAPSED": 5,
 	}
 )
 
@@ -1040,13 +1046,14 @@ const file_command_proto_rawDesc = "" +
 	"\x10running_task_ids\x18\x04 \x03(\tR\x0erunningTaskIds\x12\x1a\n" +
 	"\bcapacity\x18\x05 \x01(\x05R\bcapacity\"\x1d\n" +
 	"\x04Tick\x12\x15\n" +
-	"\x06now_ms\x18\x01 \x01(\x03R\x05nowMs*\xa7\x01\n" +
+	"\x06now_ms\x18\x01 \x01(\x03R\x05nowMs*\xc9\x01\n" +
 	"\vEvalTrigger\x12\x1c\n" +
 	"\x18EVAL_TRIGGER_UNSPECIFIED\x10\x00\x12\x1e\n" +
 	"\x1aEVAL_TRIGGER_JOB_SUBMITTED\x10\x01\x12\x1c\n" +
 	"\x18EVAL_TRIGGER_TASK_FAILED\x10\x02\x12\x1c\n" +
 	"\x18EVAL_TRIGGER_WORKER_LOST\x10\x03\x12\x1e\n" +
-	"\x1aEVAL_TRIGGER_LEASE_EXPIRED\x10\x04B@Z>github.com/evazheng/fault-tolerant-coordinator/proto/commandpbb\x06proto3"
+	"\x1aEVAL_TRIGGER_LEASE_EXPIRED\x10\x04\x12 \n" +
+	"\x1cEVAL_TRIGGER_BACKOFF_ELAPSED\x10\x05B@Z>github.com/evazheng/fault-tolerant-coordinator/proto/commandpbb\x06proto3"
 
 var (
 	file_command_proto_rawDescOnce sync.Once

@@ -805,9 +805,18 @@ func TestCompleteTaskIsIdempotentOnRedelivery(t *testing.T) {
 func TestFailTaskRetriesUntilExhausted(t *testing.T) {
 	s := seedCluster(t, 1) // MaxAttempts = 3
 
+	now := int64(1000)
 	for attempt := int32(1); attempt <= 3; attempt++ {
-		mustApply(t, s, registerWorkerCmd("w-1", 500, 90000))
-		mustApply(t, s, applyPlanCmd("eval-x", []assign{{"task-1", "w-1", attempt, 50000}}))
+		// A retryable failure now sets a backoff, so the clock has to pass it
+		// before the next dispatch is legal. Tick clears the deadline and
+		// emits a BACKOFF_ELAPSED eval; without that sweep the task would sit
+		// PENDING with nothing coming to dispatch it.
+		if attempt > 1 {
+			now += maxBackoffMs * 2
+			mustApply(t, s, tickCmd(now))
+		}
+		mustApply(t, s, registerWorkerCmd("w-1", 500, now+90000))
+		mustApply(t, s, applyPlanCmd("eval-x", []assign{{"task-1", "w-1", attempt, now + 50000}}))
 		res := mustApply(t, s, failTaskCmd("task-1", "w-1", attempt, true))
 
 		task, _ := s.Task("task-1")
@@ -1041,5 +1050,219 @@ func TestMalformedCommandsAreRejected(t *testing.T) {
 	}
 	if _, err := s.Apply(&commandpb.Command{}); err == nil {
 		t.Error("Apply(empty command) = nil error, want error")
+	}
+}
+
+// Day 5 — backoff, session bounding, effect semantics
+
+// Jitter must be DETERMINISTIC. apply runs on every replica, so a real random
+// roll would place the same task at different times on different nodes — the
+// exact divergence the Tick design exists to prevent.
+func TestBackoffIsDeterministicAndDecorrelated(t *testing.T) {
+	// Same input, same answer, every time and on every replica.
+	for i := 0; i < 50; i++ {
+		if a, b := backoffFor("task-1", 2), backoffFor("task-1", 2); a != b {
+			t.Fatalf("backoffFor is not deterministic: %d vs %d", a, b)
+		}
+	}
+
+	// Different tasks failing together must not retry in lockstep — that is
+	// the property jitter is actually for.
+	seen := make(map[int64]int)
+	for i := 0; i < 32; i++ {
+		seen[backoffFor(fmt.Sprintf("task-%d", i), 1)]++
+	}
+	if len(seen) < 8 {
+		t.Errorf("only %d distinct backoffs across 32 tasks; retries are correlated", len(seen))
+	}
+
+	// Exponential in the attempt, and capped.
+	a1, a2, a3 := backoffFor("t", 1), backoffFor("t", 2), backoffFor("t", 3)
+	if !(a1 < a2 && a2 < a3) {
+		t.Errorf("not increasing: %d, %d, %d", a1, a2, a3)
+	}
+	if got := backoffFor("t", 30); got > maxBackoffMs+maxBackoffMs/2 {
+		t.Errorf("backoff %d exceeded the cap", got)
+	}
+}
+
+// A retryable failure backs off; a lease expiry does NOT.
+//
+// The distinction is deliberate and load-bearing: a failed task RAN and may be
+// crash-looping, but an expired lease means the WORKER died and the task never
+// got its chance. Backing off there would blow the reclaim budget the résumé
+// number depends on.
+func TestFailureBacksOffButLeaseExpiryDoesNot(t *testing.T) {
+	s := seedCluster(t, 1)
+	mustApply(t, s, applyPlanCmd("eval-1", []assign{{"task-1", "w-1", 1, 5000}}))
+	mustApply(t, s, failTaskCmd("task-1", "w-1", 1, true))
+
+	failed, _ := s.Task("task-1")
+	if failed.State != TaskPending {
+		t.Fatalf("state = %s, want PENDING", failed.State)
+	}
+	if failed.NotBeforeMs <= s.NowMs() {
+		t.Errorf("NotBeforeMs = %d at now = %d; a retryable failure must back off",
+			failed.NotBeforeMs, s.NowMs())
+	}
+
+	// Now the lease-expiry path, on a fresh task.
+	s2 := seedCluster(t, 1)
+	mustApply(t, s2, applyPlanCmd("eval-1", []assign{{"task-1", "w-1", 1, 5000}}))
+	mustApply(t, s2, tickCmd(5001))
+	reclaimed, _ := s2.Task("task-1")
+	if reclaimed.State != TaskPending {
+		t.Fatalf("state = %s, want PENDING", reclaimed.State)
+	}
+	if reclaimed.NotBeforeMs != 0 {
+		t.Errorf("NotBeforeMs = %d, want 0 — a dead worker's task redispatches immediately", reclaimed.NotBeforeMs)
+	}
+}
+
+// A task in backoff cannot be dispatched, and Tick is what releases it. The
+// release must emit an eval: time passing is otherwise invisible to the
+// scheduler, so the task would sit PENDING with nothing coming for it.
+func TestBackoffBlocksDispatchUntilTickReleasesIt(t *testing.T) {
+	s := seedCluster(t, 1)
+	mustApply(t, s, applyPlanCmd("eval-1", []assign{{"task-1", "w-1", 1, 5000}}))
+	mustApply(t, s, failTaskCmd("task-1", "w-1", 1, true))
+	task, _ := s.Task("task-1")
+	deadline := task.NotBeforeMs
+
+	// Too early: the backstop refuses.
+	mustApply(t, s, registerWorkerCmd("w-1", 500, 90000))
+	if _, err := s.Apply(applyPlanCmd("eval-2", []assign{{"task-1", "w-1", 2, 50000}})); err == nil {
+		t.Fatal("applyPlan accepted a task still serving its backoff")
+	}
+
+	// A tick before the deadline releases nothing.
+	res := mustApply(t, s, tickCmd(deadline-1))
+	for _, trig := range res.EvalTriggers {
+		if trig.Reason == EvalBackoffElapsed {
+			t.Error("backoff released early")
+		}
+	}
+
+	// A tick past it clears the deadline and wakes the scheduler.
+	res = mustApply(t, s, tickCmd(deadline+1))
+	var woke bool
+	for _, trig := range res.EvalTriggers {
+		if trig.Reason == EvalBackoffElapsed && trig.TaskID == "task-1" {
+			woke = true
+		}
+	}
+	if !woke {
+		t.Error("no BACKOFF_ELAPSED eval; the task would never be rescheduled")
+	}
+	if task, _ := s.Task("task-1"); task.NotBeforeMs != 0 {
+		t.Errorf("NotBeforeMs = %d, want cleared", task.NotBeforeMs)
+	}
+
+	// And now it dispatches.
+	mustApply(t, s, registerWorkerCmd("w-1", 500, deadline+90000))
+	mustApply(t, s, applyPlanCmd("eval-3", []assign{{"task-1", "w-1", 2, deadline + 50000}}))
+	if task, _ := s.Task("task-1"); task.State != TaskAssigned || task.NotBeforeMs != 0 {
+		t.Errorf("state = %s notBefore = %d, want ASSIGNED and 0", task.State, task.NotBeforeMs)
+	}
+}
+
+// The release is ONE-SHOT: a second tick must not re-emit the eval, or every
+// tick after a backoff would manufacture scheduling work forever.
+func TestBackoffReleaseIsOneShot(t *testing.T) {
+	s := seedCluster(t, 1)
+	mustApply(t, s, applyPlanCmd("eval-1", []assign{{"task-1", "w-1", 1, 5000}}))
+	mustApply(t, s, failTaskCmd("task-1", "w-1", 1, true))
+	task, _ := s.Task("task-1")
+
+	mustApply(t, s, tickCmd(task.NotBeforeMs+1))
+	res := mustApply(t, s, tickCmd(task.NotBeforeMs+2))
+	for _, trig := range res.EvalTriggers {
+		if trig.Reason == EvalBackoffElapsed {
+			t.Error("BACKOFF_ELAPSED emitted twice for one backoff")
+		}
+	}
+}
+
+// Dedup must be bounded or the sessions map is a leak. The honest consequence
+// is that dedup is bounded IN TIME: a retry after the TTL gets a new job.
+func TestSessionsExpireOnTTL(t *testing.T) {
+	s := New()
+	mustApply(t, s, tickCmd(1000))
+	first := mustApply(t, s, submitJobCmd("job-1", "client-a", "req-1", "task-1"))
+
+	// Within the TTL, the retry still returns the original job.
+	mustApply(t, s, tickCmd(1000+sessionTTLMs/2))
+	retry := mustApply(t, s, submitJobCmd("job-X", "client-a", "req-1", "task-X"))
+	if retry.JobID != first.JobID {
+		t.Fatalf("retry returned %q, want the original %q", retry.JobID, first.JobID)
+	}
+	if s.JobCount() != 1 {
+		t.Fatalf("job count = %d, want 1", s.JobCount())
+	}
+
+	// Past the TTL the session is swept, and the same request is a new job.
+	mustApply(t, s, tickCmd(1000+sessionTTLMs+1))
+	if n := s.SessionCount(); n != 0 {
+		t.Errorf("session count = %d after the TTL, want 0 — the map would grow forever", n)
+	}
+	late := mustApply(t, s, submitJobCmd("job-2", "client-a", "req-1", "task-2"))
+	if late.JobID == first.JobID {
+		t.Error("session survived its TTL")
+	}
+	if s.JobCount() != 2 {
+		t.Errorf("job count = %d, want 2", s.JobCount())
+	}
+}
+
+// THE DAY 5 CHECKPOINT, state-machine half: the same request applied five
+// times yields exactly one job. (The concurrent version lives in the server
+// tests, where propose() is what serializes them.)
+func TestRepeatedSubmitYieldsExactlyOneJob(t *testing.T) {
+	s := New()
+	mustApply(t, s, tickCmd(1000))
+	ids := make(map[string]bool)
+	for i := 0; i < 5; i++ {
+		res := mustApply(t, s, submitJobCmd(fmt.Sprintf("job-%d", i), "client-a", "req-1", fmt.Sprintf("task-%d", i)))
+		ids[res.JobID] = true
+	}
+	if len(ids) != 1 {
+		t.Errorf("got %d distinct job ids, want 1", len(ids))
+	}
+	if s.JobCount() != 1 || s.TaskCount() != 1 {
+		t.Errorf("jobs = %d tasks = %d, want 1 and 1", s.JobCount(), s.TaskCount())
+	}
+}
+
+// THE DAY 5 CHECKPOINT, the effect half: a worker that does the work and dies
+// before reporting leaves exactly ONE committed result, not two.
+//
+// Both attempts genuinely ran — that is at-least-once delivery, and the
+// per-attempt ledger records both. What makes the EFFECT singular is that only
+// one attempt is ever the live one, so only one result_ref is committed.
+func TestWorkDoneButNotReportedYieldsOneCommittedResult(t *testing.T) {
+	s := seedCluster(t, 1)
+	mustApply(t, s, registerWorkerCmd("w-2", 500, 90000))
+
+	// Attempt 1: w-1 takes it, runs it, and dies before ReportResult lands.
+	mustApply(t, s, applyPlanCmd("eval-1", []assign{{"task-1", "w-1", 1, 5000}}))
+	mustApply(t, s, tickCmd(5001)) // lease lapses, task reclaimed
+
+	// Attempt 2: w-2 takes it and reports success.
+	mustApply(t, s, registerWorkerCmd("w-2", 500, 20000))
+	mustApply(t, s, applyPlanCmd("eval-2", []assign{{"task-1", "w-2", 2, 15000}}))
+	mustApply(t, s, completeTaskCmd("task-1", "w-2", 2, "/data/w-2/task-1/2"))
+
+	// Attempt 1's report finally arrives. It names a dead attempt.
+	mustApply(t, s, completeTaskCmd("task-1", "w-1", 1, "/data/w-1/task-1/1"))
+
+	task, _ := s.Task("task-1")
+	if task.State != TaskComplete {
+		t.Fatalf("state = %s, want COMPLETE", task.State)
+	}
+	if task.ResultRef != "/data/w-2/task-1/2" {
+		t.Errorf("result_ref = %q, want w-2's attempt 2 — the late report must not overwrite it", task.ResultRef)
+	}
+	if task.Attempt != 2 {
+		t.Errorf("attempt = %d, want 2", task.Attempt)
 	}
 }
