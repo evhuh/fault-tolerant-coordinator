@@ -124,6 +124,7 @@ func (c *Coordinator) StartRaft(cfg raftnode.Config) error {
 	node, err := raftnode.Start(cfg, raftnode.Handler{
 		Apply:             c.applyCommitted,
 		LeadershipChanged: c.onLeadershipChanged,
+		Fatal:             c.fatal,
 	})
 	if err != nil {
 		c.proposer = nil
@@ -149,9 +150,15 @@ func (c *Coordinator) applyCommitted(data []byte) {
 	cmd := &commandpb.Command{}
 	if err := proto.Unmarshal(data, cmd); err != nil {
 		// A command this build cannot decode is a schema-evolution failure,
-		// which Day 7 exists to prevent. Crashing is correct: silently
-		// skipping it would diverge this replica from the others.
-		log.Fatalf("coordinator: undecodable committed entry: %v", err)
+		// which Day 7 exists to prevent. Halting this node is correct:
+		// skipping the entry would silently diverge it from every replica
+		// that could decode it, and a diverged replica is worse than a dead
+		// one. It halts ALONE — see Coordinator.fatal.
+		c.fatal(fmt.Errorf("undecodable committed entry: %w", err))
+		return
+	}
+	if c.FatalErr() != nil {
+		return // already halted; do not apply further entries
 	}
 
 	c.mu.Lock()
@@ -292,4 +299,41 @@ func (c *Coordinator) LeaderAddr() (string, bool) {
 	}
 	addr, ok := c.cfg.APIAddrs[id]
 	return addr, ok
+}
+
+// fatal marks this coordinator unusable and halts its Raft node.
+//
+// It does NOT exit the process. A standalone binary wants to exit, and
+// cmd/coordinator does that by watching RaftDone — but the cluster tests and
+// Day 8's simulator run every node in one process, and there a single node's
+// failure must not take down its peers and the harness with it.
+//
+// The stop is asynchronous because fatal can be called from inside the Ready
+// loop, and Stop waits for that loop to exit.
+func (c *Coordinator) fatal(err error) {
+	c.fatalOnce.Do(func() {
+		c.fatalMu.Lock()
+		c.fatalErr = err
+		c.fatalMu.Unlock()
+		log.Printf("coordinator: fatal: %v", err)
+		if c.raft != nil {
+			go c.raft.Stop()
+		}
+	})
+}
+
+// FatalErr reports the error that halted this node, if any.
+func (c *Coordinator) FatalErr() error {
+	c.fatalMu.Lock()
+	defer c.fatalMu.Unlock()
+	return c.fatalErr
+}
+
+// RaftDone closes when this node's Ready loop has exited, for any reason. A
+// standalone binary watches it and exits.
+func (c *Coordinator) RaftDone() <-chan struct{} {
+	if c.raft == nil {
+		return nil
+	}
+	return c.raft.Done()
 }

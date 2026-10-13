@@ -13,11 +13,10 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
-
+	"github.com/evazheng/fault-tolerant-coordinator/internal/client"
 	schedulerpb "github.com/evazheng/fault-tolerant-coordinator/proto/schedulerpb"
 )
 
@@ -31,7 +30,7 @@ func usage() {
 }
 
 func main() {
-	addr := flag.String("coordinator", "localhost:8080", "coordinator address")
+	addr := flag.String("coordinator", "localhost:8080", "comma-separated coordinator addresses; any one will do, NOT_LEADER redirects find the rest")
 	flag.Usage = usage
 	flag.Parse()
 
@@ -39,32 +38,28 @@ func main() {
 		usage()
 	}
 
-	conn, err := grpc.NewClient(*addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		fatalf("dial %s: %v", *addr, err)
-	}
-	defer conn.Close()
-	client := schedulerpb.NewSchedulerClient(conn)
+	pool := client.NewPool(strings.Split(*addr, ",")...)
+	defer pool.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	switch cmd := flag.Arg(0); cmd {
 	case "submit":
-		submit(ctx, client, flag.Args()[1:])
+		submit(ctx, pool, flag.Args()[1:])
 	case "status":
 		if flag.NArg() != 2 {
 			usage()
 		}
-		status(ctx, client, flag.Arg(1))
+		status(ctx, pool, flag.Arg(1))
 	case "list":
-		list(ctx, client)
+		list(ctx, pool)
 	default:
 		fatalf("unknown command %q", cmd)
 	}
 }
 
-func submit(ctx context.Context, client schedulerpb.SchedulerClient, args []string) {
+func submit(ctx context.Context, pool *client.Pool, args []string) {
 	fs := flag.NewFlagSet("submit", flag.ExitOnError)
 	n := fs.Int("n", 1, "number of identical tasks to fan out")
 	timeout := fs.Duration("timeout", 30*time.Second, "per-task timeout")
@@ -95,10 +90,15 @@ func submit(ctx context.Context, client schedulerpb.SchedulerClient, args []stri
 		})
 	}
 
-	resp, err := client.SubmitJob(ctx, &schedulerpb.SubmitJobRequest{
-		ClientId:  *clientID,
-		RequestId: *requestID,
-		Tasks:     specs,
+	var resp *schedulerpb.SubmitJobResponse
+	err := pool.Do(func(c schedulerpb.SchedulerClient) error {
+		var e error
+		resp, e = c.SubmitJob(ctx, &schedulerpb.SubmitJobRequest{
+			ClientId:  *clientID,
+			RequestId: *requestID,
+			Tasks:     specs,
+		})
+		return e
 	})
 	if err != nil {
 		fatalf("submit: %v", err)
@@ -106,16 +106,26 @@ func submit(ctx context.Context, client schedulerpb.SchedulerClient, args []stri
 	fmt.Println(resp.GetJobId())
 }
 
-func status(ctx context.Context, client schedulerpb.SchedulerClient, jobID string) {
-	resp, err := client.GetJob(ctx, &schedulerpb.GetJobRequest{JobId: jobID})
+func status(ctx context.Context, pool *client.Pool, jobID string) {
+	var resp *schedulerpb.GetJobResponse
+	err := pool.Do(func(c schedulerpb.SchedulerClient) error {
+		var e error
+		resp, e = c.GetJob(ctx, &schedulerpb.GetJobRequest{JobId: jobID})
+		return e
+	})
 	if err != nil {
 		fatalf("status: %v", err)
 	}
 	printJob(resp.GetJob(), true)
 }
 
-func list(ctx context.Context, client schedulerpb.SchedulerClient) {
-	resp, err := client.ListJobs(ctx, &schedulerpb.ListJobsRequest{})
+func list(ctx context.Context, pool *client.Pool) {
+	var resp *schedulerpb.ListJobsResponse
+	err := pool.Do(func(c schedulerpb.SchedulerClient) error {
+		var e error
+		resp, e = c.ListJobs(ctx, &schedulerpb.ListJobsRequest{})
+		return e
+	})
 	if err != nil {
 		fatalf("list: %v", err)
 	}

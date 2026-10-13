@@ -70,9 +70,17 @@ type Coordinator struct {
 	now func() time.Time
 
 	// The scheduling pipeline. LEADER-ONLY and in-memory: none of it is
-	// replicated, and on Day 6 it starts on election and stops on loss.
+	// replicated, and it starts on election and stops on leadership loss.
 	// Nil until StartScheduling, which is what keeps the state machine
 	// usable on its own in tests.
+	//
+	// schedMu guards these three POINTERS, not the objects behind them.
+	// StartScheduling and StopScheduling run on the Ready-loop goroutine
+	// (leadership changes are delivered from there), while BrokerStats and
+	// Planner are read by RPC handlers and, from Day 11, a metrics endpoint.
+	// Different goroutines, so the pointers need a lock even though nothing
+	// in the current tests happens to exercise both paths at once.
+	schedMu   sync.Mutex
 	broker    *sched.Broker
 	planner   *Planner
 	scheduler *sched.Scheduler
@@ -83,6 +91,11 @@ type Coordinator struct {
 	proposer *raftProposer
 	// leaderCancel stops the leader-only goroutines on revocation.
 	leaderCancel context.CancelFunc
+
+	// fatalErr records an unrecoverable failure that halted this node.
+	fatalOnce sync.Once
+	fatalMu   sync.Mutex
+	fatalErr  error
 }
 
 func New(cfg Config) *Coordinator {
@@ -94,10 +107,6 @@ func New(cfg Config) *Coordinator {
 }
 
 func (c *Coordinator) nowMs() int64 { return c.now().UnixMilli() }
-
-// SetConfig replaces the config before the node starts serving. It exists so
-// cmd/coordinator can fill in APIAddrs once the peer flags are parsed.
-func (c *Coordinator) SetConfig(cfg Config) { c.cfg = cfg }
 
 // propose is the single mutation path. Every gRPC handler funnels through it.
 //
@@ -140,7 +149,8 @@ func (c *Coordinator) proposeLocal(cmd *commandpb.Command) (state.Result, error)
 // Day 6 moves this to the Ready loop, where it runs on committed entries
 // rather than on a direct Apply, guarded by whether this node leads.
 func (c *Coordinator) afterApply(cmd *commandpb.Command, res state.Result) {
-	if c.broker == nil {
+	broker := c.brokerRef()
+	if broker == nil {
 		return // scheduling pipeline not started (tests, or a follower)
 	}
 
@@ -157,7 +167,7 @@ func (c *Coordinator) afterApply(cmd *commandpb.Command, res state.Result) {
 		// Losing one is survivable: the broker is derived, so a new leader
 		// rediscovers the work by scanning committed state.
 		c.proposeAsync(createEvalCmd(id, trig, prio, c.storeNowMs()))
-		c.broker.Enqueue(sched.Eval{
+		broker.Enqueue(sched.Eval{
 			ID:          id,
 			JobID:       trig.JobID,
 			Priority:    prio,
@@ -176,10 +186,10 @@ func (c *Coordinator) afterApply(cmd *commandpb.Command, res state.Result) {
 	// on every lease renewal would make blocked evals a polling loop.
 	switch cmd.GetKind().(type) {
 	case *commandpb.Command_CompleteTask, *commandpb.Command_FailTask:
-		c.broker.Unblock()
+		broker.Unblock()
 	case *commandpb.Command_RegisterWorker:
 		if res.WorkerAdmitted {
-			c.broker.Unblock()
+			broker.Unblock()
 		}
 	}
 }
@@ -329,33 +339,53 @@ func evalReasonToProto(r state.EvalReason) commandpb.EvalTrigger {
 // SCANNING STATE, with none of the previous leader's memory. That is what
 // makes derived-not-replicated correct.
 func (c *Coordinator) StartScheduling(ctx context.Context) {
-	c.broker = sched.NewBroker()
-	c.planner = NewPlanner(c)
-	c.scheduler = sched.NewScheduler(c.cfg.Sched, c.broker, c, c.planner)
+	broker := sched.NewBroker()
+	planner := NewPlanner(c)
+	scheduler := sched.NewScheduler(c.cfg.Sched, broker, c, planner)
 
-	c.broker.Rebuild(c.Snapshot(), func(jobID string) string {
+	c.schedMu.Lock()
+	c.broker, c.planner, c.scheduler = broker, planner, scheduler
+	c.schedMu.Unlock()
+
+	broker.Rebuild(c.Snapshot(), func(jobID string) string {
 		return "eval/" + jobID + "/rebuild"
 	})
-	c.scheduler.Start(ctx)
+	scheduler.Start(ctx)
+}
+
+// brokerRef reads the broker pointer under the lock.
+func (c *Coordinator) brokerRef() *sched.Broker {
+	c.schedMu.Lock()
+	defer c.schedMu.Unlock()
+	return c.broker
 }
 
 // StopScheduling tears the pipeline down and waits for the workers to exit.
 func (c *Coordinator) StopScheduling() {
-	if c.broker == nil {
+	c.schedMu.Lock()
+	broker, scheduler := c.broker, c.scheduler
+	c.broker, c.scheduler, c.planner = nil, nil, nil
+	c.schedMu.Unlock()
+
+	if broker == nil {
 		return
 	}
-	c.broker.Close()
-	c.scheduler.Wait()
-	c.broker, c.scheduler, c.planner = nil, nil, nil
+	broker.Close()
+	scheduler.Wait()
 }
 
 // Planner exposes the planner's counters for tests and metrics.
-func (c *Coordinator) Planner() *Planner { return c.planner }
+func (c *Coordinator) Planner() *Planner {
+	c.schedMu.Lock()
+	defer c.schedMu.Unlock()
+	return c.planner
+}
 
 // BrokerStats reports queue depth: ready evals and blocked ones.
 func (c *Coordinator) BrokerStats() (ready, blocked int) {
-	if c.broker == nil {
+	broker := c.brokerRef()
+	if broker == nil {
 		return 0, 0
 	}
-	return c.broker.Stats()
+	return broker.Stats()
 }

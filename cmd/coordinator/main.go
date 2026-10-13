@@ -47,35 +47,48 @@ func main() {
 	cfg.Sched.MaxPlanSize = *maxPlanSize
 	cfg.Sched.LeaseTTLMs = leaseTTL.Milliseconds()
 
-	coord := server.New(cfg)
-	svc := server.NewService(coord)
-
 	// Raft is opt-in by -id, so the single-node path every earlier day
 	// depended on still works unchanged.
 	raftEnabled := *raftID != 0
+	var peers map[uint64]string
+	var dir string
 	if raftEnabled {
-		peers, err := parsePeers(*peerSpec)
+		var err error
+		peers, err = parsePeers(*peerSpec)
 		if err != nil {
 			log.Fatalf("peers: %v", err)
 		}
 		if _, ok := peers[*raftID]; !ok {
 			log.Fatalf("node id %d is not in -peers", *raftID)
 		}
-		dir := *dataDir
+		dir = *dataDir
 		if dir == "" {
 			dir = fmt.Sprintf("./raft-%d", *raftID)
 		}
-		// The gRPC address space is separate from raft's: a redirected client
-		// dials host:8080, not the raft transport URL.
-		if *apiPeerSpec != "" {
-			apiPeers, err := parsePeers(*apiPeerSpec)
-			if err != nil {
-				log.Fatalf("api-peers: %v", err)
-			}
-			cfg.APIAddrs = apiPeers
-			coord.SetConfig(cfg)
+		// REQUIRED with -id. The gRPC address space is separate from raft's:
+		// a redirected client dials host:8080, not the raft transport URL.
+		// Without this map every NOT_LEADER says "no leader elected" even
+		// when one exists, and clients never find the cluster.
+		if *apiPeerSpec == "" {
+			log.Fatal("-api-peers is required with -id: " +
+				"clients are redirected to gRPC addresses, which are not the raft peer URLs")
 		}
+		apiPeers, err := parsePeers(*apiPeerSpec)
+		if err != nil {
+			log.Fatalf("api-peers: %v", err)
+		}
+		if _, ok := apiPeers[*raftID]; !ok {
+			log.Fatalf("node id %d is not in -api-peers", *raftID)
+		}
+		cfg.APIAddrs = apiPeers
+	}
 
+	// Config is complete before the coordinator is built; nothing mutates it
+	// afterwards.
+	coord := server.New(cfg)
+	svc := server.NewService(coord)
+
+	if raftEnabled {
 		rcfg := raftnode.DefaultConfig()
 		rcfg.ID = *raftID
 		rcfg.Peers = peers
@@ -86,6 +99,16 @@ func main() {
 			log.Fatalf("start raft: %v", err)
 		}
 		defer coord.StopRaft()
+
+		// A standalone binary DOES exit on an unrecoverable node error. The
+		// library halts the node and reports; deciding to die is the host's
+		// call, because in-process clusters must not.
+		go func() {
+			<-coord.RaftDone()
+			if err := coord.FatalErr(); err != nil {
+				log.Fatalf("coordinator: halted: %v", err)
+			}
+		}()
 	}
 
 	lis, err := net.Listen("tcp", *addr)

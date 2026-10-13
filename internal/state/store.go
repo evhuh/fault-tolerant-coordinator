@@ -156,8 +156,6 @@ type Result struct {
 	EvalTriggers []EvalTrigger
 }
 
-// sessionKey dedups client retries
-// TOOD: TTL-based bounding
 type WorkerState uint8
 
 const (
@@ -258,8 +256,8 @@ type StateStore struct {
 	nowMs int64
 
 	// sessions maps (clientID, requestID) to the Result first produced for it, so a retried SubmitJob returns the original response instead of creating a second job.
-
-	// TOOD: bound this: expire sessions on a TTL carried by Tick, or it grows without lim
+	//
+	// BOUNDED by Tick, on sessionTTLMs. The honest consequence is that dedup is bounded IN TIME, not absolute: a client retrying later than the TTL gets a second job
 	sessions map[sessionKey]session
 }
 
@@ -829,7 +827,7 @@ func (s *StateStore) applyFailTask(c *commandpb.FailTask) (Result, error) {
 
 	The ONLY way an Eval enters state. The leader proposes it in response to an EvalTrigger that a previous command's apply returned- job submitted, lease expired, worker lost, task failed.
 
-	Note what is NOT here: no priority queue, no ordering, no dequeue. That is the EvalBroker, and it is DERIVED, NOT REPLICATED — a leader-only in-memory structure rebuilt by scanning committed state on leadership acquisition (TOOD). Replicating a work queue would mean every pop is a consensus round-trip, and it would need rebuilding after failover anyway.
+	Note what is NOT here: no priority queue, no ordering, no dequeue. That is the EvalBroker (internal/sched), and it is DERIVED, NOT REPLICATED — a leader-only in-memory structure rebuilt by scanning committed state on leadership acquisition. Replicating a work queue would mean every pop is a consensus round-trip, and it would need rebuilding after failover anyway.
 
 	Because the broker is derived, a CreateEval lost to a leader crash is survivable: the new leader rediscovers the work by scanning for PENDING tasks, not by reading Eval objects.
 
@@ -878,7 +876,7 @@ func evalReasonFromProto(t commandpb.EvalTrigger) EvalReason {
 	return EvalJobSubmitted
 }
 
-// Reads. All return copies: callers must never hold a pointer into live state, which is also the discipline scheduler workers (TOOD) depend on when they read a snapshot concurrently
+// Reads. All return copies: callers must never hold a pointer into live state. That is the same discipline Snapshot relies on, and it is what lets the scheduler workers in internal/sched read state concurrently while the planner commits
 
 func (s *StateStore) NowMs() int64 { return s.nowMs }
 

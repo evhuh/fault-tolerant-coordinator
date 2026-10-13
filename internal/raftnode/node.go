@@ -57,6 +57,19 @@ type Handler struct {
 	// coordinator uses it to start and stop the leader-only components —
 	// stopping cleanly is what prevents split-brain scheduling.
 	LeadershipChanged func(isLeader bool)
+
+	// Fatal reports an unrecoverable node error: a WAL write that failed, or
+	// storage that rejected an entry raft already durably logged. This node
+	// can no longer honour the contract, so it STOPS.
+	//
+	// It is a callback rather than a log.Fatal because the right response
+	// depends on who is hosting. A standalone binary should exit. But the
+	// cluster tests and Day 8's simulator run every node in ONE PROCESS, and
+	// there one node's disk error must not take down its peers and the
+	// harness with it — you would end up debugging the wrong failure.
+	//
+	// If nil, the node stops silently; the host notices via Done.
+	Fatal func(error)
 }
 
 type Node struct {
@@ -73,6 +86,9 @@ type Node struct {
 
 	stopc chan struct{}
 	done  chan struct{}
+
+	fatalOnce sync.Once
+	fatalErr  error
 }
 
 // Start brings up the node and runs the Ready loop in the background.
@@ -177,6 +193,24 @@ func (n *Node) IsLeader() bool {
 	return n.isLeader
 }
 
+// fatal records an unrecoverable error and stops THIS node. It never exits
+// the process: see Handler.Fatal.
+func (n *Node) fatal(err error) {
+	n.fatalOnce.Do(func() {
+		n.fatalErr = err
+		log.Printf("raftnode: node %d fatal: %v", n.cfg.ID, err)
+		if n.h.Fatal != nil {
+			n.h.Fatal(err)
+		}
+	})
+}
+
+// Err reports the error that stopped this node, if any.
+func (n *Node) Err() error { return n.fatalErr }
+
+// Done closes when the Ready loop has exited, for whatever reason.
+func (n *Node) Done() <-chan struct{} { return n.done }
+
 func (n *Node) Stop() {
 	select {
 	case <-n.stopc:
@@ -218,16 +252,22 @@ func (n *Node) run() {
 
 			// 1. PERSIST — WAL (fsync'd) before MemoryStorage, and before any
 			// message goes out.
+			// A failure here means this node cannot keep its durability
+			// promise. It stops rather than continuing as a liar — but it
+			// stops ALONE, so a peer sharing the process survives.
 			if err := n.wal.Save(rd.HardState, rd.Entries); err != nil {
-				log.Fatalf("raftnode: wal save: %v", err)
+				n.fatal(fmt.Errorf("wal save: %w", err))
+				return
 			}
 			if rd.HardState != nil && !raft.IsEmptyHardState(rd.HardState) {
 				if err := n.storage.SetHardState(rd.HardState); err != nil {
-					log.Fatalf("raftnode: set hardstate: %v", err)
+					n.fatal(fmt.Errorf("set hardstate: %w", err))
+					return
 				}
 			}
 			if err := n.storage.Append(rd.Entries); err != nil {
-				log.Fatalf("raftnode: append: %v", err)
+				n.fatal(fmt.Errorf("append: %w", err))
+				return
 			}
 
 			// 2. SEND — only now, because the entries these messages claim are
@@ -242,7 +282,8 @@ func (n *Node) run() {
 				case raftpb.EntryConfChange:
 					cc := &raftpb.ConfChange{}
 					if err := proto.Unmarshal(ent.GetData(), cc); err != nil {
-						log.Fatalf("raftnode: unmarshal conf change: %v", err)
+						n.fatal(fmt.Errorf("unmarshal conf change: %w", err))
+						return
 					}
 					n.node.ApplyConfChange(cc)
 				case raftpb.EntryNormal:

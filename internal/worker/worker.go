@@ -13,8 +13,7 @@ import (
 	"sync"
 	"time"
 
-	"google.golang.org/grpc"
-
+	"github.com/evazheng/fault-tolerant-coordinator/internal/client"
 	schedulerpb "github.com/evazheng/fault-tolerant-coordinator/proto/schedulerpb"
 )
 
@@ -43,9 +42,12 @@ func DefaultConfig(workerID, dataDir string) Config {
 }
 
 type Worker struct {
-	cfg    Config
-	client schedulerpb.SchedulerClient
-	exec   *Executor
+	cfg Config
+	// pool follows NOT_LEADER redirects. A worker that ignored them would
+	// re-register against a deposed node forever, so a coordinator failover
+	// would strand the whole worker pool even though the cluster recovered.
+	pool *client.Pool
+	exec *Executor
 
 	// running tracks what this worker is currently executing, and is what the
 	// heartbeat carries up as running_task_ids. That claim is what promotes
@@ -55,13 +57,13 @@ type Worker struct {
 	running map[string]bool
 }
 
-func New(cfg Config, conn *grpc.ClientConn) *Worker {
+func New(cfg Config, pool *client.Pool) *Worker {
 	if cfg.Concurrency < 1 {
 		cfg.Concurrency = 1
 	}
 	return &Worker{
 		cfg:     cfg,
-		client:  schedulerpb.NewSchedulerClient(conn),
+		pool:    pool,
 		exec:    &Executor{DataDir: cfg.DataDir},
 		running: make(map[string]bool),
 	}
@@ -93,11 +95,13 @@ func (w *Worker) Run(ctx context.Context) error {
 func (w *Worker) register(ctx context.Context) error {
 	// Declaring capacity is what lets the planner assign proactively. Day 3
 	// did not need it: workers pulled, so they self-limited by construction.
-	_, err := w.client.RegisterWorker(ctx, &schedulerpb.RegisterWorkerRequest{
-		WorkerId: w.cfg.WorkerID,
-		Capacity: int32(w.cfg.Concurrency),
+	return w.pool.Do(func(c schedulerpb.SchedulerClient) error {
+		_, err := c.RegisterWorker(ctx, &schedulerpb.RegisterWorkerRequest{
+			WorkerId: w.cfg.WorkerID,
+			Capacity: int32(w.cfg.Concurrency),
+		})
+		return err
 	})
-	return err
 }
 
 // heartbeatLoop renews the lease and republishes the running claim.
@@ -114,9 +118,12 @@ func (w *Worker) heartbeatLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			_, err := w.client.Heartbeat(ctx, &schedulerpb.HeartbeatRequest{
-				WorkerId:       w.cfg.WorkerID,
-				RunningTaskIds: w.runningIDs(),
+			err := w.pool.Do(func(c schedulerpb.SchedulerClient) error {
+				_, err := c.Heartbeat(ctx, &schedulerpb.HeartbeatRequest{
+					WorkerId:       w.cfg.WorkerID,
+					RunningTaskIds: w.runningIDs(),
+				})
+				return err
 			})
 			if err != nil && ctx.Err() == nil {
 				log.Printf("worker %s: heartbeat: %v", w.cfg.WorkerID, err)
@@ -137,16 +144,22 @@ func (w *Worker) runningIDs() []string {
 
 func (w *Worker) pollLoop(ctx context.Context) {
 	for ctx.Err() == nil {
-		resp, err := w.client.RequestTask(ctx, &schedulerpb.RequestTaskRequest{
-			WorkerId: w.cfg.WorkerID,
-			WaitMs:   w.cfg.PollWait.Milliseconds(),
+		var resp *schedulerpb.RequestTaskResponse
+		err := w.pool.Do(func(c schedulerpb.SchedulerClient) error {
+			var e error
+			resp, e = c.RequestTask(ctx, &schedulerpb.RequestTaskRequest{
+				WorkerId: w.cfg.WorkerID,
+				WaitMs:   w.cfg.PollWait.Milliseconds(),
+			})
+			return e
 		})
 		if err != nil {
 			if ctx.Err() != nil {
 				return
 			}
-			// A coordinator restart or a lapsed lease both surface here.
-			// Re-register and back off; there is nothing else to do.
+			// A coordinator restart, a lapsed lease, or an exhausted redirect
+			// chase all surface here. Re-register and back off; the pool has
+			// already moved on to another node if it was told to.
 			log.Printf("worker %s: request task: %v", w.cfg.WorkerID, err)
 			time.Sleep(w.cfg.HeartbeatInterval)
 			_ = w.register(ctx)
@@ -228,7 +241,11 @@ func (w *Worker) execute(ctx context.Context, task *schedulerpb.Task) {
 	// Delivery is at-least-once, so retrying here is safe by construction.
 	reportCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
-	if _, err := w.client.ReportResult(reportCtx, req); err != nil {
+	err := w.pool.Do(func(c schedulerpb.SchedulerClient) error {
+		_, e := c.ReportResult(reportCtx, req)
+		return e
+	})
+	if err != nil {
 		// Dropping the report is survivable: the lease expires and the task
 		// is redispatched. That is the failure mode the whole lease design
 		// exists to absorb.

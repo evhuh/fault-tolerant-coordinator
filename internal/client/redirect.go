@@ -54,8 +54,15 @@ type Pool struct {
 	seeds   []string
 }
 
+// NewPool takes one or more coordinator gRPC addresses. Any one will do: a
+// non-leader answers NOT_LEADER with the leader's address, so a single seed
+// is enough to find the cluster.
 func NewPool(seeds ...string) *Pool {
-	return &Pool{conns: map[string]*grpc.ClientConn{}, seeds: seeds, current: seeds[0]}
+	norm := make([]string, 0, len(seeds))
+	for _, s := range seeds {
+		norm = append(norm, normalize(s))
+	}
+	return &Pool{conns: map[string]*grpc.ClientConn{}, seeds: norm, current: norm[0]}
 }
 
 // Client returns a client for the address believed to be the leader.
@@ -118,4 +125,75 @@ func normalize(addr string) string {
 	addr = strings.TrimPrefix(addr, "http://")
 	addr = strings.TrimPrefix(addr, "https://")
 	return strings.TrimSuffix(addr, "/")
+}
+
+// maxAttempts bounds one call's chase. A cluster mid-election can bounce a
+// caller around; past this the call fails and the caller retries at its own
+// pace rather than spinning inside a single RPC.
+const maxAttempts = 6
+
+// isUnreachable reports a transport-level failure: the node is down, or did
+// not answer in time.
+//
+// This is a SEPARATE case from NOT_LEADER and it is the one that actually
+// matters on failover. A killed leader does not answer "NOT_LEADER" — it does
+// not answer at all. A pool that only handled redirects would retry the
+// corpse forever, which is precisely what stranded the worker pool the first
+// time this was wired up.
+func isUnreachable(err error) bool {
+	switch status.Code(err) {
+	case codes.Unavailable, codes.DeadlineExceeded:
+		return true
+	}
+	return false
+}
+
+// Do runs fn against the node currently believed to lead, following
+// NOT_LEADER redirects.
+//
+// This is the whole point of the package: without it the coordinator's
+// redirect is advice nobody takes. A worker that ignores it re-registers
+// against a deposed node forever, and a failover strands the worker pool even
+// though the cluster recovered fine.
+//
+// fn may run more than once, so it must be safe to retry. Every RPC in the
+// scheduler API is: writes carry (clientID, requestID) or are idempotent on
+// (taskID, attempt), and reads have no effect.
+func (p *Pool) Do(fn func(schedulerpb.SchedulerClient) error) error {
+	var lastErr error
+	for i := 0; i < maxAttempts; i++ {
+		c, err := p.Client()
+		if err != nil {
+			return err
+		}
+		err = fn(c)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+
+		// Two distinct ways to be talking to the wrong node:
+		if addr, ok := IsNotLeader(err); ok {
+			// It answered, and told us where to go. An empty addr means it
+			// knows of no leader either, and Redirect rotates instead.
+			p.Redirect(addr)
+			continue
+		}
+		if isUnreachable(err) {
+			// It did not answer at all — killed, partitioned, or still
+			// starting. Nobody is going to send us a redirect, so move on.
+			p.Redirect("")
+			continue
+		}
+		return err // a real error; the caller decides what to do
+	}
+	return lastErr
+}
+
+// Current reports the address the pool is currently aimed at. For logging and
+// tests.
+func (p *Pool) Current() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.current
 }

@@ -35,10 +35,13 @@ LEADER=$(find_leader)
 [ -z "$LEADER" ] && { echo "FATAL: no leader"; tail -5 coord1.log; exit 1; }
 echo ">>> leader is node $LEADER (pid ${PIDS[$LEADER]})"
 
-./worker -id w-1 -coordinator "127.0.0.1:1808$LEADER" -concurrency 1 > w1.log 2>&1 &
+# Seeded with ALL THREE addresses. The worker follows NOT_LEADER on its own —
+# it is never told about the failover.
+ALL_API="127.0.0.1:18081,127.0.0.1:18082,127.0.0.1:18083"
+./worker -id w-1 -coordinator "$ALL_API" -concurrency 1 > w1.log 2>&1 &
 sleep 1
 
-JOB=$(./schedctl -coordinator "127.0.0.1:1808$LEADER" submit -n 8 -max-attempts 5 -- /bin/sh -c 'sleep 1; echo ok')
+JOB=$(./schedctl -coordinator "$ALL_API" submit -n 8 -max-attempts 5 -- /bin/sh -c 'sleep 1; echo ok')
 echo "JOB=$JOB"
 sleep 2
 echo
@@ -57,10 +60,7 @@ echo
 echo "--- the job survived in the log ---"
 ./schedctl -coordinator "127.0.0.1:1808$NEW" status "$JOB" | head -1
 
-# Point the worker at the new leader and let it finish the job.
-pkill -x worker 2>/dev/null; sleep 0.3
-./worker -id w-1 -coordinator "127.0.0.1:1808$NEW" -concurrency 1 > w1b.log 2>&1 &
-
+# The worker is NOT restarted. It discovers the new leader by itself.
 for i in $(seq 1 25); do
   line=$(./schedctl -coordinator "127.0.0.1:1808$NEW" status "$JOB" | head -1)
   echo "t+${i}s  $line"
@@ -70,3 +70,8 @@ done
 echo
 echo "--- final ---"
 ./schedctl -coordinator "127.0.0.1:1808$NEW" status "$JOB" | tail -n +2
+echo
+echo "--- the worker process never restarted ---"
+echo "worker pid now:  $(pgrep -x worker | tr '\n' ' ')"
+echo "worker started:  $(head -1 w1.log)"
+echo "(one process, one log, spanning the failover; the pool re-aimed itself)"

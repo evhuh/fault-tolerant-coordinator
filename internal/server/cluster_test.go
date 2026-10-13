@@ -2,11 +2,15 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"testing"
 	"time"
 
+	"google.golang.org/grpc"
+
+	"github.com/evazheng/fault-tolerant-coordinator/internal/client"
 	"github.com/evazheng/fault-tolerant-coordinator/internal/raftnode"
 	"github.com/evazheng/fault-tolerant-coordinator/internal/state"
 	schedulerpb "github.com/evazheng/fault-tolerant-coordinator/proto/schedulerpb"
@@ -23,12 +27,16 @@ type clusterNode struct {
 	coord *Coordinator
 	svc   *Service
 	dir   string
+	// gs serves this node's gRPC API on a real socket, so a client pool can
+	// dial it and follow NOT_LEADER for real.
+	gs *grpc.Server
 }
 
 type cluster struct {
-	t     *testing.T
-	nodes map[uint64]*clusterNode
-	peers map[uint64]string
+	t        *testing.T
+	nodes    map[uint64]*clusterNode
+	peers    map[uint64]string // raft transport URLs
+	apiAddrs map[uint64]string // gRPC addresses — a DIFFERENT address space
 }
 
 // freePort asks the kernel for an unused port. Hardcoding them makes tests
@@ -46,10 +54,14 @@ func freePort(t *testing.T) int {
 
 func newCluster(t *testing.T, n int) *cluster {
 	t.Helper()
-	c := &cluster{t: t, nodes: map[uint64]*clusterNode{}, peers: map[uint64]string{}}
+	c := &cluster{
+		t: t, nodes: map[uint64]*clusterNode{},
+		peers: map[uint64]string{}, apiAddrs: map[uint64]string{},
+	}
 
 	for i := 1; i <= n; i++ {
 		c.peers[uint64(i)] = fmt.Sprintf("http://127.0.0.1:%d", freePort(t))
+		c.apiAddrs[uint64(i)] = fmt.Sprintf("127.0.0.1:%d", freePort(t))
 	}
 	for i := 1; i <= n; i++ {
 		c.start(uint64(i), t.TempDir())
@@ -63,6 +75,7 @@ func (c *cluster) start(id uint64, dir string) {
 	cfg := DefaultConfig()
 	cfg.Sched.Workers = 2
 	cfg.Sched.LeaseTTLMs = cfg.LeaseTTL.Milliseconds()
+	cfg.APIAddrs = c.apiAddrs
 
 	coord := New(cfg)
 	rcfg := raftnode.DefaultConfig()
@@ -78,15 +91,43 @@ func (c *cluster) start(id uint64, dir string) {
 	if err := coord.StartRaft(rcfg); err != nil {
 		c.t.Fatalf("start node %d: %v", id, err)
 	}
-	c.nodes[id] = &clusterNode{id: id, coord: coord, svc: NewService(coord), dir: dir}
+	svc := NewService(coord)
+	n := &clusterNode{id: id, coord: coord, svc: svc, dir: dir}
+
+	// Serve the API on a real socket. Without this the redirect is untestable:
+	// a client pool has nothing to dial.
+	lis, err := net.Listen("tcp", c.apiAddrs[id])
+	if err != nil {
+		c.t.Fatalf("listen api for node %d: %v", id, err)
+	}
+	n.gs = grpc.NewServer()
+	schedulerpb.RegisterSchedulerServer(n.gs, svc)
+	go func() { _ = n.gs.Serve(lis) }()
+
+	c.nodes[id] = n
 }
 
 func (c *cluster) stop(id uint64) {
 	if n, ok := c.nodes[id]; ok {
+		if n.gs != nil {
+			n.gs.Stop()
+		}
 		n.coord.StopRaft()
 		n.coord.StopScheduling()
 		delete(c.nodes, id)
 	}
+}
+
+// follower returns any node that is not currently leading.
+func (c *cluster) follower(lead *clusterNode) *clusterNode {
+	c.t.Helper()
+	for id, n := range c.nodes {
+		if id != lead.id {
+			return n
+		}
+	}
+	c.t.Fatal("no follower")
+	return nil
 }
 
 func (c *cluster) stopAll() {
@@ -372,5 +413,205 @@ func TestRestartedNodeRecoversFromDisk(t *testing.T) {
 	revived.coord.read(func(st *state.StateStore) { _, found = st.Job(resp.GetJobId()) })
 	if !found {
 		t.Error("restarted node lost a job it had already applied")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// NOT_LEADER redirect: the client half
+// ---------------------------------------------------------------------------
+
+// A client pool aimed at a FOLLOWER must reach the leader on its own.
+//
+// Without this, the coordinator's redirect is advice nobody takes: the server
+// says "the leader is over there" and the caller keeps asking the node that
+// cannot help it.
+func TestClientPoolFollowsRedirectFromFollower(t *testing.T) {
+	c := newCluster(t, 3)
+	lead := c.leader(10 * time.Second)
+	fol := c.follower(lead)
+
+	// Seeded with ONLY the follower's address — the pool has never heard of
+	// the leader and must learn it from the redirect.
+	pool := client.NewPool(c.apiAddrs[fol.id])
+	defer pool.Close()
+
+	var jobID string
+	err := pool.Do(func(sc schedulerpb.SchedulerClient) error {
+		resp, e := sc.SubmitJob(context.Background(), &schedulerpb.SubmitJobRequest{
+			ClientId: "c", RequestId: "r-1",
+			Tasks: []*schedulerpb.TaskSpec{{Command: "/bin/true", MaxAttempts: 3}},
+		})
+		if e != nil {
+			return e
+		}
+		jobID = resp.GetJobId()
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("submit through a follower: %v", err)
+	}
+	if jobID == "" {
+		t.Fatal("no job id returned")
+	}
+
+	// The pool now points at the leader, so the next call costs no redirect.
+	if got, want := pool.Current(), c.apiAddrs[lead.id]; got != want {
+		t.Errorf("pool is aimed at %q, want the leader at %q", got, want)
+	}
+
+	// And the write really landed in the replicated log.
+	var found bool
+	lead.coord.read(func(st *state.StateStore) { _, found = st.Job(jobID) })
+	if !found {
+		t.Error("the redirected submit did not reach the state machine")
+	}
+}
+
+// THE ONE THAT MATTERS: after a leader dies, a client that was talking to it
+// finds the new leader by itself.
+//
+// This is what the Day 6 demo script was faking by restarting the worker
+// against the new address by hand.
+func TestClientPoolRecoversFromLeaderFailure(t *testing.T) {
+	c := newCluster(t, 3)
+	lead := c.leader(10 * time.Second)
+
+	// Seed with every node, the way a real deployment would.
+	seeds := make([]string, 0, len(c.apiAddrs))
+	for _, a := range c.apiAddrs {
+		seeds = append(seeds, a)
+	}
+	pool := client.NewPool(seeds...)
+	defer pool.Close()
+
+	submit := func(reqID string) (string, error) {
+		var id string
+		err := pool.Do(func(sc schedulerpb.SchedulerClient) error {
+			resp, e := sc.SubmitJob(context.Background(), &schedulerpb.SubmitJobRequest{
+				ClientId: "c", RequestId: reqID,
+				Tasks: []*schedulerpb.TaskSpec{{Command: "/bin/true", MaxAttempts: 3}},
+			})
+			if e != nil {
+				return e
+			}
+			id = resp.GetJobId()
+			return nil
+		})
+		return id, err
+	}
+
+	if _, err := submit("r-before"); err != nil {
+		t.Fatalf("submit before failover: %v", err)
+	}
+
+	killed := lead.id
+	c.stop(killed)
+	next := c.leader(10 * time.Second)
+	if next.id == killed {
+		t.Fatal("killed node still leading")
+	}
+
+	// The pool is probably still aimed at the dead node, and NOTHING TELLS
+	// IT SO — a killed leader does not answer NOT_LEADER, it does not answer
+	// at all. Do must rotate off an unreachable node on its own.
+	//
+	// The only thing retried here is the call itself, the way any client
+	// would across an election window. The pool is never steered by hand.
+	var jobID string
+	var lastErr error
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		id, err := submit("r-after")
+		if err == nil {
+			jobID = id
+			break
+		}
+		lastErr = err
+		time.Sleep(100 * time.Millisecond)
+	}
+	if jobID == "" {
+		t.Fatalf("client never recovered after failover: %v", lastErr)
+	}
+
+	var found bool
+	next.coord.read(func(st *state.StateStore) { _, found = st.Job(jobID) })
+	if !found {
+		t.Error("post-failover submit did not reach the new leader's state machine")
+	}
+}
+
+// Retrying a submit through the redirect must not create a second job: fn can
+// run several times, so every RPC Do wraps has to be safe to repeat.
+func TestRedirectedRetryStillDedups(t *testing.T) {
+	c := newCluster(t, 3)
+	lead := c.leader(10 * time.Second)
+	fol := c.follower(lead)
+
+	pool := client.NewPool(c.apiAddrs[fol.id])
+	defer pool.Close()
+
+	ids := map[string]bool{}
+	for i := 0; i < 3; i++ {
+		var id string
+		if err := pool.Do(func(sc schedulerpb.SchedulerClient) error {
+			resp, e := sc.SubmitJob(context.Background(), &schedulerpb.SubmitJobRequest{
+				ClientId: "c", RequestId: "same-request",
+				Tasks: []*schedulerpb.TaskSpec{{Command: "/bin/true", MaxAttempts: 3}},
+			})
+			if e != nil {
+				return e
+			}
+			id = resp.GetJobId()
+			return nil
+		}); err != nil {
+			t.Fatalf("submit %d: %v", i, err)
+		}
+		ids[id] = true
+	}
+	if len(ids) != 1 {
+		t.Errorf("got %d distinct job ids across retries, want 1", len(ids))
+	}
+
+	var jobs int
+	lead.coord.read(func(st *state.StateStore) { jobs = st.JobCount() })
+	if jobs != 1 {
+		t.Errorf("job count = %d, want 1", jobs)
+	}
+}
+
+// An unrecoverable node error must halt THAT NODE, not the process.
+//
+// Three nodes share this test binary, and Day 8's simulator runs a whole
+// cluster in one. A log.Fatal in the Ready loop would take down the healthy
+// peers and the harness, leaving you debugging the wrong failure.
+func TestFatalHaltsOneNodeNotTheProcess(t *testing.T) {
+	c := newCluster(t, 3)
+	lead := c.leader(10 * time.Second)
+	victim := c.follower(lead)
+
+	// If this killed the process, the test binary would die here rather than
+	// report a failure.
+	victim.coord.fatal(errors.New("simulated unrecoverable disk error"))
+
+	if got := victim.coord.FatalErr(); got == nil {
+		t.Error("FatalErr is nil after fatal")
+	}
+	select {
+	case <-victim.coord.RaftDone():
+	case <-time.After(5 * time.Second):
+		t.Fatal("the halted node's Ready loop never exited")
+	}
+
+	// The survivors still have quorum and still serve.
+	if _, err := lead.svc.SubmitJob(context.Background(), &schedulerpb.SubmitJobRequest{
+		ClientId: "c", RequestId: "r-after-fatal",
+		Tasks: []*schedulerpb.TaskSpec{{Command: "/bin/true", MaxAttempts: 3}},
+	}); err != nil {
+		t.Errorf("cluster stopped serving after one node halted: %v", err)
+	}
+
+	// And a healthy node reports no error.
+	if err := lead.coord.FatalErr(); err != nil {
+		t.Errorf("healthy leader reports fatal %v", err)
 	}
 }
