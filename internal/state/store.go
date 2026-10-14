@@ -17,6 +17,30 @@ import (
 	schedulerpb "github.com/evazheng/fault-tolerant-coordinator/proto/schedulerpb"
 )
 
+// Command versions. These describe the MEANING of a command, not its wire
+// format — protobuf already handles added fields, and we have added four
+// without incident. What it cannot handle is a field or a command whose
+// semantics changed, because the log holds yesterday's intent.
+//
+// This is not hypothetical here. ApplyPlan was ALL-OR-NOTHING until Raft was
+// wired, and became deterministic partial apply because one stale assignment
+// should not discard 99 good ones. A log written under the old rule, replayed
+// by the new code, reaches different state than the cluster actually had: an
+// old plan with one bad assignment used to apply nothing and would now apply
+// the rest.
+//
+// So the old behaviour is kept, keyed on the version stamped into the entry.
+// That is the whole point of the field, and the cost of having operated
+// something.
+const (
+	// CommandVersionAllOrNothingPlan is the original semantics: an ApplyPlan
+	// commits whole or is rejected whole.
+	CommandVersionAllOrNothingPlan uint32 = 1
+	// CommandVersionPartialPlan skips invalid assignments and applies the
+	// rest. Current.
+	CommandVersionPartialPlan uint32 = 2
+)
+
 // defaultMaxAttempts applies when a TaskSpec omits it. Any defaulting done here must be a constant, never a configured or environment-derived value: a replica configured differently would diverge
 const defaultMaxAttempts int32 = 3
 
@@ -313,7 +337,7 @@ func (s *StateStore) Apply(cmd *commandpb.Command) (Result, error) {
 	case *commandpb.Command_CreateEval:
 		return s.applyCreateEval(k.CreateEval)
 	case *commandpb.Command_ApplyPlan:
-		return s.applyPlan(k.ApplyPlan)
+		return s.applyPlan(k.ApplyPlan, cmd.GetVersion())
 	case *commandpb.Command_CompleteTask:
 		return s.applyCompleteTask(k.CompleteTask)
 	case *commandpb.Command_FailTask:
@@ -512,6 +536,7 @@ func (s *StateStore) applyTick(c *commandpb.Tick) (Result, error) {
 	}
 
 	// (1) Clamp. A backwards tick is a no-op, not an error.
+	wasUnset := s.nowMs == 0
 	if c.GetNowMs() > s.nowMs {
 		s.nowMs = c.GetNowMs()
 	}
@@ -548,6 +573,25 @@ func (s *StateStore) applyTick(c *commandpb.Tick) (Result, error) {
 	// (4) Expire dedup sessions. Unbounded growth is a real leak in a
 	// long-running coordinator, and the sweep must be deterministic: it reads
 	// the Tick-carried clock, never time.Now().
+	//
+	// REBASE FIRST. The clock starts at zero, so anything recorded before the
+	// first Tick carries createdMs = 0 — not "the epoch", but "no time yet".
+	// Measured against a real clock that looks infinitely old, and the sweep
+	// would destroy it on the very first tick. That is not a lost edge case:
+	// it silently broke dedup for every request served in the window between
+	// winning an election and the first Tick committing, and it looked
+	// exactly like a snapshot bug.
+	//
+	// Treating those as created now is deterministic — same state, same log
+	// position, same result on every replica.
+	if wasUnset {
+		for key, sess := range s.sessions {
+			if sess.createdMs == 0 {
+				sess.createdMs = now
+				s.sessions[key] = sess
+			}
+		}
+	}
 	for key, sess := range s.sessions {
 		if sess.createdMs+sessionTTLMs < now {
 			delete(s.sessions, key)
@@ -616,12 +660,20 @@ func (s *StateStore) applyTick(c *commandpb.Tick) (Result, error) {
 	(2) Apply assignments: PENDING → ASSIGNED, Attempt := assignment.Attempt
 	(3) Promote the job to RUNNING on its first assignment
 */
-func (s *StateStore) applyPlan(c *commandpb.ApplyPlan) (Result, error) {
+func (s *StateStore) applyPlan(c *commandpb.ApplyPlan, version uint32) (Result, error) {
 	if c == nil {
 		return Result{}, fmt.Errorf("apply plan: nil payload")
 	}
 	if c.GetEvalId() == "" {
 		return Result{}, fmt.Errorf("apply plan: empty eval_id")
+	}
+
+	// Entries written before the semantics changed must replay under the rule
+	// they were written with, or a restart reaches state the cluster never
+	// had. Version 0 means an entry predating the field entirely, which can
+	// only be the older meaning.
+	if version < CommandVersionPartialPlan {
+		return s.applyPlanAllOrNothing(c)
 	}
 
 	var res Result
@@ -957,4 +1009,83 @@ func backoffFor(taskID string, attempt int32) int64 {
 	_, _ = h.Write([]byte{byte(attempt), byte(attempt >> 8), byte(attempt >> 16), byte(attempt >> 24)})
 	spread := int64(h.Sum64() % uint64(base/2+1))
 	return base + spread
+}
+
+// applyPlanAllOrNothing is ApplyPlan's ORIGINAL semantics, kept for replay.
+//
+// It is dead code for anything this build proposes — every new entry is
+// stamped CommandVersionPartialPlan — and it must stay anyway. A log written
+// before the change still holds entries that meant this, and replaying them
+// under the new rule would silently produce state the cluster never had.
+//
+// That is the whole problem schema versioning exists for, and it only ever
+// appears once a system has a past.
+func (s *StateStore) applyPlanAllOrNothing(c *commandpb.ApplyPlan) (Result, error) {
+	// Validate EVERYTHING before mutating anything: under this rule a single
+	// invalid entry rejects the batch, so a partial mutation would be a bug.
+	seen := make(map[string]bool, len(c.GetAssignments()))
+	for _, a := range c.GetAssignments() {
+		t, ok := s.tasks[a.GetTaskId()]
+		if !ok {
+			return Result{}, fmt.Errorf("apply plan: unknown task %q", a.GetTaskId())
+		}
+		if seen[a.GetTaskId()] {
+			return Result{}, fmt.Errorf("apply plan: task %q assigned twice in one plan", a.GetTaskId())
+		}
+		seen[a.GetTaskId()] = true
+
+		if t.State != TaskPending {
+			return Result{}, fmt.Errorf("apply plan: task %q is %s, want PENDING", t.ID, t.State)
+		}
+		if a.GetAttempt() != t.Attempt+1 {
+			return Result{}, fmt.Errorf("apply plan: task %q attempt %d, want %d (stale plan)",
+				t.ID, a.GetAttempt(), t.Attempt+1)
+		}
+		if a.GetAttempt() > t.Spec.MaxAttempts {
+			return Result{}, fmt.Errorf("apply plan: task %q attempt %d exceeds max_attempts %d",
+				t.ID, a.GetAttempt(), t.Spec.MaxAttempts)
+		}
+		w, ok := s.workers[a.GetWorkerId()]
+		if !ok {
+			return Result{}, fmt.Errorf("apply plan: unknown worker %q", a.GetWorkerId())
+		}
+		if w.State != WorkerAlive {
+			return Result{}, fmt.Errorf("apply plan: worker %q is %s, want ALIVE", w.ID, w.State)
+		}
+		if a.GetLeaseExpiryMs() <= s.nowMs {
+			return Result{}, fmt.Errorf("apply plan: task %q lease %d already expired at now=%d",
+				t.ID, a.GetLeaseExpiryMs(), s.nowMs)
+		}
+	}
+	for _, st := range c.GetStops() {
+		t, ok := s.tasks[st.GetTaskId()]
+		if !ok {
+			return Result{}, fmt.Errorf("apply plan: stop names unknown task %q", st.GetTaskId())
+		}
+		if t.State != TaskAssigned && t.State != TaskRunning {
+			return Result{}, fmt.Errorf("apply plan: cannot stop task %q in state %s", t.ID, t.State)
+		}
+	}
+
+	res := Result{EvalID: c.GetEvalId()}
+	for _, st := range c.GetStops() {
+		t := s.tasks[st.GetTaskId()]
+		t.State = TaskPending
+		t.WorkerID = ""
+		t.LeaseExpiryMs = 0
+		t.LastError = st.GetReason()
+		res.PlanApplied++
+	}
+	for _, a := range c.GetAssignments() {
+		t := s.tasks[a.GetTaskId()]
+		t.State = TaskAssigned
+		t.WorkerID = a.GetWorkerId()
+		t.Attempt = a.GetAttempt()
+		t.LeaseExpiryMs = a.GetLeaseExpiryMs()
+		res.PlanApplied++
+		if j, ok := s.jobs[t.JobID]; ok && j.State == JobPending {
+			j.State = JobRunning
+		}
+	}
+	return res, nil
 }

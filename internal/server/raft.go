@@ -125,6 +125,8 @@ func (c *Coordinator) StartRaft(cfg raftnode.Config) error {
 		Apply:             c.applyCommitted,
 		LeadershipChanged: c.onLeadershipChanged,
 		Fatal:             c.fatal,
+		Snapshot:          c.snapshotState,
+		Restore:           c.restoreState,
 	})
 	if err != nil {
 		c.proposer = nil
@@ -336,4 +338,30 @@ func (c *Coordinator) RaftDone() <-chan struct{} {
 		return nil
 	}
 	return c.raft.Done()
+}
+
+// snapshotState serializes the state machine for a Raft snapshot.
+//
+// Taken under the same lock as apply, so the bytes correspond to a single log
+// position rather than a smear across several.
+func (c *Coordinator) snapshotState() ([]byte, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.store.Encode()
+}
+
+// restoreState REPLACES the state machine from a snapshot.
+//
+// Called at startup from disk, and when the leader ships one to a follower
+// that fell further behind than its log could repair.
+//
+// The scheduling pipeline is deliberately NOT rebuilt here. A node receiving
+// a snapshot is by definition a follower, so it has none running; and when it
+// later wins an election, establishLeadership rebuilds the broker by scanning
+// the state this restore just installed. Derived-not-replicated pays off
+// exactly here — there is no in-memory queue to reconcile with a snapshot.
+func (c *Coordinator) restoreState(data []byte) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.store.Restore(data)
 }

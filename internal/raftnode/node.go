@@ -36,13 +36,25 @@ type Config struct {
 	TickInterval  time.Duration
 	ElectionTick  int
 	HeartbeatTick int
+
+	// SnapshotEntries is how many applied entries trigger a snapshot. Without
+	// one the log grows forever and restart replay grows with uptime, which
+	// is the thing that makes snapshots non-optional for an always-on
+	// service rather than a nicety.
+	SnapshotEntries uint64
+	// SnapshotCatchUpEntries are kept after compaction so a slightly lagging
+	// follower can still be caught up by shipping entries rather than a whole
+	// snapshot.
+	SnapshotCatchUpEntries uint64
 }
 
 func DefaultConfig() Config {
 	return Config{
-		TickInterval:  100 * time.Millisecond,
-		ElectionTick:  10,
-		HeartbeatTick: 1,
+		TickInterval:           100 * time.Millisecond,
+		ElectionTick:           10,
+		HeartbeatTick:          1,
+		SnapshotEntries:        10_000,
+		SnapshotCatchUpEntries: 1_000,
 	}
 }
 
@@ -70,6 +82,19 @@ type Handler struct {
 	//
 	// If nil, the node stops silently; the host notices via Done.
 	Fatal func(error)
+
+	// Snapshot serializes the state machine. Called when enough entries have
+	// been applied to be worth compacting.
+	Snapshot func() ([]byte, error)
+
+	// Restore REPLACES the state machine from a snapshot. Called on startup
+	// when a snapshot exists on disk, and when the leader ships one to a
+	// follower that fell too far behind to catch up from the log.
+	//
+	// Without it, compaction is a correctness bug rather than a feature: a
+	// lagging follower would receive a snapshot it silently dropped and stay
+	// stuck forever.
+	Restore func([]byte) error
 }
 
 type Node struct {
@@ -87,6 +112,11 @@ type Node struct {
 	stopc chan struct{}
 	done  chan struct{}
 
+	// Indices driving compaction. Only the Ready loop touches these.
+	appliedIndex  uint64
+	snapshotIndex uint64
+	confState     *raftpb.ConfState
+
 	fatalOnce sync.Once
 	fatalErr  error
 }
@@ -102,12 +132,35 @@ func Start(cfg Config, h Handler) (*Node, error) {
 	// seeds MemoryStorage, which is raft's in-process read-back copy of the
 	// log. Raft calls back into storage mid-decision (to re-send entries to a
 	// lagging follower), and it cannot wait on a disk read.
-	w, hs, ents, hadState, err := openWAL(cfg.DataDir)
+	// The snapshot comes FIRST and sets the base the WAL continues from.
+	// Reading them in the other order means not knowing which entries the
+	// snapshot already covers.
+	snap, err := loadSnapshot(cfg.DataDir)
+	if err != nil {
+		return nil, fmt.Errorf("raftnode: load snapshot: %w", err)
+	}
+	var baseIndex uint64
+	if snap != nil && snap.GetMetadata() != nil {
+		baseIndex = snap.GetMetadata().GetIndex()
+	}
+
+	w, hs, ents, hadState, err := openWAL(cfg.DataDir, baseIndex)
 	if err != nil {
 		return nil, fmt.Errorf("raftnode: open wal: %w", err)
 	}
 
 	storage := raft.NewMemoryStorage()
+	if snap != nil {
+		if err := storage.ApplySnapshot(snap); err != nil {
+			return nil, fmt.Errorf("raftnode: apply snapshot: %w", err)
+		}
+		if h.Restore != nil {
+			if err := h.Restore(snap.GetData()); err != nil {
+				return nil, fmt.Errorf("raftnode: restore state machine: %w", err)
+			}
+		}
+		hadState = true // a snapshot IS a past: restart, never bootstrap
+	}
 	if hadState {
 		if hs != nil && !raft.IsEmptyHardState(hs) {
 			if err := storage.SetHardState(hs); err != nil {
@@ -131,9 +184,11 @@ func Start(cfg Config, h Handler) (*Node, error) {
 
 	n := &Node{
 		cfg: cfg, h: h, storage: storage, wal: w,
-		tp:    newTransport(cfg.Peers),
-		stopc: make(chan struct{}),
-		done:  make(chan struct{}),
+		tp:            newTransport(cfg.Peers),
+		stopc:         make(chan struct{}),
+		done:          make(chan struct{}),
+		appliedIndex:  baseIndex,
+		snapshotIndex: baseIndex,
 	}
 
 	// Fork on whether this node has a past.
@@ -250,6 +305,30 @@ func (n *Node) run() {
 				n.setLeadership(rd.SoftState.Lead, rd.SoftState.RaftState == raft.StateLeader)
 			}
 
+			// 0. INCOMING SNAPSHOT. The leader ships one when this node has
+			// fallen further behind than its log can repair. Dropping it —
+			// which is what ignoring rd.Snapshot does — leaves the node stuck
+			// forever, so this must exist before compaction is ever enabled.
+			if !raft.IsEmptySnap(rd.Snapshot) {
+				if err := saveSnapshot(n.cfg.DataDir, rd.Snapshot); err != nil {
+					n.fatal(fmt.Errorf("save incoming snapshot: %w", err))
+					return
+				}
+				if err := n.storage.ApplySnapshot(rd.Snapshot); err != nil {
+					n.fatal(fmt.Errorf("apply incoming snapshot: %w", err))
+					return
+				}
+				if n.h.Restore != nil {
+					if err := n.h.Restore(rd.Snapshot.GetData()); err != nil {
+						n.fatal(fmt.Errorf("restore from incoming snapshot: %w", err))
+						return
+					}
+				}
+				idx := rd.Snapshot.GetMetadata().GetIndex()
+				n.appliedIndex, n.snapshotIndex = idx, idx
+				log.Printf("raftnode: node %d restored from leader snapshot at index %d", n.cfg.ID, idx)
+			}
+
 			// 1. PERSIST — WAL (fsync'd) before MemoryStorage, and before any
 			// message goes out.
 			// A failure here means this node cannot keep its durability
@@ -285,13 +364,26 @@ func (n *Node) run() {
 						n.fatal(fmt.Errorf("unmarshal conf change: %w", err))
 						return
 					}
-					n.node.ApplyConfChange(cc)
+					// Kept because CreateSnapshot needs the membership that
+					// was in effect at the snapshot index.
+					n.confState = n.node.ApplyConfChange(cc)
 				case raftpb.EntryNormal:
-					if len(ent.GetData()) == 0 {
-						continue // new-leader no-op, committing the leader's term
+					if len(ent.GetData()) > 0 {
+						n.h.Apply(ent.GetData())
 					}
-					n.h.Apply(ent.GetData())
+					// An empty entry is a new leader's no-op. It still
+					// ADVANCES the index: skipping it here would make the
+					// snapshot claim coverage it does not have.
 				}
+				if idx := ent.GetIndex(); idx > n.appliedIndex {
+					n.appliedIndex = idx
+				}
+			}
+
+			// 3b. COMPACT once enough has been applied to be worth it.
+			if err := n.maybeSnapshot(); err != nil {
+				n.fatal(err)
+				return
 			}
 
 			// 4. ADVANCE — raft holds the next Ready until this call.
@@ -310,4 +402,60 @@ func (n *Node) setLeadership(leaderID uint64, isLeader bool) {
 	if changed && n.h.LeadershipChanged != nil {
 		n.h.LeadershipChanged(isLeader)
 	}
+}
+
+// maybeSnapshot takes a snapshot and compacts the log once enough entries
+// have been applied.
+//
+// Order is load-bearing throughout: serialize, make the snapshot durable,
+// and only then drop the entries it covers. Compacting first would leave a
+// window where a crash loses entries nothing else holds.
+func (n *Node) maybeSnapshot() error {
+	if n.h.Snapshot == nil || n.cfg.SnapshotEntries == 0 {
+		return nil
+	}
+	if n.appliedIndex < n.snapshotIndex+n.cfg.SnapshotEntries {
+		return nil
+	}
+
+	data, err := n.h.Snapshot()
+	if err != nil {
+		return fmt.Errorf("serialize state machine: %w", err)
+	}
+
+	// CreateSnapshot records the membership in effect at this index, so a
+	// node restored from it knows who its peers are.
+	snap, err := n.storage.CreateSnapshot(n.appliedIndex, n.confState, data)
+	if err != nil {
+		if err == raft.ErrSnapOutOfDate {
+			return nil // a newer snapshot already covers this; nothing to do
+		}
+		return fmt.Errorf("create snapshot: %w", err)
+	}
+	if err := saveSnapshot(n.cfg.DataDir, snap); err != nil {
+		return fmt.Errorf("save snapshot: %w", err)
+	}
+
+	// Keep a tail of entries so a slightly lagging follower can still be
+	// repaired by shipping entries, which is far cheaper than shipping the
+	// whole state machine.
+	compactIndex := n.appliedIndex
+	if compactIndex > n.cfg.SnapshotCatchUpEntries {
+		compactIndex -= n.cfg.SnapshotCatchUpEntries
+	} else {
+		compactIndex = 0
+	}
+	if compactIndex > 0 {
+		if err := n.storage.Compact(compactIndex); err != nil && err != raft.ErrCompacted {
+			return fmt.Errorf("compact: %w", err)
+		}
+		if err := n.wal.compact(n.cfg.DataDir, compactIndex); err != nil {
+			return fmt.Errorf("compact wal: %w", err)
+		}
+	}
+
+	n.snapshotIndex = n.appliedIndex
+	log.Printf("raftnode: node %d snapshotted at index %d (%d bytes), log compacted to %d",
+		n.cfg.ID, n.appliedIndex, len(data), compactIndex)
+	return nil
 }

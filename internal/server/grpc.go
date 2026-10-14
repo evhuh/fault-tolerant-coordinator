@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -48,6 +49,31 @@ func (s *Service) notLeader() error {
 		return status.Errorf(codes.FailedPrecondition, "NOT_LEADER: leader is at %s", addr)
 	}
 	return status.Error(codes.Unavailable, "NOT_LEADER: no leader elected")
+}
+
+// proposeError maps a propose() failure onto a gRPC code the CLIENT can act
+// on. Getting this wrong is silent: a client that is handed InvalidArgument
+// for a lost proposal gives up instead of retrying, and the failure only
+// shows during a failover.
+//
+// Three outcomes, three behaviours:
+//
+//	ErrNotLeader    → NOT_LEADER, so the pool re-aims at the real leader.
+//	                  Leadership can be lost BETWEEN the guard and the commit.
+//	ErrProposalLost → Unavailable, so the pool retries. The entry may still
+//	                  commit, which is safe: every command is idempotent, and
+//	                  that is exactly what the dedup key is for.
+//	anything else   → InvalidArgument: the state machine rejected it, and
+//	                  retrying would only be rejected again.
+func (s *Service) proposeError(err error, what string) error {
+	switch {
+	case errors.Is(err, ErrNotLeader):
+		return s.notLeader()
+	case errors.Is(err, ErrProposalLost):
+		return status.Errorf(codes.Unavailable, "%s: proposal lost, retry", what)
+	default:
+		return status.Errorf(codes.InvalidArgument, "%s: %v", what, err)
+	}
 }
 
 // requireLeader guards every RPC that must not be served by a follower.
@@ -100,7 +126,7 @@ func (s *Service) SubmitJob(ctx context.Context, req *schedulerpb.SubmitJobReque
 		},
 	})
 	if err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "submit job: %v", err)
+		return nil, s.proposeError(err, "submit job")
 	}
 	// On a retry the state machine returns the ORIGINAL job id and the jobID
 	// minted above is simply discarded, never having entered state. That is
@@ -153,7 +179,7 @@ func (s *Service) RegisterWorker(ctx context.Context, req *schedulerpb.RegisterW
 	// it to answer "does this worker have room" — Day 3 did not, because
 	// workers pulled and self-limited.
 	if _, err := s.c.propose(s.c.registerWorkerCmd(req.GetWorkerId(), nil, req.GetCapacity())); err != nil {
-		return nil, status.Errorf(codes.Internal, "register worker: %v", err)
+		return nil, s.proposeError(err, "register worker")
 	}
 	return &schedulerpb.RegisterWorkerResponse{LeaseTtlMs: s.c.cfg.LeaseTTL.Milliseconds()}, nil
 }
@@ -172,7 +198,7 @@ func (s *Service) Heartbeat(ctx context.Context, req *schedulerpb.HeartbeatReque
 	// Capacity 0 means "unchanged": a heartbeat renews the lease and
 	// republishes the running claim, it does not redeclare the worker.
 	if _, err := s.c.propose(s.c.registerWorkerCmd(req.GetWorkerId(), req.GetRunningTaskIds(), 0)); err != nil {
-		return nil, status.Errorf(codes.Internal, "heartbeat: %v", err)
+		return nil, s.proposeError(err, "heartbeat")
 	}
 
 	var expiry int64
@@ -302,7 +328,7 @@ func (s *Service) ReportResult(ctx context.Context, req *schedulerpb.ReportResul
 	}
 
 	if _, err := s.c.propose(cmd); err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "report result: %v", err)
+		return nil, s.proposeError(err, "report result")
 	}
 	return &schedulerpb.ReportResultResponse{}, nil
 }

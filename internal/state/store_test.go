@@ -1,6 +1,7 @@
 package state
 
 import (
+	"bytes"
 	"fmt"
 	"sort"
 	"strings"
@@ -8,6 +9,8 @@ import (
 
 	commandpb "github.com/evazheng/fault-tolerant-coordinator/proto/commandpb"
 	schedulerpb "github.com/evazheng/fault-tolerant-coordinator/proto/schedulerpb"
+	snapshotpb "github.com/evazheng/fault-tolerant-coordinator/proto/snapshotpb"
+	"google.golang.org/protobuf/proto"
 )
 
 // Helpers
@@ -26,7 +29,7 @@ func submitJobCmd(jobID, clientID, requestID string, taskIDs ...string) *command
 		})
 	}
 	return &commandpb.Command{
-		Version: 1,
+		Version: CommandVersionPartialPlan,
 		Kind: &commandpb.Command_SubmitJob{
 			SubmitJob: &commandpb.SubmitJob{
 				ClientId:  clientID,
@@ -42,7 +45,7 @@ func submitJobCmd(jobID, clientID, requestID string, taskIDs ...string) *command
 
 func registerWorkerCmd(workerID string, registeredMs, leaseExpiryMs int64) *commandpb.Command {
 	return &commandpb.Command{
-		Version: 1,
+		Version: CommandVersionPartialPlan,
 		Kind: &commandpb.Command_RegisterWorker{
 			RegisterWorker: &commandpb.RegisterWorker{
 				WorkerId:      workerID,
@@ -63,7 +66,7 @@ func heartbeatCmd(workerID string, leaseExpiryMs int64, runningTaskIDs ...string
 
 func tickCmd(nowMs int64) *commandpb.Command {
 	return &commandpb.Command{
-		Version: 1,
+		Version: CommandVersionPartialPlan,
 		Kind:    &commandpb.Command_Tick{Tick: &commandpb.Tick{NowMs: nowMs}},
 	}
 }
@@ -90,7 +93,7 @@ func applyPlanCmd(evalID string, assigns []assign, stops ...string) *commandpb.C
 		ss = append(ss, &commandpb.Stop{TaskId: id, Reason: "stopped by plan"})
 	}
 	return &commandpb.Command{
-		Version: 1,
+		Version: CommandVersionPartialPlan,
 		Kind: &commandpb.Command_ApplyPlan{
 			ApplyPlan: &commandpb.ApplyPlan{EvalId: evalID, Assignments: as, Stops: ss},
 		},
@@ -99,7 +102,7 @@ func applyPlanCmd(evalID string, assigns []assign, stops ...string) *commandpb.C
 
 func completeTaskCmd(taskID, workerID string, attempt int32, resultRef string) *commandpb.Command {
 	return &commandpb.Command{
-		Version: 1,
+		Version: CommandVersionPartialPlan,
 		Kind: &commandpb.Command_CompleteTask{
 			CompleteTask: &commandpb.CompleteTask{
 				TaskId: taskID, WorkerId: workerID, Attempt: attempt,
@@ -111,7 +114,7 @@ func completeTaskCmd(taskID, workerID string, attempt int32, resultRef string) *
 
 func failTaskCmd(taskID, workerID string, attempt int32, retryable bool) *commandpb.Command {
 	return &commandpb.Command{
-		Version: 1,
+		Version: CommandVersionPartialPlan,
 		Kind: &commandpb.Command_FailTask{
 			FailTask: &commandpb.FailTask{
 				TaskId: taskID, WorkerId: workerID, Attempt: attempt,
@@ -123,7 +126,7 @@ func failTaskCmd(taskID, workerID string, attempt int32, retryable bool) *comman
 
 func createEvalCmd(evalID, jobID string, trigger commandpb.EvalTrigger) *commandpb.Command {
 	return &commandpb.Command{
-		Version: 1,
+		Version: CommandVersionPartialPlan,
 		Kind: &commandpb.Command_CreateEval{
 			CreateEval: &commandpb.CreateEval{
 				EvalId: evalID, JobId: jobID, Priority: 50,
@@ -131,6 +134,14 @@ func createEvalCmd(evalID, jobID string, trigger commandpb.EvalTrigger) *command
 			},
 		},
 	}
+}
+
+// applyPlanCmdV1 stamps the ORIGINAL all-or-nothing semantics, the way an
+// entry written before Raft was wired would have been.
+func applyPlanCmdV1(evalID string, assigns []assign, stops ...string) *commandpb.Command {
+	cmd := applyPlanCmd(evalID, assigns, stops...)
+	cmd.Version = CommandVersionAllOrNothingPlan
+	return cmd
 }
 
 // dump renders the store's full state in a canonical, sorted order. Two stores
@@ -330,7 +341,7 @@ func TestSubmitJobRejectsDuplicateJobID(t *testing.T) {
 func TestSubmitJobDefaultsMaxAttempts(t *testing.T) {
 	s := New()
 	cmd := &commandpb.Command{
-		Version: 1,
+		Version: CommandVersionPartialPlan,
 		Kind: &commandpb.Command_SubmitJob{
 			SubmitJob: &commandpb.SubmitJob{
 				ClientId:  "client-a",
@@ -1318,5 +1329,316 @@ func TestWorkDoneButNotReportedYieldsOneCommittedResult(t *testing.T) {
 	}
 	if task.Attempt != 2 {
 		t.Errorf("attempt = %d, want 2", task.Attempt)
+	}
+}
+
+// Day 7 — snapshot serialization
+
+// A snapshot must round-trip the ENTIRE state machine. The test compares
+// dumps rather than fields, so anything added to StateStore later and
+// forgotten here shows up as a failure instead of as silent data loss.
+func TestSnapshotRoundTripsEverything(t *testing.T) {
+	s := seedCluster(t, 3)
+	mustApply(t, s, registerWorkerCmd("w-2", 600, 9000))
+	mustApply(t, s, applyPlanCmd("eval-1", []assign{
+		{"task-1", "w-1", 1, 5000},
+		{"task-2", "w-2", 1, 5000},
+	}))
+	mustApply(t, s, heartbeatCmd("w-1", 8000, "task-1"))
+	mustApply(t, s, completeTaskCmd("task-2", "w-2", 1, "/data/w-2/out"))
+	mustApply(t, s, failTaskCmd("task-3", "w-1", 0, true)) // stale, ignored
+	mustApply(t, s, createEvalCmd("eval-9", "job-1", commandpb.EvalTrigger_EVAL_TRIGGER_TASK_FAILED))
+
+	data, err := s.Encode()
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+
+	restored := New()
+	if err := restored.Restore(data); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	if got, want := dump(restored), dump(s); got != want {
+		t.Errorf("restored state differs\nwant:\n%s\ngot:\n%s", want, got)
+	}
+}
+
+// Two replicas with identical state must produce IDENTICAL BYTES. Protobuf's
+// default marshaling is explicitly allowed to vary between runs, which would
+// make this silently false.
+func TestSnapshotEncodingIsDeterministic(t *testing.T) {
+	build := func() *StateStore {
+		s := seedCluster(t, 4)
+		mustApply(t, s, applyPlanCmd("eval-1", []assign{
+			{"task-1", "w-1", 1, 5000},
+			{"task-2", "w-1", 1, 5000},
+		}))
+		mustApply(t, s, completeTaskCmd("task-1", "w-1", 1, "/out/1"))
+		return s
+	}
+	a, err := build().Encode()
+	if err != nil {
+		t.Fatalf("encode a: %v", err)
+	}
+	for i := 0; i < 20; i++ {
+		b, err := build().Encode()
+		if err != nil {
+			t.Fatalf("encode b: %v", err)
+		}
+		if !bytes.Equal(a, b) {
+			t.Fatalf("encoding is not deterministic (run %d): %d vs %d bytes", i, len(a), len(b))
+		}
+	}
+}
+
+// THE OMISSION THAT WOULD BE SILENT: sessions must survive a snapshot.
+//
+// Without them a restored node looks completely healthy and duplicates a job
+// the first time a client retries across the restore — no error, no log line,
+// just two jobs where there should be one.
+func TestSnapshotPreservesDedupSessions(t *testing.T) {
+	s := New()
+	mustApply(t, s, tickCmd(1000))
+	first := mustApply(t, s, submitJobCmd("job-1", "client-a", "req-1", "task-1"))
+
+	data, err := s.Encode()
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	restored := New()
+	if err := restored.Restore(data); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+
+	if n := restored.SessionCount(); n != 1 {
+		t.Fatalf("session count = %d after restore, want 1", n)
+	}
+	// The retry must still be deduped against the restored session.
+	retry := mustApply(t, restored, submitJobCmd("job-X", "client-a", "req-1", "task-X"))
+	if retry.JobID != first.JobID {
+		t.Errorf("retry after restore created job %q, want the original %q", retry.JobID, first.JobID)
+	}
+	if restored.JobCount() != 1 {
+		t.Errorf("job count = %d after a retry, want 1", restored.JobCount())
+	}
+}
+
+// nowMs must survive too, or every live lease looks expired on the first tick
+// after a restore and the whole cluster reclaims its work at once.
+func TestSnapshotPreservesClockAndLeases(t *testing.T) {
+	s := seedCluster(t, 1)
+	mustApply(t, s, applyPlanCmd("eval-1", []assign{{"task-1", "w-1", 1, 5000}}))
+
+	data, _ := s.Encode()
+	restored := New()
+	if err := restored.Restore(data); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	if got, want := restored.NowMs(), s.NowMs(); got != want {
+		t.Errorf("nowMs = %d after restore, want %d", got, want)
+	}
+
+	// A tick at the same instant must NOT expire a lease that was live.
+	mustApply(t, restored, tickCmd(restored.NowMs()))
+	if task, _ := restored.Task("task-1"); task.State != TaskAssigned {
+		t.Errorf("task is %s after restore+tick, want ASSIGNED — the lease was still live", task.State)
+	}
+}
+
+// Restore REPLACES rather than merges: anything the snapshot compacted away
+// must not linger.
+func TestRestoreReplacesExistingState(t *testing.T) {
+	empty := New()
+	mustApply(t, empty, tickCmd(500))
+	data, _ := empty.Encode()
+
+	populated := seedCluster(t, 2)
+	if populated.JobCount() == 0 {
+		t.Fatal("precondition: expected state to replace")
+	}
+	if err := populated.Restore(data); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	if populated.JobCount() != 0 || populated.TaskCount() != 0 || populated.WorkerCount() != 0 {
+		t.Errorf("state survived a restore: jobs=%d tasks=%d workers=%d",
+			populated.JobCount(), populated.TaskCount(), populated.WorkerCount())
+	}
+}
+
+// A snapshot from a future build may mean something this one would misread.
+// Refusing beats misreading.
+func TestRestoreRefusesNewerSnapshotVersion(t *testing.T) {
+	s := seedCluster(t, 1)
+	data, _ := s.Encode()
+
+	future := &snapshotpb.Snapshot{}
+	if err := proto.Unmarshal(data, future); err != nil {
+		t.Fatal(err)
+	}
+	future.Version = snapshotVersion + 1
+	raw, _ := proto.Marshal(future)
+
+	if err := New().Restore(raw); err == nil {
+		t.Error("restored a snapshot from a newer build; misreading state is worse than refusing")
+	}
+}
+
+// Day 7 — schema versioning
+
+// THE CHECKPOINT: a log written under yesterday's meaning must replay under
+// yesterday's rule.
+//
+// ApplyPlan was all-or-nothing until Raft was wired; it is partial now. The
+// identical command therefore means two different things depending on when it
+// was written, and the version stamped into the entry is the only thing that
+// can tell them apart. Replaying a v1 entry under v2 rules would silently
+// produce state the cluster never had.
+func TestApplyPlanRespectsTheVersionItWasWrittenWith(t *testing.T) {
+	// One good assignment, one stale — the case where the two rules diverge.
+	mixed := func() []assign {
+		return []assign{
+			{"task-2", "w-1", 1, 5000}, // valid
+			{"task-1", "w-1", 1, 5000}, // stale: task-1 is already ASSIGNED
+		}
+	}
+
+	t.Run("v1 rejects the whole batch", func(t *testing.T) {
+		s := seedCluster(t, 2)
+		mustApply(t, s, applyPlanCmd("eval-1", []assign{{"task-1", "w-1", 1, 5000}}))
+		before := dump(s)
+
+		if _, err := s.Apply(applyPlanCmdV1("eval-2", mixed())); err == nil {
+			t.Fatal("v1 accepted a plan with a stale assignment; it was all-or-nothing")
+		}
+		if after := dump(s); after != before {
+			t.Errorf("v1 partially applied a rejected plan\nbefore:\n%s\nafter:\n%s", before, after)
+		}
+	})
+
+	t.Run("v2 applies the good half", func(t *testing.T) {
+		s := seedCluster(t, 2)
+		mustApply(t, s, applyPlanCmd("eval-1", []assign{{"task-1", "w-1", 1, 5000}}))
+
+		res := mustApply(t, s, applyPlanCmd("eval-2", mixed()))
+		if res.PlanApplied != 1 || res.PlanSkipped != 1 {
+			t.Errorf("applied = %d skipped = %d, want 1 and 1", res.PlanApplied, res.PlanSkipped)
+		}
+		if task, _ := s.Task("task-2"); task.State != TaskAssigned {
+			t.Errorf("task-2 is %s, want ASSIGNED", task.State)
+		}
+	})
+}
+
+// An entry predating the version field entirely can only mean the older rule.
+func TestUnversionedCommandUsesTheOldestSemantics(t *testing.T) {
+	s := seedCluster(t, 2)
+	mustApply(t, s, applyPlanCmd("eval-1", []assign{{"task-1", "w-1", 1, 5000}}))
+
+	cmd := applyPlanCmd("eval-2", []assign{
+		{"task-2", "w-1", 1, 5000},
+		{"task-1", "w-1", 1, 5000},
+	})
+	cmd.Version = 0 // written before the field existed
+
+	if _, err := s.Apply(cmd); err == nil {
+		t.Error("an unversioned plan applied partially; version 0 must mean the oldest rule")
+	}
+}
+
+// Replaying a recorded log must reach the same state twice, with each entry
+// honouring the version it carries. This is what restart-from-disk does.
+func TestMixedVersionLogReplaysDeterministically(t *testing.T) {
+	buildLog := func() []*commandpb.Command {
+		return []*commandpb.Command{
+			submitJobCmd("job-1", "client-a", "req-1", "task-1", "task-2", "task-3"),
+			registerWorkerCmd("w-1", 500, 90000),
+			tickCmd(1000),
+			applyPlanCmdV1("eval-1", []assign{{"task-1", "w-1", 1, 50000}}),
+			// v1: one stale entry rejects the batch, so NOTHING here lands.
+			applyPlanCmdV1("eval-2", []assign{
+				{"task-2", "w-1", 1, 50000},
+				{"task-1", "w-1", 1, 50000},
+			}),
+			// v2: the good half lands.
+			applyPlanCmd("eval-3", []assign{
+				{"task-3", "w-1", 1, 50000},
+				{"task-1", "w-1", 1, 50000},
+			}),
+		}
+	}
+	replay := func() *StateStore {
+		s := New()
+		for _, cmd := range buildLog() {
+			_, _ = s.Apply(cmd) // rejections are part of the history
+		}
+		return s
+	}
+
+	a, b := replay(), replay()
+	if dump(a) != dump(b) {
+		t.Fatalf("replay is not deterministic\nA:\n%s\nB:\n%s", dump(a), dump(b))
+	}
+
+	// And the mixed rules produced the state they should have: task-2 never
+	// landed (v1 rejected its batch), task-3 did (v2 applied its half).
+	if task, _ := a.Task("task-2"); task.State != TaskPending {
+		t.Errorf("task-2 is %s, want PENDING — its v1 batch was rejected whole", task.State)
+	}
+	if task, _ := a.Task("task-3"); task.State != TaskAssigned {
+		t.Errorf("task-3 is %s, want ASSIGNED — its v2 batch applied partially", task.State)
+	}
+}
+
+// THE SILENT ONE: a session recorded before the clock was ever set must not
+// be swept by the first real Tick.
+//
+// The state machine's clock starts at zero, so anything applied before the
+// first Tick carries createdMs = 0 — meaning "no time yet", not "the epoch".
+// Measured against a wall-clock timestamp that looks infinitely old, and the
+// sweep destroyed it immediately. The symptom was dedup quietly failing for
+// everything served between winning an election and the first Tick
+// committing, and it looked exactly like a snapshot bug.
+func TestSessionCreatedBeforeTheFirstTickSurvives(t *testing.T) {
+	s := New()
+	// No Tick yet: nowMs is 0, exactly like a freshly elected leader.
+	if s.NowMs() != 0 {
+		t.Fatalf("precondition: nowMs = %d, want 0", s.NowMs())
+	}
+	first := mustApply(t, s, submitJobCmd("job-1", "client-a", "req-1", "task-1"))
+	if s.SessionCount() != 1 {
+		t.Fatalf("session count = %d, want 1", s.SessionCount())
+	}
+
+	// The first real Tick arrives carrying a wall-clock timestamp.
+	const realClock int64 = 1_760_000_000_000
+	mustApply(t, s, tickCmd(realClock))
+
+	if n := s.SessionCount(); n != 1 {
+		t.Fatalf("session count = %d after the first tick, want 1 — it was swept as infinitely old", n)
+	}
+	retry := mustApply(t, s, submitJobCmd("job-X", "client-a", "req-1", "task-X"))
+	if retry.JobID != first.JobID {
+		t.Errorf("retry created %q, want the original %q", retry.JobID, first.JobID)
+	}
+
+	// Rebased, not exempted: it still expires on schedule afterwards.
+	mustApply(t, s, tickCmd(realClock+sessionTTLMs+1))
+	if n := s.SessionCount(); n != 0 {
+		t.Errorf("session count = %d past the TTL, want 0 — rebasing must not make it immortal", n)
+	}
+}
+
+// The rebase is a pure function of state and log position, like everything
+// else in apply.
+func TestSessionRebaseIsDeterministic(t *testing.T) {
+	build := func() *StateStore {
+		s := New()
+		mustApply(t, s, submitJobCmd("job-1", "client-a", "req-1", "task-1"))
+		mustApply(t, s, submitJobCmd("job-2", "client-b", "req-2", "task-2"))
+		mustApply(t, s, tickCmd(1_760_000_000_000))
+		return s
+	}
+	if a, b := build(), build(); dump(a) != dump(b) {
+		t.Errorf("rebase diverged\nA:\n%s\nB:\n%s", dump(a), dump(b))
 	}
 }

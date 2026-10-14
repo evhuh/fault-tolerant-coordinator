@@ -2,12 +2,18 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	"github.com/evazheng/fault-tolerant-coordinator/internal/client"
 	"github.com/evazheng/fault-tolerant-coordinator/internal/sched"
 	"github.com/evazheng/fault-tolerant-coordinator/internal/state"
 	schedulerpb "github.com/evazheng/fault-tolerant-coordinator/proto/schedulerpb"
@@ -829,5 +835,73 @@ func TestKilledBeforeReportYieldsOneObservableResult(t *testing.T) {
 	}
 	if final.Attempt != 2 {
 		t.Errorf("attempt = %d, want 2", final.Attempt)
+	}
+}
+
+// A propose() failure must reach the client as a code it can ACT on.
+//
+// This mapping is silent when wrong: a lost proposal handed back as
+// InvalidArgument makes the client pool give up instead of retrying, and the
+// bug only appears during a failover — the one moment it matters.
+func TestProposeErrorsMapToActionableCodes(t *testing.T) {
+	s, _ := newTestService(t)
+
+	tests := []struct {
+		name     string
+		err      error
+		wantCode codes.Code
+		wantMsg  string
+	}{
+		{
+			// Leadership can be lost between the guard and the commit. The
+			// client must re-aim, not fail.
+			name: "lost leadership mid-propose", err: ErrNotLeader,
+			wantCode: codes.Unavailable, wantMsg: "NOT_LEADER",
+		},
+		{
+			// The entry may still commit; retrying is safe because every
+			// command is idempotent.
+			name: "proposal timed out", err: ErrProposalLost,
+			wantCode: codes.Unavailable, wantMsg: "retry",
+		},
+		{
+			// The state machine said no. Retrying would be rejected again.
+			name: "rejected by the state machine", err: errors.New("job already exists"),
+			wantCode: codes.InvalidArgument, wantMsg: "job already exists",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := s.proposeError(tc.err, "submit job")
+			if code := status.Code(got); code != tc.wantCode {
+				t.Errorf("code = %s, want %s", code, tc.wantCode)
+			}
+			if msg := status.Convert(got).Message(); !strings.Contains(msg, tc.wantMsg) {
+				t.Errorf("message = %q, want it to contain %q", msg, tc.wantMsg)
+			}
+		})
+	}
+}
+
+// The two retryable outcomes must be ones the client pool actually acts on.
+// Asserting the codes alone would not catch a mismatch between the two halves.
+func TestRetryableProposeErrorsAreActedOnByTheClient(t *testing.T) {
+	s, _ := newTestService(t)
+
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"not leader", ErrNotLeader},
+		{"proposal lost", ErrProposalLost},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rpcErr := s.proposeError(tc.err, "submit job")
+			_, isRedirect := client.IsNotLeader(rpcErr)
+			retryable := isRedirect || status.Code(rpcErr) == codes.Unavailable
+			if !retryable {
+				t.Errorf("%v maps to %s, which the client pool treats as fatal", tc.err, status.Code(rpcErr))
+			}
+		})
 	}
 }

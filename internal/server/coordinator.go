@@ -13,6 +13,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -49,7 +50,7 @@ func DefaultConfig() Config {
 	return Config{
 		LeaseTTL:       2000 * time.Millisecond, // 4 missed heartbeats at H=500ms
 		TickPeriod:     200 * time.Millisecond,
-		CommandVersion: 1,
+		CommandVersion: state.CommandVersionPartialPlan,
 		Sched:          sched.DefaultConfig(),
 	}
 }
@@ -240,6 +241,32 @@ func (c *Coordinator) read(fn func(s *state.StateStore)) {
 func (c *Coordinator) RunTicker(ctx context.Context) {
 	t := time.NewTicker(c.cfg.TickPeriod)
 	defer t.Stop()
+
+	// Tick IMMEDIATELY, before waiting out the first interval.
+	//
+	// A new leader's state machine may still have a zero clock, and anything
+	// it serves before the first Tick commits is timestamped with "no time
+	// yet". Establishing the time base up front shrinks that window to the
+	// commit itself; applyTick's rebase covers what is left.
+	tick := func() bool {
+		if _, err := c.propose(tickCmd(c.nowMs())); err != nil {
+			// Losing leadership mid-tick is NORMAL, not a bug. The ticker is
+			// cancelled on revocation, but a tick already in flight races
+			// that cancellation and the window cannot be closed from here.
+			// Same for a proposal abandoned during the transition.
+			//
+			// Treating these as fatal crashed the node on every failover —
+			// the one moment it most needs to survive.
+			if errors.Is(err, ErrNotLeader) || errors.Is(err, ErrProposalLost) {
+				return true
+			}
+			// Anything else means a malformed Tick, a bug in this file.
+			panic(fmt.Sprintf("coordinator: tick rejected: %v", err))
+		}
+		return true
+	}
+	tick()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -249,11 +276,7 @@ func (c *Coordinator) RunTicker(ctx context.Context) {
 			// normal case: afterApply turns each into a CreateEval and
 			// hands it to the broker, which is how a reclaimed task gets
 			// rescheduled.
-			if _, err := c.propose(tickCmd(c.nowMs())); err != nil {
-				// Tick has no failure mode other than a malformed payload,
-				// which would be a bug in this file.
-				panic(fmt.Sprintf("coordinator: tick rejected: %v", err))
-			}
+			tick()
 		}
 	}
 }

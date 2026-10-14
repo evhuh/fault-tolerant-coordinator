@@ -38,6 +38,8 @@ func main() {
 	apiPeerSpec := flag.String("api-peers", "", "comma-separated id=host:port gRPC addresses, for NOT_LEADER redirects")
 	raftTick := flag.Duration("raft-tick", 100*time.Millisecond, "raft tick interval; the time unit for election/heartbeat ticks")
 	electionTick := flag.Int("election-tick", 10, "election timeout in raft ticks")
+	snapEntries := flag.Uint64("snapshot-entries", 10000, "applied entries between snapshots; low values exercise Restore")
+	snapCatchUp := flag.Uint64("snapshot-catchup-entries", 1000, "entries kept after compaction so a lagging follower can catch up from the log")
 	flag.Parse()
 
 	cfg := server.DefaultConfig()
@@ -95,6 +97,8 @@ func main() {
 		rcfg.DataDir = dir
 		rcfg.TickInterval = *raftTick
 		rcfg.ElectionTick = *electionTick
+		rcfg.SnapshotEntries = *snapEntries
+		rcfg.SnapshotCatchUpEntries = *snapCatchUp
 		if err := coord.StartRaft(rcfg); err != nil {
 			log.Fatalf("start raft: %v", err)
 		}

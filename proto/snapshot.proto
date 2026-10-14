@@ -1,0 +1,122 @@
+syntax = "proto3";
+
+// The SNAPSHOT schema: a complete, self-contained state machine.
+//
+// This is a third schema with a third set of pressures. scheduler.proto breaks
+// clients; command.proto breaks replay of a log; THIS one breaks restart from
+// disk, and a snapshot is the only thing standing between a node and replaying
+// its entire history.
+//
+// Two rules specific to it:
+//
+//   1. ENUM VALUES ARE PINNED HERE, not taken from Go. The state package
+//      numbers its own states with iota, and reordering those constants is an
+//      ordinary refactor — but it must never silently change what is already
+//      on disk. These enums are the durable encoding; the mapping to Go is
+//      explicit and one-way.
+//   2. Encoding must be DETERMINISTIC: entries are emitted in sorted id order,
+//      so two replicas snapshotting identical state produce identical bytes.
+package snapshot.v1;
+
+option go_package = "github.com/evazheng/fault-tolerant-coordinator/proto/snapshotpb";
+
+import "scheduler.proto";
+
+enum TaskState {
+  TASK_STATE_UNSPECIFIED = 0;
+  TASK_STATE_PENDING     = 1;
+  TASK_STATE_ASSIGNED    = 2;
+  TASK_STATE_RUNNING     = 3;
+  TASK_STATE_COMPLETE    = 4;
+  TASK_STATE_FAILED      = 5;
+}
+
+enum JobState {
+  JOB_STATE_UNSPECIFIED = 0;
+  JOB_STATE_PENDING     = 1;
+  JOB_STATE_RUNNING     = 2;
+  JOB_STATE_COMPLETE    = 3;
+  JOB_STATE_FAILED      = 4;
+}
+
+enum WorkerState {
+  WORKER_STATE_UNSPECIFIED = 0;
+  WORKER_STATE_ALIVE       = 1;
+  WORKER_STATE_LOST        = 2;
+}
+
+enum EvalReason {
+  EVAL_REASON_UNSPECIFIED     = 0;
+  EVAL_REASON_JOB_SUBMITTED   = 1;
+  EVAL_REASON_TASK_FAILED     = 2;
+  EVAL_REASON_WORKER_LOST     = 3;
+  EVAL_REASON_LEASE_EXPIRED   = 4;
+  EVAL_REASON_BACKOFF_ELAPSED = 5;
+}
+
+message Task {
+  string                task_id         = 1;
+  string                job_id          = 2;
+  scheduler.v1.TaskSpec spec            = 3;
+  TaskState             state           = 4;
+  int32                 attempt         = 5;
+  string                worker_id       = 6;
+  int64                 lease_expiry_ms = 7;
+  string                result_ref      = 8;
+  int32                 exit_code       = 9;
+  string                last_error      = 10;
+  // Retry backoff deadline. Dropping this on restore would redispatch every
+  // backing-off task immediately, turning a crash loop back on
+  int64                 not_before_ms   = 11;
+}
+
+message Job {
+  string          job_id     = 1;
+  string          client_id  = 2;
+  string          request_id = 3;
+  JobState        state      = 4;
+  repeated string task_ids   = 5; // ORDERED: submission order is semantic
+  int32           priority   = 6;
+  int64           created_ms = 7;
+}
+
+message Worker {
+  string      worker_id       = 1;
+  WorkerState state           = 2;
+  int64       registered_ms   = 3;
+  int64       lease_expiry_ms = 4;
+  int32       capacity        = 5;
+}
+
+message Eval {
+  string     eval_id      = 1;
+  string     job_id       = 2;
+  int32      priority     = 3;
+  EvalReason triggered_by = 4;
+  int64      created_ms   = 5;
+}
+
+// Session is one remembered (clientID, requestID) response.
+//
+// EASY TO FORGET, AND SILENT WHEN YOU DO: a snapshot without sessions restores
+// a system that looks completely healthy and duplicates a job the first time a
+// client retries across the restore.
+message Session {
+  string client_id  = 1;
+  string request_id = 2;
+  string job_id     = 3;
+  int64  created_ms = 4;
+}
+
+message Snapshot {
+  uint32 version = 1;
+  // The state machine's clock. Without it, lease expiry after a restore reads
+  // zero and every live lease looks expired
+  int64  now_ms  = 2;
+
+  repeated Job     jobs     = 3;
+  repeated Task    tasks    = 4;
+  repeated Worker  workers  = 5;
+  repeated Eval    evals    = 6;
+  repeated Session sessions = 7;
+}

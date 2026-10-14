@@ -7,7 +7,7 @@ proto:
 	cd proto && protoc \
 		--go_out=. --go_opt=module=$(PROTO_MODULE) \
 		--go-grpc_out=. --go-grpc_opt=module=$(PROTO_MODULE) \
-		command.proto scheduler.proto
+		command.proto scheduler.proto snapshot.proto
 
 build:
 	go build ./...

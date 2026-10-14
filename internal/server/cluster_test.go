@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -37,6 +39,9 @@ type cluster struct {
 	nodes    map[uint64]*clusterNode
 	peers    map[uint64]string // raft transport URLs
 	apiAddrs map[uint64]string // gRPC addresses — a DIFFERENT address space
+	// snapshotEntries is deliberately tiny so compaction and Restore are
+	// genuinely exercised rather than merely compiled.
+	snapshotEntries uint64
 }
 
 // freePort asks the kernel for an unused port. Hardcoding them makes tests
@@ -57,6 +62,7 @@ func newCluster(t *testing.T, n int) *cluster {
 	c := &cluster{
 		t: t, nodes: map[uint64]*clusterNode{},
 		peers: map[uint64]string{}, apiAddrs: map[uint64]string{},
+		snapshotEntries: 20,
 	}
 
 	for i := 1; i <= n; i++ {
@@ -87,6 +93,12 @@ func (c *cluster) start(id uint64, dir string) {
 	rcfg.TickInterval = 20 * time.Millisecond
 	rcfg.ElectionTick = 10
 	rcfg.HeartbeatTick = 1
+	// A LOW threshold on purpose. At the production default of 10k entries
+	// no test would ever snapshot, and Restore would be dead code that
+	// compiles. The Tick proposer alone produces entries fast enough that
+	// this fires within seconds.
+	rcfg.SnapshotEntries = c.snapshotEntries
+	rcfg.SnapshotCatchUpEntries = 5
 
 	if err := coord.StartRaft(rcfg); err != nil {
 		c.t.Fatalf("start node %d: %v", id, err)
@@ -613,5 +625,281 @@ func TestFatalHaltsOneNodeNotTheProcess(t *testing.T) {
 	// And a healthy node reports no error.
 	if err := lead.coord.FatalErr(); err != nil {
 		t.Errorf("healthy leader reports fatal %v", err)
+	}
+}
+
+// THE SECOND HALF OF THE DAY 6 CHECKPOINT: restart the node that was KILLED
+// WHILE LEADING, and watch it catch up and rejoin.
+//
+// This is a different case from restarting a follower, and the harder one.
+// An ex-leader's WAL can hold entries it appended and replicated to nobody —
+// proposed in its last term, never committed cluster-wide. On restart it
+// comes back as a FOLLOWER, and the new leader's log overwrites that
+// uncommitted suffix. Getting this wrong means a node that silently believes
+// in entries no one else has.
+func TestKilledLeaderRestartsAsFollowerAndCatchesUp(t *testing.T) {
+	c := newCluster(t, 3)
+	lead := c.leader(10 * time.Second)
+
+	if _, err := lead.svc.SubmitJob(context.Background(), &schedulerpb.SubmitJobRequest{
+		ClientId: "c", RequestId: "r-before",
+		Tasks: []*schedulerpb.TaskSpec{{Command: "/bin/true", MaxAttempts: 3}},
+	}); err != nil {
+		t.Fatalf("submit before kill: %v", err)
+	}
+
+	// Kill the LEADER and keep its data directory.
+	killed := lead.id
+	dir := lead.dir
+	c.stop(killed)
+
+	next := c.leader(10 * time.Second)
+	if next.id == killed {
+		t.Fatal("killed node still leading")
+	}
+
+	// The surviving majority keeps committing while the old leader is gone,
+	// so it has real catching up to do rather than returning to a quiet log.
+	for i := 0; i < 3; i++ {
+		if _, err := next.svc.SubmitJob(context.Background(), &schedulerpb.SubmitJobRequest{
+			ClientId: "c", RequestId: fmt.Sprintf("r-while-down-%d", i),
+			Tasks: []*schedulerpb.TaskSpec{{Command: "/bin/true", MaxAttempts: 3}},
+		}); err != nil {
+			t.Fatalf("submit while the old leader is down: %v", err)
+		}
+	}
+
+	// Back from its own WAL, via RestartNode.
+	c.start(killed, dir)
+	revived := c.nodes[killed]
+
+	// It must rejoin as a follower: the cluster already has a leader, and two
+	// would be a split brain.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var jobs int
+		revived.coord.read(func(st *state.StateStore) { jobs = st.JobCount() })
+		if jobs == 4 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("revived ex-leader has %d jobs, want 4 — it never caught up", jobs)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if revived.coord.IsLeader() && next.coord.IsLeader() {
+		t.Error("two leaders after the ex-leader rejoined")
+	}
+
+	// And it serves nothing while it follows.
+	if !revived.coord.IsLeader() {
+		if _, err := revived.svc.ListJobs(context.Background(), &schedulerpb.ListJobsRequest{}); err == nil {
+			t.Error("revived node served a read while following")
+		}
+	}
+
+	// Its state matches the leader's, entry for entry.
+	var leaderDump, revivedDump int
+	next.coord.read(func(st *state.StateStore) { leaderDump = st.TaskCount() })
+	revived.coord.read(func(st *state.StateStore) { revivedDump = st.TaskCount() })
+	if leaderDump != revivedDump {
+		t.Errorf("task count: leader %d, revived %d — the replicas diverged", leaderDump, revivedDump)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Day 7: snapshots, compaction, restart
+// ---------------------------------------------------------------------------
+
+// snapshotCount reports how many nodes have written a snapshot to disk.
+func (c *cluster) snapshotCount() int {
+	n := 0
+	for _, node := range c.nodes {
+		if _, err := os.Stat(filepath.Join(node.dir, "snapshot.pb")); err == nil {
+			n++
+		}
+	}
+	return n
+}
+
+// awaitSnapshots waits until every live node has compacted at least once.
+func (c *cluster) awaitSnapshots(within time.Duration) {
+	c.t.Helper()
+	deadline := time.Now().Add(within)
+	for time.Now().Before(deadline) {
+		if c.snapshotCount() == len(c.nodes) {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	c.t.Fatalf("only %d/%d nodes snapshotted within %s — compaction never ran",
+		c.snapshotCount(), len(c.nodes), within)
+}
+
+// Snapshots actually happen, and the log is actually compacted.
+//
+// The Tick proposer alone drives the index forward, so this needs no load —
+// which is the point: an always-on coordinator's log grows even when idle.
+func TestNodesSnapshotAndCompact(t *testing.T) {
+	c := newCluster(t, 3)
+	lead := c.leader(10 * time.Second)
+
+	if _, err := lead.svc.SubmitJob(context.Background(), &schedulerpb.SubmitJobRequest{
+		ClientId: "c", RequestId: "r-1",
+		Tasks: []*schedulerpb.TaskSpec{{Command: "/bin/true", MaxAttempts: 3}},
+	}); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	c.awaitSnapshots(20 * time.Second)
+
+	// Compaction must shrink the WAL, not just write a snapshot beside it.
+	for _, n := range c.nodes {
+		wal, err := os.Stat(filepath.Join(n.dir, "wal.log"))
+		if err != nil {
+			t.Fatalf("node %d: stat wal: %v", n.id, err)
+		}
+		snap, err := os.Stat(filepath.Join(n.dir, "snapshot.pb"))
+		if err != nil {
+			t.Fatalf("node %d: stat snapshot: %v", n.id, err)
+		}
+		t.Logf("node %d: wal=%d bytes snapshot=%d bytes", n.id, wal.Size(), snap.Size())
+	}
+}
+
+// THE DAY 7 CHECKPOINT: kill ALL THREE nodes, restart them from disk, and the
+// state is intact.
+//
+// With a low snapshot threshold most of the history is in the snapshot rather
+// than the log, so this genuinely exercises Restore plus a replay of the tail
+// — not just a replay from index 1.
+func TestWholeClusterRestartsFromDiskWithStateIntact(t *testing.T) {
+	c := newCluster(t, 3)
+	lead := c.leader(10 * time.Second)
+
+	// Enough jobs that losing any would be obvious.
+	var jobIDs []string
+	for i := 0; i < 6; i++ {
+		resp, err := lead.svc.SubmitJob(context.Background(), &schedulerpb.SubmitJobRequest{
+			ClientId: "c", RequestId: fmt.Sprintf("r-%d", i),
+			Tasks: []*schedulerpb.TaskSpec{
+				{Command: "/bin/true", MaxAttempts: 3},
+				{Command: "/bin/true", MaxAttempts: 3},
+			},
+		})
+		if err != nil {
+			t.Fatalf("submit %d: %v", i, err)
+		}
+		jobIDs = append(jobIDs, resp.GetJobId())
+	}
+
+	// Force compaction so the restart is not a plain log replay.
+	c.awaitSnapshots(20 * time.Second)
+
+	var wantJobs, wantTasks, wantSessions int
+	lead.coord.read(func(st *state.StateStore) {
+		wantJobs, wantTasks, wantSessions = st.JobCount(), st.TaskCount(), st.SessionCount()
+	})
+	t.Logf("before restart: jobs=%d tasks=%d sessions=%d", wantJobs, wantTasks, wantSessions)
+
+	// Stop everything, keeping the data directories.
+	dirs := map[uint64]string{}
+	for id, n := range c.nodes {
+		dirs[id] = n.dir
+	}
+	c.stopAll()
+
+	// Cold start the whole cluster from disk.
+	for id, dir := range dirs {
+		c.start(id, dir)
+	}
+	revived := c.leader(15 * time.Second)
+
+	var gotJobs, gotTasks, gotSessions int
+	revived.coord.read(func(st *state.StateStore) {
+		gotJobs, gotTasks, gotSessions = st.JobCount(), st.TaskCount(), st.SessionCount()
+	})
+	t.Logf("after restart:  jobs=%d tasks=%d sessions=%d", gotJobs, gotTasks, gotSessions)
+	if gotJobs != wantJobs || gotTasks != wantTasks {
+		t.Errorf("after cold restart: jobs=%d tasks=%d, want %d and %d", gotJobs, gotTasks, wantJobs, wantTasks)
+	}
+	for _, id := range jobIDs {
+		var found bool
+		revived.coord.read(func(st *state.StateStore) { _, found = st.Job(id) })
+		if !found {
+			t.Errorf("job %s lost across a whole-cluster restart", id)
+		}
+	}
+
+	// Dedup must survive too: the sessions map is in the snapshot, and
+	// forgetting it would be silent — everything looks healthy and a retry
+	// quietly creates a second job.
+	resp, err := revived.svc.SubmitJob(context.Background(), &schedulerpb.SubmitJobRequest{
+		ClientId: "c", RequestId: "r-0", // the very first request, replayed
+		Tasks: []*schedulerpb.TaskSpec{{Command: "/bin/true", MaxAttempts: 3}},
+	})
+	if err != nil {
+		t.Fatalf("retry after restart: %v", err)
+	}
+	if resp.GetJobId() != jobIDs[0] {
+		t.Errorf("retry returned %q, want the original %q — dedup did not survive the snapshot",
+			resp.GetJobId(), jobIDs[0])
+	}
+	revived.coord.read(func(st *state.StateStore) { gotJobs = st.JobCount() })
+	if gotJobs != wantJobs {
+		t.Errorf("job count = %d after a retry, want %d — the retry created a duplicate", gotJobs, wantJobs)
+	}
+}
+
+// A node that falls far behind is caught up by the LEADER SHIPPING A
+// SNAPSHOT, not by replaying the log it no longer has.
+//
+// This is the path that made handling rd.Snapshot non-optional: compaction
+// without it leaves such a node permanently stuck, silently.
+func TestLaggingNodeIsCaughtUpByAnInstalledSnapshot(t *testing.T) {
+	c := newCluster(t, 3)
+	lead := c.leader(10 * time.Second)
+
+	victim := c.follower(lead)
+	dir := victim.dir
+	victimID := victim.id
+	c.stop(victimID)
+
+	// Commit well past the compaction point while it is gone, so the entries
+	// it needs no longer exist anywhere.
+	for i := 0; i < 8; i++ {
+		if _, err := lead.svc.SubmitJob(context.Background(), &schedulerpb.SubmitJobRequest{
+			ClientId: "c", RequestId: fmt.Sprintf("r-while-down-%d", i),
+			Tasks: []*schedulerpb.TaskSpec{{Command: "/bin/true", MaxAttempts: 3}},
+		}); err != nil {
+			t.Fatalf("submit while a node is down: %v", err)
+		}
+	}
+	// The survivors must compact, or there would still be a log to catch up from.
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) && c.snapshotCount() < 2 {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if c.snapshotCount() < 2 {
+		t.Fatal("survivors never compacted; the test would not exercise InstallSnapshot")
+	}
+
+	var want int
+	lead.coord.read(func(st *state.StateStore) { want = st.JobCount() })
+
+	c.start(victimID, dir)
+	revived := c.nodes[victimID]
+
+	deadline = time.Now().Add(20 * time.Second)
+	for {
+		var got int
+		revived.coord.read(func(st *state.StateStore) { got = st.JobCount() })
+		if got == want {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("lagging node has %d jobs, want %d — it was never caught up", got, want)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
