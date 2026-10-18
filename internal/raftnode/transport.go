@@ -23,14 +23,23 @@ import (
 // Day 8 replaces this with a shim that can drop, delay, and partition on a
 // seeded schedule. That is why sending goes through a struct rather than a
 // package-level function.
-type Transport struct {
+type Transport interface {
+	// Listen starts receiving, handing every well-formed message to step.
+	Listen(selfURL string, step func(context.Context, *raftpb.Message) error) error
+	// Send delivers a message to m.To, best effort.
+	Send(m *raftpb.Message)
+	Close()
+}
+
+// httpTransport is the real one, and the default.
+type httpTransport struct {
 	peers  map[uint64]string
 	client *http.Client
 	srv    *http.Server
 }
 
-func newTransport(peers map[uint64]string) *Transport {
-	return &Transport{
+func newHTTPTransport(peers map[uint64]string) *httpTransport {
+	return &httpTransport{
 		peers: peers,
 		client: &http.Client{
 			// Bounded: a hung peer must not pin a sender goroutine forever.
@@ -44,7 +53,7 @@ func newTransport(peers map[uint64]string) *Transport {
 // A dedicated mux, never http.DefaultServeMux: the global one would panic on
 // double registration the moment two nodes share a process, which is exactly
 // what Day 8's simulator does.
-func (t *Transport) listen(selfURL string, step func(context.Context, *raftpb.Message) error) error {
+func (t *httpTransport) Listen(selfURL string, step func(context.Context, *raftpb.Message) error) error {
 	u, err := url.Parse(selfURL)
 	if err != nil {
 		return err
@@ -71,7 +80,7 @@ func (t *Transport) listen(selfURL string, step func(context.Context, *raftpb.Me
 	return nil
 }
 
-func (t *Transport) send(m *raftpb.Message) {
+func (t *httpTransport) Send(m *raftpb.Message) {
 	addr, ok := t.peers[m.GetTo()]
 	if !ok {
 		return
@@ -87,7 +96,7 @@ func (t *Transport) send(m *raftpb.Message) {
 	_ = resp.Body.Close()
 }
 
-func (t *Transport) close() {
+func (t *httpTransport) Close() {
 	if t.srv != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()

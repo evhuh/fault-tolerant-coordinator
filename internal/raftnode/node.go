@@ -16,11 +16,14 @@ import (
 	"fmt"
 	"log"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.etcd.io/raft/v3"
 	"go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/protobuf/proto"
+
+	"github.com/evazheng/fault-tolerant-coordinator/internal/clock"
 )
 
 // Config describes one node and its fixed cluster. Membership changes are out
@@ -46,6 +49,13 @@ type Config struct {
 	// follower can still be caught up by shipping entries rather than a whole
 	// snapshot.
 	SnapshotCatchUpEntries uint64
+
+	// Clock reads wall time. Nil means the real one.
+	Clock clock.Clock
+	// Transport carries raft messages between nodes. Nil means HTTP, which is
+	// what every real deployment uses; the simulator supplies an in-memory
+	// one it can drop, delay and partition.
+	Transport Transport
 }
 
 func DefaultConfig() Config {
@@ -103,7 +113,8 @@ type Node struct {
 	node    raft.Node
 	storage *raft.MemoryStorage
 	wal     *wal
-	tp      *Transport
+	tp      Transport
+	clk     clock.Clock
 
 	mu       sync.RWMutex
 	leaderID uint64
@@ -112,17 +123,44 @@ type Node struct {
 	stopc chan struct{}
 	done  chan struct{}
 
-	// Indices driving compaction. Only the Ready loop touches these.
+	// Indices driving compaction. Only the Ready loop WRITES these.
+	// appliedIndex is mirrored into appliedAtomic for readers outside the
+	// loop — the invariant checker needs it to compare two replicas at the
+	// SAME log position, which is the only comparison that means anything.
 	appliedIndex  uint64
 	snapshotIndex uint64
 	confState     *raftpb.ConfState
+
+	appliedAtomic atomic.Uint64
 
 	fatalOnce sync.Once
 	fatalErr  error
 }
 
+// AppliedIndex is the highest log index this node has applied.
+func (n *Node) AppliedIndex() uint64 { return n.appliedAtomic.Load() }
+
 // Start brings up the node and runs the Ready loop in the background.
+//
+// Prefer New + Run when the caller has fields to publish before the loop can
+// observe them: Start launches the goroutine immediately, so anything the
+// handler touches must already be in place.
 func Start(cfg Config, h Handler) (*Node, error) {
+	n, err := New(cfg, h)
+	if err != nil {
+		return nil, err
+	}
+	n.Run()
+	return n, nil
+}
+
+// New brings up the node WITHOUT starting the Ready loop.
+//
+// The split exists because of a real race: the Ready loop calls back into the
+// handler immediately, and a caller that assigns `node` to a field *after*
+// Start returns has already lost — the loop can be applying entries and
+// reading that still-nil field. Construct, publish, then Run.
+func New(cfg Config, h Handler) (*Node, error) {
 	selfURL, ok := cfg.Peers[cfg.ID]
 	if !ok {
 		return nil, fmt.Errorf("raftnode: node id %d is not in the peer set", cfg.ID)
@@ -182,14 +220,20 @@ func Start(cfg Config, h Handler) (*Node, error) {
 		Logger:          &raft.DefaultLogger{Logger: log.New(log.Writer(), "raft ", log.LstdFlags)},
 	}
 
+	tp := cfg.Transport
+	if tp == nil {
+		tp = newHTTPTransport(cfg.Peers)
+	}
 	n := &Node{
 		cfg: cfg, h: h, storage: storage, wal: w,
-		tp:            newTransport(cfg.Peers),
+		tp:            tp,
+		clk:           clock.OrReal(cfg.Clock),
 		stopc:         make(chan struct{}),
 		done:          make(chan struct{}),
 		appliedIndex:  baseIndex,
 		snapshotIndex: baseIndex,
 	}
+	n.appliedAtomic.Store(baseIndex)
 
 	// Fork on whether this node has a past.
 	//
@@ -205,15 +249,18 @@ func Start(cfg Config, h Handler) (*Node, error) {
 		n.node = raft.StartNode(rc, bootstrap)
 	}
 
-	if err := n.tp.listen(selfURL, n.node.Step); err != nil {
+	if err := n.tp.Listen(selfURL, n.node.Step); err != nil {
 		n.node.Stop()
 		_ = w.Close()
 		return nil, fmt.Errorf("raftnode: listen %s: %w", selfURL, err)
 	}
 
-	go n.run()
 	return n, nil
 }
+
+// Run starts the Ready loop. Call it once, after the caller has published
+// whatever the handler needs.
+func (n *Node) Run() { go n.run() }
 
 // Propose submits a command. Returning nil means ACCEPTED INTO THE PIPELINE,
 // not committed — commitment is only observable when the entry re-emerges
@@ -279,11 +326,11 @@ func (n *Node) Stop() {
 // run is the Ready loop: the whole contract this package exists to implement.
 func (n *Node) run() {
 	defer close(n.done)
-	defer n.tp.close()
+	defer n.tp.Close()
 	defer n.node.Stop()
 	defer func() { _ = n.wal.Close() }()
 
-	ticker := time.NewTicker(n.cfg.TickInterval)
+	ticker := n.clk.NewTicker(n.cfg.TickInterval)
 	defer ticker.Stop()
 
 	for {
@@ -295,7 +342,7 @@ func (n *Node) run() {
 			n.setLeadership(raft.None, false)
 			return
 
-		case <-ticker.C:
+		case <-ticker.C():
 			n.node.Tick() // feeds raft its time units: elections and heartbeats
 
 		case rd := <-n.node.Ready():
@@ -326,6 +373,7 @@ func (n *Node) run() {
 				}
 				idx := rd.Snapshot.GetMetadata().GetIndex()
 				n.appliedIndex, n.snapshotIndex = idx, idx
+				n.appliedAtomic.Store(idx)
 				log.Printf("raftnode: node %d restored from leader snapshot at index %d", n.cfg.ID, idx)
 			}
 
@@ -352,7 +400,7 @@ func (n *Node) run() {
 			// 2. SEND — only now, because the entries these messages claim are
 			// durable actually are.
 			for _, m := range rd.Messages {
-				go n.tp.send(m)
+				go n.tp.Send(m)
 			}
 
 			// 3. APPLY
@@ -377,6 +425,7 @@ func (n *Node) run() {
 				}
 				if idx := ent.GetIndex(); idx > n.appliedIndex {
 					n.appliedIndex = idx
+					n.appliedAtomic.Store(idx)
 				}
 			}
 

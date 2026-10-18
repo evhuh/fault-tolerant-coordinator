@@ -1,0 +1,121 @@
+// Command simulator runs a coordinator cluster under seeded fault injection.
+//
+//	simulator                    # one random seed, printed
+//	simulator -seed 42           # reproduce exactly that schedule
+//	simulator -runs 50           # sweep 50 consecutive seeds
+//	SCHED_SEED=42 simulator      # same as -seed
+//
+// THE SEED IS PRINTED ON EVERY RUN AND ON EVERY FAILURE. That is the whole
+// point: a failure you cannot get back to is an anecdote.
+package main
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"io"
+	"os"
+	"os/signal"
+	"strconv"
+	"syscall"
+	"time"
+
+	"github.com/evazheng/fault-tolerant-coordinator/internal/sim"
+	"github.com/evazheng/fault-tolerant-coordinator/internal/simnet"
+)
+
+func main() {
+	seedFlag := flag.Int64("seed", 0, "seed to run; 0 picks one from the clock and prints it")
+	runs := flag.Int("runs", 1, "how many consecutive seeds to run")
+	steps := flag.Int("steps", 40, "fault steps per run")
+	nodes := flag.Int("nodes", 3, "coordinator nodes")
+	dropRate := flag.Float64("drop-rate", 0.02, "probability a raft message is dropped")
+	maxDelay := flag.Duration("max-delay", 5*time.Millisecond, "upper bound on message delay")
+	stepTime := flag.Duration("step-time", 150*time.Millisecond, "wall time the cluster runs per step")
+	verbose := flag.Bool("v", false, "log every fault as it is applied")
+	flag.Parse()
+
+	seed := *seedFlag
+	if env := os.Getenv("SCHED_SEED"); env != "" && seed == 0 {
+		v, err := strconv.ParseInt(env, 10, 64)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "bad SCHED_SEED %q: %v\n", env, err)
+			os.Exit(2)
+		}
+		seed = v
+	}
+	if seed == 0 {
+		seed = time.Now().UnixNano()
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	failures := 0
+	for i := 0; i < *runs; i++ {
+		s := seed + int64(i)
+		if err := runOne(ctx, s, *steps, *nodes, *dropRate, *maxDelay, *stepTime, *verbose); err != nil {
+			failures++
+			fmt.Printf("\nFAILED  seed=%d\n", s)
+			fmt.Printf("  %v\n", err)
+			fmt.Printf("  reproduce with:  simulator -seed %d -steps %d -nodes %d -v\n", s, *steps, *nodes)
+		}
+		if ctx.Err() != nil {
+			break
+		}
+	}
+
+	if failures > 0 {
+		fmt.Printf("\n%d/%d runs failed\n", failures, *runs)
+		os.Exit(1)
+	}
+	fmt.Printf("\n%d/%d runs passed\n", *runs, *runs)
+}
+
+func runOne(ctx context.Context, seed int64, steps, nodes int, dropRate float64,
+	maxDelay, stepTime time.Duration, verbose bool) error {
+
+	dir, err := os.MkdirTemp("", fmt.Sprintf("sim-%d-", seed))
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(dir)
+
+	dirs := map[uint64]string{}
+	for i := 1; i <= nodes; i++ {
+		d := fmt.Sprintf("%s/node-%d", dir, i)
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			return err
+		}
+		dirs[uint64(i)] = d
+	}
+
+	cfg := sim.DefaultConfig()
+	cfg.Seed = seed
+	cfg.Nodes = nodes
+	cfg.Steps = steps
+	cfg.StepTime = stepTime
+	cfg.Faults = simnet.Faults{DropRate: dropRate, MaxDelay: maxDelay}
+	cfg.Out = io.Discard
+	if verbose {
+		cfg.Out = os.Stdout
+	}
+
+	fmt.Printf("seed=%-20d nodes=%d steps=%d drop=%.0f%% ... ", seed, nodes, steps, dropRate*100)
+	start := time.Now()
+	res, err := sim.New(cfg, dirs).Run(ctx)
+	elapsed := time.Since(start).Round(time.Millisecond)
+
+	if err != nil {
+		fmt.Printf("FAIL (%s)\n", elapsed)
+		return err
+	}
+	n := res.Faults.Net
+	fmt.Printf("ok (%s)\n", elapsed)
+	fmt.Printf("    faults:   kills=%d restarts=%d partitions=%d heals=%d\n",
+		res.Faults.NodeKills, res.Faults.NodeRestarts, res.Faults.Partitions, res.Faults.Heals)
+	fmt.Printf("    messages: sent=%d delivered=%d  dropped: random=%d partition=%d node-down=%d\n",
+		n.Sent, n.Delivered, n.DroppedRandom, n.DroppedPartition, n.DroppedDown)
+	fmt.Printf("    state:    jobs=%d tasks=%d\n", res.Jobs, res.Tasks)
+	return nil
+}

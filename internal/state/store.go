@@ -1089,3 +1089,16 @@ func (s *StateStore) applyPlanAllOrNothing(c *commandpb.ApplyPlan) (Result, erro
 	}
 	return res, nil
 }
+
+// CorruptForTesting puts a task into a state no command path can produce: it
+// leaves a worker attached while marking the task PENDING.
+//
+// It exists so the simulator's invariant checker can be shown to FAIL. A
+// checker that has never caught anything is indistinguishable from one that
+// cannot, and "zero violations across N seeds" is only evidence if the
+// detector demonstrably works.
+func (s *StateStore) CorruptForTesting(taskID string) {
+	if t, ok := s.tasks[taskID]; ok {
+		t.State = TaskPending // worker and lease deliberately left behind
+	}
+}

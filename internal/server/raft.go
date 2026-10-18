@@ -2,10 +2,10 @@ package server
 
 import (
 	"context"
-	"crypto/rand"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"sync"
 	"time"
@@ -27,10 +27,23 @@ var (
 	ErrProposalLost = errors.New("proposal lost")
 )
 
-// proposalTimeout bounds how long a caller waits for its entry to commit.
-// Past it the proposal is abandoned, not cancelled — it may still commit
-// later, which is exactly why every command must be idempotent.
-const proposalTimeout = 5 * time.Second
+// defaultProposalTimeout bounds how long a caller waits for its entry to
+// commit. Past it the proposal is abandoned, not cancelled — it may still
+// commit later, which is exactly why every command must be idempotent.
+//
+// Overridable because the simulator compresses every other timing by ~20×,
+// and a 5s wait against a 10ms raft tick means a single leaderless moment
+// costs five hundred ticks. Leaving it fixed made simulated runs spend
+// almost all their wall time parked on proposals that were never going to
+// land.
+const defaultProposalTimeout = 5 * time.Second
+
+func (c *Coordinator) proposalTimeout() time.Duration {
+	if c.cfg.ProposalTimeout > 0 {
+		return c.cfg.ProposalTimeout
+	}
+	return defaultProposalTimeout
+}
 
 // waiter is one caller blocked on a proposal.
 type waiter struct {
@@ -61,10 +74,10 @@ func newRaftProposer() *raftProposer {
 	return &raftProposer{waiters: make(map[string]*waiter)}
 }
 
-func newProposalID() string {
+func (c *Coordinator) newProposalID() string {
 	var b [12]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		panic("server: crypto/rand unavailable: " + err.Error())
+	if _, err := io.ReadFull(c.rand, b[:]); err != nil {
+		panic("server: id randomness unavailable: " + err.Error())
 	}
 	return hex.EncodeToString(b[:])
 }
@@ -121,7 +134,15 @@ func (p *raftProposer) failAll(err error) {
 func (c *Coordinator) StartRaft(cfg raftnode.Config) error {
 	c.proposer = newRaftProposer()
 
-	node, err := raftnode.Start(cfg, raftnode.Handler{
+	// Construct WITHOUT running. The Ready loop calls straight back into
+	// applyCommitted, which reads c.raft via IsLeader — so the field has to
+	// be published before any goroutine can observe it.
+	//
+	// Starting first and assigning after is a data race, and a quiet one: it
+	// needs a node to be restarted while entries are already committing,
+	// which is rare enough that the cluster tests never hit it and the
+	// simulator hit it within ten steps.
+	node, err := raftnode.New(cfg, raftnode.Handler{
 		Apply:             c.applyCommitted,
 		LeadershipChanged: c.onLeadershipChanged,
 		Fatal:             c.fatal,
@@ -134,6 +155,8 @@ func (c *Coordinator) StartRaft(cfg raftnode.Config) error {
 	}
 	c.proposer.node = node
 	c.raft = node
+
+	node.Run()
 	return nil
 }
 
@@ -189,7 +212,7 @@ func (c *Coordinator) proposeRaft(cmd *commandpb.Command) (state.Result, error) 
 		return state.Result{}, ErrNotLeader
 	}
 	cmd.Version = c.cfg.CommandVersion
-	cmd.ProposalId = newProposalID()
+	cmd.ProposalId = c.newProposalID()
 
 	data, err := proto.Marshal(cmd)
 	if err != nil {
@@ -199,7 +222,7 @@ func (c *Coordinator) proposeRaft(cmd *commandpb.Command) (state.Result, error) 
 	w := c.proposer.register(cmd.ProposalId)
 	defer c.proposer.forget(cmd.ProposalId)
 
-	ctx, cancel := context.WithTimeout(context.Background(), proposalTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), c.proposalTimeout())
 	defer cancel()
 	if err := c.proposer.node.Propose(ctx, data); err != nil {
 		return state.Result{}, fmt.Errorf("propose: %w", err)
@@ -241,7 +264,7 @@ func (c *Coordinator) proposeAsync(cmd *commandpb.Command) {
 		return
 	}
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), proposalTimeout)
+		ctx, cancel := context.WithTimeout(context.Background(), c.proposalTimeout())
 		defer cancel()
 		_ = c.proposer.node.Propose(ctx, data)
 	}()
@@ -264,16 +287,29 @@ func (c *Coordinator) onLeadershipChanged(isLeader bool) {
 	}
 
 	log.Printf("coordinator: lost leadership, revoking")
+
+	// FAIL PENDING PROPOSALS FIRST. Order is load-bearing here, and getting
+	// it wrong deadlocks the node.
+	//
+	// This function runs ON THE READY LOOP GOROUTINE. StopScheduling waits
+	// for the scheduler workers to exit, and a scheduler worker may be parked
+	// inside planner.Submit waiting for a proposal to commit — a proposal
+	// only the Ready loop can deliver. So waiting for the scheduler before
+	// releasing those waiters means the Ready loop waits on the scheduler
+	// while the scheduler waits on the Ready loop.
+	//
+	// It self-heals after proposalTimeout, which is what hid it: the symptom
+	// is not a hang but a node that processes NO raft messages for five
+	// seconds on every leadership change — long enough to trigger the next
+	// election and do it all again.
+	if c.proposer != nil {
+		c.proposer.failAll(ErrNotLeader)
+	}
 	if c.leaderCancel != nil {
 		c.leaderCancel()
 		c.leaderCancel = nil
 	}
 	c.StopScheduling()
-	// Anyone blocked on a proposal this node will never commit must be told,
-	// or their RPC hangs until the timeout for no reason.
-	if c.proposer != nil {
-		c.proposer.failAll(ErrNotLeader)
-	}
 }
 
 // IsLeader reports whether this node may accept writes. Without Raft wired
@@ -364,4 +400,15 @@ func (c *Coordinator) restoreState(data []byte) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.store.Restore(data)
+}
+
+// AppliedIndex is the highest log index this node has applied, or 0 without
+// Raft. The invariant checker uses it to compare replicas at the same log
+// position — comparing two nodes at DIFFERENT positions is meaningless, since
+// a node a few entries behind legitimately holds different state.
+func (c *Coordinator) AppliedIndex() uint64 {
+	if c.raft == nil {
+		return 0
+	}
+	return c.raft.AppliedIndex()
 }

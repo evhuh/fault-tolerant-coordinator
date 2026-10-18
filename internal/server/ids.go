@@ -1,9 +1,9 @@
 package server
 
 import (
-	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"io"
 
 	"github.com/evazheng/fault-tolerant-coordinator/internal/state"
 )
@@ -19,11 +19,17 @@ import (
 //
 // Day 4 needs a different answer for eval ids, which have no such dedup key
 // and must therefore be DERIVED from what triggered them.
+//
+// The SOURCE of that randomness is injectable (Config.Rand) for one reason:
+// under a seeded simulator run, ids drawn from crypto/rand differ every time,
+// so two runs of the same seed cannot be diffed to find where they diverged.
+// The seed reproduces the fault schedule; readable ids are what make that
+// reproduction usable.
 
-func newJobID() string {
+func (c *Coordinator) newJobID() string {
 	var b [8]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		panic("server: crypto/rand unavailable: " + err.Error())
+	if _, err := io.ReadFull(c.rand, b[:]); err != nil {
+		panic("server: id randomness unavailable: " + err.Error())
 	}
 	return "job-" + hex.EncodeToString(b[:])
 }

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/evazheng/fault-tolerant-coordinator/internal/client"
+	"github.com/evazheng/fault-tolerant-coordinator/internal/clock"
 	schedulerpb "github.com/evazheng/fault-tolerant-coordinator/proto/schedulerpb"
 )
 
@@ -29,6 +30,9 @@ type Config struct {
 	// Concurrency is how many tasks this worker executes at once.
 	Concurrency int
 	DataDir     string
+	// Clock reads wall time. Nil means the real one; the simulator supplies
+	// its own so a run can be compressed.
+	Clock clock.Clock
 }
 
 func DefaultConfig(workerID, dataDir string) Config {
@@ -43,6 +47,7 @@ func DefaultConfig(workerID, dataDir string) Config {
 
 type Worker struct {
 	cfg Config
+	clk clock.Clock
 	// pool follows NOT_LEADER redirects. A worker that ignored them would
 	// re-register against a deposed node forever, so a coordinator failover
 	// would strand the whole worker pool even though the cluster recovered.
@@ -63,6 +68,7 @@ func New(cfg Config, pool *client.Pool) *Worker {
 	}
 	return &Worker{
 		cfg:     cfg,
+		clk:     clock.OrReal(cfg.Clock),
 		pool:    pool,
 		exec:    &Executor{DataDir: cfg.DataDir},
 		running: make(map[string]bool),
@@ -111,13 +117,13 @@ func (w *Worker) register(ctx context.Context) error {
 // revives it. That is why RegisterWorker is create-OR-renew rather than
 // create-only.
 func (w *Worker) heartbeatLoop(ctx context.Context) {
-	t := time.NewTicker(w.cfg.HeartbeatInterval)
+	t := w.clk.NewTicker(w.cfg.HeartbeatInterval)
 	defer t.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-t.C:
+		case <-t.C():
 			err := w.pool.Do(func(c schedulerpb.SchedulerClient) error {
 				_, err := c.Heartbeat(ctx, &schedulerpb.HeartbeatRequest{
 					WorkerId:       w.cfg.WorkerID,
@@ -161,7 +167,7 @@ func (w *Worker) pollLoop(ctx context.Context) {
 			// chase all surface here. Re-register and back off; the pool has
 			// already moved on to another node if it was told to.
 			log.Printf("worker %s: request task: %v", w.cfg.WorkerID, err)
-			time.Sleep(w.cfg.HeartbeatInterval)
+			w.clk.Sleep(w.cfg.HeartbeatInterval)
 			_ = w.register(ctx)
 			continue
 		}
@@ -185,7 +191,7 @@ func (w *Worker) pollLoop(ctx context.Context) {
 			select {
 			case <-ctx.Done():
 				return
-			case <-time.After(w.cfg.HeartbeatInterval):
+			case <-w.clk.After(w.cfg.HeartbeatInterval):
 			}
 			continue
 		}

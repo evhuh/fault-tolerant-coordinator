@@ -13,11 +13,14 @@ package server
 
 import (
 	"context"
+	cryptorand "crypto/rand"
 	"errors"
 	"fmt"
+	"io"
 	"sync"
 	"time"
 
+	"github.com/evazheng/fault-tolerant-coordinator/internal/clock"
 	"github.com/evazheng/fault-tolerant-coordinator/internal/raftnode"
 	"github.com/evazheng/fault-tolerant-coordinator/internal/sched"
 	"github.com/evazheng/fault-tolerant-coordinator/internal/state"
@@ -37,6 +40,20 @@ type Config struct {
 	CommandVersion uint32
 	// Sched tunes the scheduling pipeline.
 	Sched sched.Config
+	// ProposalTimeout bounds a caller's wait for its entry to commit. Zero
+	// means the default.
+	ProposalTimeout time.Duration
+	// Rand is the source for generated ids. Nil means crypto/rand. The
+	// simulator seeds it so a reproduced run yields the same ids and two
+	// runs can be diffed.
+	//
+	// It is NOT a security boundary: ids only need to be unique, and in a
+	// simulator they need to be repeatable, which crypto/rand cannot be.
+	Rand io.Reader
+	// Clock reads wall time for the DRIVERS: the Tick proposer, long-poll
+	// deadlines. Nil means the real one. The apply path has no clock at all
+	// and never will — that is what Tick is for.
+	Clock clock.Clock
 	// APIAddrs maps a raft node id to that node's gRPC address.
 	//
 	// It exists because the two address spaces are DIFFERENT: the raft peer
@@ -65,9 +82,13 @@ type Coordinator struct {
 	mu    sync.Mutex
 	store *state.StateStore
 
-	// now is the only wall clock in the system. Everything downstream reads
-	// time from Tick-carried timestamps instead. Held as a field so Day 8 can
-	// replace it with an injected clock without touching call sites.
+	rand io.Reader
+	// clk is this node's view of wall time. Everything inside the state
+	// machine reads Tick-carried timestamps instead.
+	clk clock.Clock
+	// now is what the Tick proposer stamps into commands. Kept separate from
+	// clk so tests can drive the state machine's clock without also
+	// controlling tickers and timeouts.
 	now func() time.Time
 
 	// The scheduling pipeline. LEADER-ONLY and in-memory: none of it is
@@ -100,10 +121,17 @@ type Coordinator struct {
 }
 
 func New(cfg Config) *Coordinator {
+	clk := clock.OrReal(cfg.Clock)
+	rnd := cfg.Rand
+	if rnd == nil {
+		rnd = cryptorand.Reader
+	}
 	return &Coordinator{
 		cfg:   cfg,
 		store: state.New(),
-		now:   time.Now,
+		clk:   clk,
+		rand:  rnd,
+		now:   clk.Now,
 	}
 }
 
@@ -220,6 +248,16 @@ func (c *Coordinator) Snapshot() *state.Snapshot {
 	return c.store.Snapshot()
 }
 
+// ReadState runs fn against this node's state machine under the apply lock.
+//
+// Exported for the simulator and the invariant checker, which must inspect
+// FOLLOWERS too — a divergence between replicas is only visible by reading
+// each one directly, and the gRPC surface deliberately refuses a follower.
+//
+// It is not a client API and never should be: it bypasses the NOT_LEADER
+// guard, so anything using it is explicitly asking for one node's local view.
+func (c *Coordinator) ReadState(fn func(s *state.StateStore)) { c.read(fn) }
+
 // read runs fn under the same lock as propose. Every read of the store goes
 // through it, so there is one place to change on Day 6 if reads need a
 // ReadIndex barrier (see Day 9: a partitioned leader serving local reads is a
@@ -239,7 +277,7 @@ func (c *Coordinator) read(fn func(s *state.StateStore)) {
 // ticking concurrently is exactly the split-brain that stopping cleanly
 // prevents.
 func (c *Coordinator) RunTicker(ctx context.Context) {
-	t := time.NewTicker(c.cfg.TickPeriod)
+	t := c.clk.NewTicker(c.cfg.TickPeriod)
 	defer t.Stop()
 
 	// Tick IMMEDIATELY, before waiting out the first interval.
@@ -271,7 +309,7 @@ func (c *Coordinator) RunTicker(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case <-t.C:
+		case <-t.C():
 			// A Tick whose lease expiries produce EvalTriggers is the
 			// normal case: afterApply turns each into a CreateEval and
 			// hands it to the broker, which is how a reclaimed task gets

@@ -104,7 +104,7 @@ func (s *Service) SubmitJob(ctx context.Context, req *schedulerpb.SubmitJobReque
 		}
 	}
 
-	jobID := newJobID()
+	jobID := s.c.newJobID()
 	entries := make([]*commandpb.TaskEntry, 0, len(req.GetTasks()))
 	for i, spec := range req.GetTasks() {
 		entries = append(entries, &commandpb.TaskEntry{
@@ -234,7 +234,7 @@ func (s *Service) RequestTask(ctx context.Context, req *schedulerpb.RequestTaskR
 	if wait > maxWait {
 		wait = maxWait
 	}
-	deadline := time.Now().Add(wait)
+	deadline := s.c.clk.Now().Add(wait)
 
 	for {
 		// Re-checked every pass, not just on entry: a worker parked here for
@@ -248,7 +248,7 @@ func (s *Service) RequestTask(ctx context.Context, req *schedulerpb.RequestTaskR
 		if found {
 			return &schedulerpb.RequestTaskResponse{Task: taskToProto(task)}, nil
 		}
-		if !time.Now().Before(deadline) {
+		if !s.c.clk.Now().Before(deadline) {
 			// Nothing available within wait_ms. An empty response is normal,
 			// not an error: the worker simply polls again.
 			return &schedulerpb.RequestTaskResponse{}, nil
@@ -256,7 +256,7 @@ func (s *Service) RequestTask(ctx context.Context, req *schedulerpb.RequestTaskR
 		select {
 		case <-ctx.Done():
 			return nil, status.FromContextError(ctx.Err()).Err()
-		case <-time.After(pollInterval):
+		case <-s.c.clk.After(pollInterval):
 			// Lock released for the whole sleep. See pollInterval.
 		}
 	}
