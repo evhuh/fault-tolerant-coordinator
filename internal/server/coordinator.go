@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"sync"
 	"time"
 
@@ -121,6 +122,13 @@ type Coordinator struct {
 	proposer *raftProposer
 	// leaderCancel stops the leader-only goroutines on revocation.
 	leaderCancel context.CancelFunc
+
+	// tickFailures counts Tick proposals that did not commit. Dropped ticks
+	// are tolerated, so they must be countable — a node silently failing
+	// every tick looks healthy and has a frozen clock.
+	tickFailMu     sync.Mutex
+	tickFailures   int
+	tickFailLogged time.Time
 
 	// stalls records Ready-loop stalls. A non-empty list means something on
 	// that goroutine blocked on work the goroutine itself serves.
@@ -299,22 +307,30 @@ func (c *Coordinator) RunTicker(ctx context.Context) {
 	// it serves before the first Tick commits is timestamped with "no time
 	// yet". Establishing the time base up front shrinks that window to the
 	// commit itself; applyTick's rebase covers what is left.
-	tick := func() bool {
-		if _, err := c.propose(tickCmd(c.nowMs())); err != nil {
-			// Losing leadership mid-tick is NORMAL, not a bug. The ticker is
-			// cancelled on revocation, but a tick already in flight races
-			// that cancellation and the window cannot be closed from here.
-			// Same for a proposal abandoned during the transition.
-			//
-			// Treating these as fatal crashed the node on every failover —
-			// the one moment it most needs to survive.
-			if errors.Is(err, ErrNotLeader) || errors.Is(err, ErrProposalLost) {
-				return true
-			}
-			// Anything else means a malformed Tick, a bug in this file.
+	// DENY BY DEFAULT. A failed Tick is non-fatal unless the error is on an
+	// explicit list of things that cannot be anything but a bug here.
+	//
+	// The inverse — enumerate what is tolerable, panic on the rest — is what
+	// this used to do, and it failed twice. First on ErrNotLeader during
+	// failover; then, after that was patched, on the context deadline that
+	// node.Propose returns on its own, which is a different error value for
+	// the same situation. Each fix was correct and each left the next gap
+	// open, because the set of ways a proposal can fail is open and the set
+	// of ways a Tick can be malformed is closed.
+	//
+	// A dropped Tick costs at most one period of clock staleness; the next
+	// one carries a fresher timestamp and the state machine clamps forward.
+	// Crashing a healthy node over it is far worse.
+	tick := func() {
+		_, err := c.propose(tickCmd(c.nowMs()))
+		if err == nil {
+			return
+		}
+		if isFatalTickError(err) {
 			panic(fmt.Sprintf("coordinator: tick rejected: %v", err))
 		}
-		return true
+		// Everything else: log once in a while and try again next period.
+		c.noteTickFailure(err)
 	}
 	tick()
 
@@ -462,4 +478,46 @@ func (c *Coordinator) BrokerStats() (ready, blocked int) {
 		return 0, 0
 	}
 	return broker.Stats()
+}
+
+// isFatalTickError is the ALLOWLIST: errors that can only mean this file
+// built a Tick the state machine cannot accept.
+//
+// A malformed command is a programming error — the same Tick shape would be
+// rejected on every node, forever, and limping on would hide it. Everything
+// not named here is treated as transient, because the ways a proposal can
+// fail in a distributed system are open-ended and guessing at them has
+// already cost two outages in this codebase.
+func isFatalTickError(err error) bool {
+	// The state machine rejected the command's CONTENT. applyTick only
+	// errors on a nil payload, which this file is responsible for.
+	return errors.Is(err, state.ErrMalformedCommand)
+}
+
+// noteTickFailure records a dropped Tick without flooding the log.
+//
+// Mid-failover these come in bursts, and a line per failure at one tick per
+// 200ms buries everything else in the log exactly when it is being read.
+func (c *Coordinator) noteTickFailure(err error) {
+	c.tickFailMu.Lock()
+	c.tickFailures++
+	n := c.tickFailures
+	first := c.tickFailLogged.IsZero() || c.clk.Since(c.tickFailLogged) > 5*time.Second
+	if first {
+		c.tickFailLogged = c.clk.Now()
+	}
+	c.tickFailMu.Unlock()
+
+	if first {
+		log.Printf("coordinator: tick not committed (%v); %d failed so far, retrying next period", err, n)
+	}
+}
+
+// TickFailures reports how many Tick proposals have not committed. Exposed so
+// the simulator can assert the clock is actually advancing rather than the
+// node quietly failing every tick.
+func (c *Coordinator) TickFailures() int {
+	c.tickFailMu.Lock()
+	defer c.tickFailMu.Unlock()
+	return c.tickFailures
 }

@@ -14,6 +14,8 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/evazheng/fault-tolerant-coordinator/internal/client"
+	commandpb "github.com/evazheng/fault-tolerant-coordinator/proto/commandpb"
+
 	"github.com/evazheng/fault-tolerant-coordinator/internal/sched"
 	"github.com/evazheng/fault-tolerant-coordinator/internal/state"
 	schedulerpb "github.com/evazheng/fault-tolerant-coordinator/proto/schedulerpb"
@@ -939,5 +941,72 @@ func TestProposeTimeoutsAllClassifyAsLost(t *testing.T) {
 				t.Errorf("%v surfaced as Internal; clients will not retry", tc.err)
 			}
 		})
+	}
+}
+
+// THE TICKER IS DENY-BY-DEFAULT.
+//
+// It used to enumerate tolerable errors and panic on the rest, which failed
+// twice: first on ErrNotLeader during failover, then — after that patch — on
+// the context deadline node.Propose returns on its own, a different error
+// value for the same situation.
+//
+// Each fix was correct and each left the next gap open, because the set of
+// ways a proposal can fail is OPEN and the set of ways a Tick can be
+// malformed is CLOSED. This pins the inversion: unknown errors are survived,
+// and only a command this file built wrong is fatal.
+func TestTickErrorsAreSurvivedUnlessMalformed(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		err   error
+		fatal bool
+	}{
+		{"not leader", ErrNotLeader, false},
+		{"proposal lost", ErrProposalLost, false},
+		{"propose deadline", context.DeadlineExceeded, false},
+		{"propose cancelled", context.Canceled, false},
+		{"raft stopped", errors.New("raft: stopped"), false},
+		{"transport failure", errors.New("connection reset by peer"), false},
+		{"something nobody anticipated", errors.New("a brand new failure mode"), false},
+		{"malformed command", fmt.Errorf("tick: %w", state.ErrMalformedCommand), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isFatalTickError(tc.err); got != tc.fatal {
+				t.Errorf("isFatalTickError(%v) = %v, want %v", tc.err, got, tc.fatal)
+			}
+		})
+	}
+}
+
+// The allowlist must actually match what the state machine produces, or it is
+// decoration: a malformed Tick would be survived forever and the clock would
+// silently stop advancing.
+func TestMalformedTickIsRecognisedFromTheStateMachine(t *testing.T) {
+	s, _ := newTestService(t)
+
+	// Exactly what a nil payload produces, through the real apply path.
+	_, err := s.c.propose(&commandpb.Command{
+		Kind: &commandpb.Command_Tick{Tick: nil},
+	})
+	if err == nil {
+		t.Fatal("a nil Tick payload was accepted")
+	}
+	if !isFatalTickError(err) {
+		t.Errorf("the state machine's own malformed-Tick error is not recognised as fatal: %v", err)
+	}
+}
+
+// Dropped ticks must be COUNTABLE. Tolerating them is right, but a node
+// silently failing every tick looks healthy while its clock is frozen —
+// leases never expire and nothing is ever reclaimed.
+func TestDroppedTicksAreCounted(t *testing.T) {
+	s, _ := newTestService(t)
+	if got := s.c.TickFailures(); got != 0 {
+		t.Fatalf("precondition: %d failures before anything ran", got)
+	}
+	s.c.noteTickFailure(errors.New("transient"))
+	s.c.noteTickFailure(errors.New("transient"))
+	if got := s.c.TickFailures(); got != 2 {
+		t.Errorf("TickFailures = %d, want 2", got)
 	}
 }

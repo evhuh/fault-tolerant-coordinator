@@ -221,6 +221,10 @@ type Sim struct {
 	seenRetried  map[string]bool
 	seenFailed   map[string]bool
 	lastSessions int
+	// lastClock is the leader's state-machine clock at the previous check,
+	// and clockFrozenSteps how many checks it has failed to move.
+	lastClock        int64
+	clockFrozenSteps int
 }
 
 // New builds a simulation. dirs must be writable; the caller owns cleanup.

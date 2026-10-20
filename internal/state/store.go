@@ -9,6 +9,7 @@ Every mutation enters through Apply, and Apply accepts exactly the seven command
 package state
 
 import (
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"sort"
@@ -40,6 +41,15 @@ const (
 	// rest. Current.
 	CommandVersionPartialPlan uint32 = 2
 )
+
+// ErrMalformedCommand marks a command the state machine cannot accept because
+// of its CONTENT, not because of the state it met.
+//
+// The distinction is what lets a caller tell "I built this wrong" — which
+// would be rejected identically on every node, forever — from "someone else
+// got there first", which is ordinary. Callers that must not crash on the
+// second kind match on this.
+var ErrMalformedCommand = errors.New("malformed command")
 
 // defaultMaxAttempts applies when a TaskSpec omits it. Any defaulting done here must be a constant, never a configured or environment-derived value: a replica configured differently would diverge
 const defaultMaxAttempts int32 = 3
@@ -584,7 +594,7 @@ func (s *StateStore) applyRegisterWorker(c *commandpb.RegisterWorker) (Result, e
 */
 func (s *StateStore) applyTick(c *commandpb.Tick) (Result, error) {
 	if c == nil {
-		return Result{}, fmt.Errorf("tick: nil payload")
+		return Result{}, fmt.Errorf("tick: %w", ErrMalformedCommand)
 	}
 
 	// (1) Clamp. A backwards tick is a no-op, not an error.

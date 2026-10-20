@@ -50,6 +50,27 @@ func (s *Sim) checkInvariants(step int) []Violation {
 		}
 	}
 
+	// The clock must be ADVANCING. Dropped ticks are tolerated by design, so
+	// a node that fails every single one looks perfectly healthy while its
+	// state-machine clock is frozen — no lease ever expires, nothing is ever
+	// reclaimed, and every check above still passes.
+	//
+	// Calibrated on a STREAK, not a single step. Ticks proposed into a
+	// partition or across a leadership change legitimately fail, so one
+	// stalled step is ordinary; several in a row with a leader present is
+	// not. At ~3 ticks per step, this is roughly 15 consecutive missed ticks.
+	if nowMs := s.stateClock(lead); nowMs == s.lastClock && s.lastClock > 0 {
+		s.clockFrozenSteps++
+		if s.clockFrozenSteps >= frozenClockSteps {
+			add("leader's state-machine clock stuck at %d for %d consecutive steps "+
+				"(%d tick failures) — ticks are being dropped silently, so no lease will ever expire",
+				nowMs, s.clockFrozenSteps, lead.coord.TickFailures())
+		}
+	} else {
+		s.clockFrozenSteps = 0
+		s.lastClock = nowMs
+	}
+
 	lead.coord.ReadState(func(st *state.StateStore) {
 		// A task holds at most one worker, and only while it is live. The
 		// coordinator-side version of "never running on two workers": the
@@ -300,4 +321,15 @@ func (s *Sim) recordCoverage() {
 	s.result.Coverage.TasksRedispatched = len(s.seenRetried)
 	s.result.Coverage.TasksBackedOff = len(s.seenBackoff)
 	s.result.Coverage.TasksTerminalFail = len(s.seenFailed)
+}
+
+// frozenClockSteps is how many consecutive steps a leader's clock may fail to
+// advance before that counts as broken rather than unlucky.
+const frozenClockSteps = 6
+
+// stateClock reads a node's state-machine clock.
+func (s *Sim) stateClock(n *node) int64 {
+	var ms int64
+	n.coord.ReadState(func(st *state.StateStore) { ms = st.NowMs() })
+	return ms
 }
