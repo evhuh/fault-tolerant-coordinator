@@ -63,7 +63,7 @@ func post(t *testing.T, addr string, body []byte) {
 
 func TestHTTPTransportDiscardsMalformedBodies(t *testing.T) {
 	addr := fmt.Sprintf("http://127.0.0.1:%d", freePort(t))
-	tp := newHTTPTransport(map[uint64]string{1: addr})
+	tp := newHTTPTransport(1, map[uint64]string{1: addr, 2: "http://peer-2"})
 	rec := &stepRecorder{}
 	if err := tp.Listen(addr, rec.step); err != nil {
 		t.Fatalf("listen: %v", err)
@@ -72,8 +72,11 @@ func TestHTTPTransportDiscardsMalformedBodies(t *testing.T) {
 
 	// A well-formed message first, to prove the endpoint works at all —
 	// otherwise "nothing was Stepped" would be satisfied by a broken server.
+	// Addressed to self (1), from a known peer (2).
+	// A non-local type matters: Type 0 is MsgHup, which the guard refuses.
 	var from, to uint64 = 2, 1
-	good, err := proto.Marshal(&raftpb.Message{From: &from, To: &to})
+	goodType := raftpb.MsgApp
+	good, err := proto.Marshal(&raftpb.Message{From: &from, To: &to, Type: &goodType})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -136,7 +139,7 @@ func TestEmptyBodyDoesNotForceAnElection(t *testing.T) {
 	}
 
 	addr := fmt.Sprintf("http://127.0.0.1:%d", freePort(t))
-	tp := newHTTPTransport(map[uint64]string{1: addr})
+	tp := newHTTPTransport(1, map[uint64]string{1: addr, 2: "http://peer-2"})
 	rec := &stepRecorder{}
 	if err := tp.Listen(addr, rec.step); err != nil {
 		t.Fatalf("listen: %v", err)
@@ -152,26 +155,78 @@ func TestEmptyBodyDoesNotForceAnElection(t *testing.T) {
 	}
 }
 
-// A message addressed to nobody cannot have come from a peer: Send resolves
-// m.To through the peer map, so anything we emit names a real node id.
-func TestMessageWithNoDestinationIsDropped(t *testing.T) {
+// A message addressed to someone else reached the wrong node.
+func TestMessageForAnotherNodeIsDropped(t *testing.T) {
 	addr := fmt.Sprintf("http://127.0.0.1:%d", freePort(t))
-	tp := newHTTPTransport(map[uint64]string{1: addr})
+	tp := newHTTPTransport(1, map[uint64]string{1: addr, 2: "http://peer-2"})
 	rec := &stepRecorder{}
 	if err := tp.Listen(addr, rec.step); err != nil {
 		t.Fatalf("listen: %v", err)
 	}
 	defer tp.Close()
 
-	var from uint64 = 2
+	var from, elsewhere uint64 = 2, 9
 	typ := raftpb.MsgApp
-	body, err := proto.Marshal(&raftpb.Message{From: &from, Type: &typ}) // To unset
+	body, err := proto.Marshal(&raftpb.Message{From: &from, To: &elsewhere, Type: &typ})
 	if err != nil {
 		t.Fatal(err)
 	}
 	post(t, addr, body)
 	time.Sleep(150 * time.Millisecond)
 	if got := rec.count(); got != 0 {
-		t.Errorf("a message with To=0 was Stepped (%d)", got)
+		t.Errorf("a message addressed to node 9 was Stepped by node 1 (%d)", got)
+	}
+}
+
+// A local message type arriving over a socket is not a peer talking.
+//
+// raft already refuses these (see TestRaftIgnoresLocalMessagesArrivingFromThe
+// Network), so this layer is belt and braces — but it is the layer that can
+// say so explicitly rather than relying on a library internal.
+func TestLocalMessageTypesFromTheNetworkAreDropped(t *testing.T) {
+	addr := fmt.Sprintf("http://127.0.0.1:%d", freePort(t))
+	tp := newHTTPTransport(1, map[uint64]string{1: addr, 2: "http://peer-2"})
+	rec := &stepRecorder{}
+	if err := tp.Listen(addr, rec.step); err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer tp.Close()
+
+	var from, to uint64 = 2, 1 // otherwise entirely well-formed
+	for _, typ := range []raftpb.MessageType{raftpb.MsgHup, raftpb.MsgBeat} {
+		ty := typ
+		body, err := proto.Marshal(&raftpb.Message{From: &from, To: &to, Type: &ty})
+		if err != nil {
+			t.Fatal(err)
+		}
+		post(t, addr, body)
+	}
+	time.Sleep(150 * time.Millisecond)
+	if got := rec.count(); got != 0 {
+		t.Errorf("%d local-type messages from the network were Stepped", got)
+	}
+}
+
+// A message from an id outside the configured cluster is not from this
+// cluster. Membership is fixed at startup, so this is exactly decidable.
+func TestMessageFromAnUnknownPeerIsDropped(t *testing.T) {
+	addr := fmt.Sprintf("http://127.0.0.1:%d", freePort(t))
+	tp := newHTTPTransport(1, map[uint64]string{1: addr, 2: "http://peer-2"})
+	rec := &stepRecorder{}
+	if err := tp.Listen(addr, rec.step); err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer tp.Close()
+
+	var stranger, to uint64 = 99, 1
+	typ := raftpb.MsgApp
+	body, err := proto.Marshal(&raftpb.Message{From: &stranger, To: &to, Type: &typ})
+	if err != nil {
+		t.Fatal(err)
+	}
+	post(t, addr, body)
+	time.Sleep(150 * time.Millisecond)
+	if got := rec.count(); got != 0 {
+		t.Errorf("a message from unknown node 99 was Stepped (%d)", got)
 	}
 }

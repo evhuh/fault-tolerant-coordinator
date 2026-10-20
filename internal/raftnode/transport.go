@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"time"
 
+	"go.etcd.io/raft/v3"
 	"go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/protobuf/proto"
 )
@@ -33,14 +34,16 @@ type Transport interface {
 
 // httpTransport is the real one, and the default.
 type httpTransport struct {
+	selfID uint64
 	peers  map[uint64]string
 	client *http.Client
 	srv    *http.Server
 }
 
-func newHTTPTransport(peers map[uint64]string) *httpTransport {
+func newHTTPTransport(selfID uint64, peers map[uint64]string) *httpTransport {
 	return &httpTransport{
-		peers: peers,
+		selfID: selfID,
+		peers:  peers,
 		client: &http.Client{
 			// Bounded: a hung peer must not pin a sender goroutine forever.
 			Timeout: 2 * time.Second,
@@ -68,7 +71,7 @@ func (t *httpTransport) Listen(selfURL string, step func(context.Context, *raftp
 		if proto.Unmarshal(body, m) != nil {
 			return // corrupt → drop, never Step
 		}
-		if !plausible(body, m) {
+		if !t.acceptable(m) {
 			return
 		}
 		_ = step(r.Context(), m)
@@ -107,28 +110,36 @@ func (t *httpTransport) Close() {
 	}
 }
 
-// plausible rejects decoded messages that cannot have come from a peer.
+// acceptable rejects decoded messages that cannot have come from a peer.
 //
-// Parsing successfully is NOT enough, and the gap is sharper than it looks:
-// an EMPTY body unmarshals cleanly into Message{Type: MsgHup, From: 0, To: 0},
-// and MsgHup is the message that makes a node start an election. So an empty
-// POST to /raft — or a corrupted frame truncated to zero length — forces the
-// receiver to campaign. Repeated, that is a liveness attack costing one HTTP
-// request each.
+// DEFENSE IN DEPTH, not a fix for a hole. etcd/raft already refuses local
+// message types that arrive over the network — node.Step drops anything
+// IsLocalMsg unless it came from one of raft's internal sentinel sources —
+// and TestRaftIgnoresLocalMessagesArrivingFromTheNetwork pins that
+// empirically: 50 network MsgHup messages leave the term untouched.
 //
-// Two checks are enough, and both are unambiguous:
+// So this layer exists because parsing is not validating, and because the
+// transport is the place that knows things raft does not: which node it is,
+// and who its peers are. Three principled checks, each rejecting something
+// structurally impossible rather than merely suspicious:
 //
-//   - An empty body carries no information. Raft never sends one.
-//   - To == 0 addresses nobody. Send() resolves m.To through the peer map, so
-//     a message we would emit always names a real node id, and ids start at 1.
+//   - A LOCAL message type (MsgHup, MsgBeat, ...) is by definition generated
+//     inside a node. One arriving over a socket is not a peer talking.
+//   - A message addressed to someone else reached the wrong node.
+//   - A message from an unknown id is not from this cluster. Membership is
+//     fixed at startup, so "known peer" is exactly decidable.
 //
-// Deliberately NOT validating further. The transport's job is to refuse the
-// structurally impossible; deciding whether a well-formed message is
-// legitimate is the consensus module's, and duplicating that judgement here
-// is how a transport starts silently dropping valid traffic.
-func plausible(body []byte, m *raftpb.Message) bool {
-	if len(body) == 0 {
+// Deliberately nothing further. Whether a WELL-FORMED message from a real
+// peer is legitimate — right term, right index, right log position — is the
+// consensus module's judgement, and duplicating it here is how a transport
+// starts silently dropping valid traffic.
+func (t *httpTransport) acceptable(m *raftpb.Message) bool {
+	if raft.IsLocalMsg(m.GetType()) {
 		return false
 	}
-	return m.GetTo() != 0
+	if m.GetTo() != t.selfID {
+		return false
+	}
+	_, known := t.peers[m.GetFrom()]
+	return known
 }

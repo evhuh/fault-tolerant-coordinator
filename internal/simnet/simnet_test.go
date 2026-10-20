@@ -263,10 +263,22 @@ func TestCorruptMessagesAreDiscardedNotStepped(t *testing.T) {
 		t.Errorf("precondition: %d of %d corrupt messages never arrived (no partition here)",
 			st.Corrupted-st.CorruptArrived, st.Corrupted)
 	}
-	if st.CorruptDiscarded != st.CorruptArrived {
-		t.Errorf("discarded %d of %d corrupt messages that arrived — the rest reached Step",
-			st.CorruptDiscarded, st.CorruptArrived)
+	refused := st.CorruptRejectedByDecoder + st.CorruptRejectedByGuard
+	if refused != st.CorruptArrived {
+		t.Errorf("refused %d of %d corrupt messages that arrived — the rest reached Step",
+			refused, st.CorruptArrived)
 	}
+	// Both paths must actually run, or one of them is untested while the
+	// summed total still looks complete.
+	if st.CorruptRejectedByDecoder == 0 {
+		t.Error("no corruption was caught by the decoder")
+	}
+	if st.CorruptRejectedByGuard == 0 {
+		t.Error("no corruption decoded into a plausible-looking message — " +
+			"the guard path above the decoder is untested")
+	}
+	t.Logf("of %d corrupt arrivals: %d refused by the decoder, %d decoded fine and were refused above it",
+		st.CorruptArrived, st.CorruptRejectedByDecoder, st.CorruptRejectedByGuard)
 	if got := rs[2].count(); got != 0 {
 		t.Errorf("%d corrupt messages were delivered to Step", got)
 	}
@@ -330,8 +342,8 @@ func TestCorruptMessageDroppedByPartitionIsNotALeak(t *testing.T) {
 	if st.CorruptArrived != 0 {
 		t.Errorf("CorruptArrived = %d across a partition, want 0", st.CorruptArrived)
 	}
-	if st.CorruptDiscarded != st.CorruptArrived {
-		t.Errorf("discarded %d but only %d arrived", st.CorruptDiscarded, st.CorruptArrived)
+	if n := st.CorruptRejectedByDecoder + st.CorruptRejectedByGuard; n != st.CorruptArrived {
+		t.Errorf("refused %d but only %d arrived", n, st.CorruptArrived)
 	}
 	if st.DroppedPartition == 0 {
 		t.Error("nothing was dropped by the partition; the test proves nothing")

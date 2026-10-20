@@ -256,7 +256,7 @@ func New(cfg Config, h Handler) (*Node, error) {
 
 	tp := cfg.Transport
 	if tp == nil {
-		tp = newHTTPTransport(cfg.Peers)
+		tp = newHTTPTransport(cfg.ID, cfg.Peers)
 	}
 	n := &Node{
 		cfg: cfg, h: h, storage: storage, wal: w,

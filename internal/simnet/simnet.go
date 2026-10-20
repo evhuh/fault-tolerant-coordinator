@@ -88,7 +88,12 @@ type Network struct {
 	droppedDown      int // addressed to a stopped node
 	corrupted        int // bytes mangled at send
 	corruptArrived   int // ...and actually reached a receiver
-	corruptDiscarded int // ...and were refused there
+	// Why each arrival was refused, kept apart because they test DIFFERENT
+	// things: one proves the decoder rejects garbage, the other proves the
+	// plausibility guard rejects garbage that decoded fine. A single
+	// "discarded" number cannot tell you whether the second ever ran.
+	corruptRejectedByDecoder int
+	corruptRejectedByGuard   int
 }
 
 func New(seed int64, f Faults) *Network {
@@ -139,12 +144,13 @@ func (n *Network) Stats() Stats {
 	defer n.mu.Unlock()
 	return Stats{
 		Sent: n.sent, Delivered: n.delivered,
-		DroppedRandom:    n.droppedRandom,
-		DroppedPartition: n.droppedPartition,
-		DroppedDown:      n.droppedDown,
-		Corrupted:        n.corrupted,
-		CorruptArrived:   n.corruptArrived,
-		CorruptDiscarded: n.corruptDiscarded,
+		DroppedRandom:            n.droppedRandom,
+		DroppedPartition:         n.droppedPartition,
+		DroppedDown:              n.droppedDown,
+		Corrupted:                n.corrupted,
+		CorruptArrived:           n.corruptArrived,
+		CorruptRejectedByDecoder: n.corruptRejectedByDecoder,
+		CorruptRejectedByGuard:   n.corruptRejectedByGuard,
 	}
 }
 
@@ -158,13 +164,19 @@ type Stats struct {
 	// route for an unrelated reason — a partition opening, the target going
 	// down — and never reach a receiver at all.
 	//
-	// The invariant is CorruptArrived == CorruptDiscarded. Comparing against
-	// Corrupted instead reports a phantom leak every time a corrupt message
-	// is dropped by a partition, which reads exactly like a corrupt message
-	// reaching Step.
-	Corrupted        int
-	CorruptArrived   int
-	CorruptDiscarded int
+	// The invariant is CorruptArrived == CorruptRejectedByDecoder +
+	// CorruptRejectedByGuard. Comparing against Corrupted instead reports a
+	// phantom leak every time a corrupt message is dropped by a partition,
+	// which reads exactly like a corrupt message reaching Step.
+	//
+	// The two rejection reasons are separate because they exercise different
+	// code: the decoder refusing malformed bytes, and the plausibility guard
+	// refusing bytes that decoded into something a peer could not have sent.
+	// Summing them would hide a run in which the guard never ran at all.
+	Corrupted                int
+	CorruptArrived           int
+	CorruptRejectedByDecoder int
+	CorruptRejectedByGuard   int
 }
 
 // Close stops delivery and waits for in-flight messages to finish, so a test
@@ -302,17 +314,18 @@ func (t *transport) Send(m *raftpb.Message) {
 			// message to the consensus module is how a network fault turns
 			// into a safety violation.
 			n.mu.Lock()
-			n.corruptDiscarded++
+			n.corruptRejectedByDecoder++
 			n.mu.Unlock()
 			return
 		}
 		if corrupt {
-			// Mangled bytes that still parsed. Protobuf is not
-			// self-validating, so this happens; discard it anyway. The claim
-			// is "nothing corrupt was Stepped", not "every mangled byte was
-			// detectable by the decoder".
+			// Mangled bytes that still PARSED. Protobuf is not
+			// self-validating, so this is common — a flipped byte often
+			// lands in a field value rather than in the framing. Counted
+			// separately because it is the case the decoder cannot catch and
+			// something above it must.
 			n.mu.Lock()
-			n.corruptDiscarded++
+			n.corruptRejectedByGuard++
 			n.mu.Unlock()
 			return
 		}

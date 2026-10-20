@@ -117,9 +117,9 @@ func runOne(ctx context.Context, seed int64, steps, nodes int, dropRate, corrupt
 	fmt.Printf("ok (%s)\n", elapsed)
 	fmt.Printf("    faults:   kills=%d restarts=%d partitions=%d heals=%d\n",
 		res.Faults.NodeKills, res.Faults.NodeRestarts, res.Faults.Partitions, res.Faults.Heals)
-	fmt.Printf("    messages: sent=%d delivered=%d  dropped: random=%d partition=%d node-down=%d  corrupt: %d sent, %d arrived, %d discarded\n",
+	fmt.Printf("    messages: sent=%d delivered=%d  dropped: random=%d partition=%d node-down=%d  corrupt: %d sent, %d arrived, %d refused by decoder, %d by guard\n",
 		n.Sent, n.Delivered, n.DroppedRandom, n.DroppedPartition, n.DroppedDown,
-		n.Corrupted, n.CorruptArrived, n.CorruptDiscarded)
+		n.Corrupted, n.CorruptArrived, n.CorruptRejectedByDecoder, n.CorruptRejectedByGuard)
 	// Coverage, not configuration: which paths this run actually reached.
 	// "Zero violations" is only evidence about code that executed.
 	fmt.Printf("    reported: ok=%d retryable-fail=%d terminal-fail=%d\n",
