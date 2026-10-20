@@ -50,6 +50,18 @@ type Config struct {
 	// snapshot.
 	SnapshotCatchUpEntries uint64
 
+	// StallThreshold is how long the Ready loop may spend processing one
+	// batch before it is reported as stalled. Zero derives one from the
+	// election timeout.
+	//
+	// It MUST be strictly below ElectionTick × TickInterval, so it fires
+	// before the symptom it exists to catch. A loop that stalls past the
+	// election timeout stops ticking AND stops sending heartbeats, so the
+	// cluster elects around it — and the stall self-heals once whatever it
+	// was waiting on times out, leaving an unexplained election and no
+	// evidence.
+	StallThreshold time.Duration
+
 	// Clock reads wall time. Nil means the real one.
 	Clock clock.Clock
 	// Transport carries raft messages between nodes. Nil means HTTP, which is
@@ -79,6 +91,20 @@ type Handler struct {
 	// coordinator uses it to start and stop the leader-only components —
 	// stopping cleanly is what prevents split-brain scheduling.
 	LeadershipChanged func(isLeader bool)
+
+	// Stalled fires when the Ready loop spends longer than StallThreshold
+	// inside one batch.
+	//
+	// This is a CONTRACT GUARD, not a recovery mechanism. onLeadershipChanged
+	// and Apply both run on that goroutine, and neither may block on anything
+	// the goroutine itself serves — waiting on a proposal to commit, or on a
+	// scheduler worker that is waiting on a proposal. Such a cycle self-heals
+	// after a timeout, which is exactly what makes it hard to find: the
+	// symptom is an unexplained election, not a hang.
+	//
+	// The simulator treats a stall as an invariant violation and fails the
+	// run with its seed.
+	Stalled func(time.Duration)
 
 	// Fatal reports an unrecoverable node error: a WAL write that failed, or
 	// storage that rejected an entry raft already durably logged. This node
@@ -132,6 +158,14 @@ type Node struct {
 	confState     *raftpb.ConfState
 
 	appliedAtomic atomic.Uint64
+
+	// processingSince is the unix-nano instant the Ready loop began handling
+	// the current batch, or 0 when idle.
+	//
+	// IDLE IS NOT STALLED. The loop spends most of its life parked in a
+	// select waiting for work, and a watchdog that could not tell the two
+	// apart would fire constantly. Only time spent INSIDE a batch counts.
+	processingSince atomic.Int64
 
 	fatalOnce sync.Once
 	fatalErr  error
@@ -258,9 +292,79 @@ func New(cfg Config, h Handler) (*Node, error) {
 	return n, nil
 }
 
-// Run starts the Ready loop. Call it once, after the caller has published
-// whatever the handler needs.
-func (n *Node) Run() { go n.run() }
+// Run starts the Ready loop and its stall watchdog. Call it once, after the
+// caller has published whatever the handler needs.
+func (n *Node) Run() {
+	go n.run()
+	go n.watchStalls()
+}
+
+// stallThreshold is the configured value, or a derived one strictly below the
+// election timeout.
+//
+// Half the election timeout: late enough that ordinary batch work never trips
+// it, early enough to fire before the cluster starts electing around this
+// node.
+//
+// THERE IS A FLOOR THIS CANNOT GO BELOW, and it is not a time the config
+// controls. A batch does real disk I/O — a WAL fsync, and periodically a
+// snapshot plus log compaction, measured at 23-40ms on an SSD. Disk I/O does
+// NOT compress when the rest of the timing budget does, so an election
+// timeout squeezed below roughly 4x the snapshot cost derives a threshold
+// that the node trips just by doing its job.
+//
+// The simulator hit exactly this: at a 100ms election timeout the derived 50ms
+// threshold sat under the fsync floor, and legitimate snapshots looked like
+// stalls. The budget has to stay above the hardware, not just internally
+// consistent.
+func (n *Node) stallThreshold() time.Duration {
+	if n.cfg.StallThreshold > 0 {
+		return n.cfg.StallThreshold
+	}
+	election := time.Duration(n.cfg.ElectionTick) * n.cfg.TickInterval
+	if election <= 0 {
+		return time.Second
+	}
+	return election / 2
+}
+
+// watchStalls reports a Ready loop that has been inside one batch too long.
+//
+// It reports ONCE per stall rather than every poll: a stall that lasts
+// seconds would otherwise bury its own first report.
+func (n *Node) watchStalls() {
+	threshold := n.stallThreshold()
+	ticker := n.clk.NewTicker(threshold / 2)
+	defer ticker.Stop()
+
+	var reportedFor int64
+	for {
+		select {
+		case <-n.stopc:
+			return
+		case <-n.done:
+			return
+		case <-ticker.C():
+			since := n.processingSince.Load()
+			if since == 0 {
+				reportedFor = 0 // idle, not stalled
+				continue
+			}
+			if since == reportedFor {
+				continue // already reported this one
+			}
+			if elapsed := time.Since(time.Unix(0, since)); elapsed > threshold {
+				reportedFor = since
+				log.Printf("raftnode: node %d READY LOOP STALLED for %s (threshold %s) — "+
+					"something on that goroutine is blocking on work the goroutine itself serves",
+					n.cfg.ID, elapsed.Round(time.Millisecond), threshold)
+				if n.h.Stalled != nil {
+					n.h.Stalled(elapsed)
+				}
+			}
+		}
+	}
+}
 
 // Propose submits a command. Returning nil means ACCEPTED INTO THE PIPELINE,
 // not committed — commitment is only observable when the entry re-emerges
@@ -346,97 +450,9 @@ func (n *Node) run() {
 			n.node.Tick() // feeds raft its time units: elections and heartbeats
 
 		case rd := <-n.node.Ready():
-			// Leadership first, so the coordinator has started or stopped its
-			// leader-only parts before any of this batch is applied.
-			if rd.SoftState != nil {
-				n.setLeadership(rd.SoftState.Lead, rd.SoftState.RaftState == raft.StateLeader)
-			}
-
-			// 0. INCOMING SNAPSHOT. The leader ships one when this node has
-			// fallen further behind than its log can repair. Dropping it —
-			// which is what ignoring rd.Snapshot does — leaves the node stuck
-			// forever, so this must exist before compaction is ever enabled.
-			if !raft.IsEmptySnap(rd.Snapshot) {
-				if err := saveSnapshot(n.cfg.DataDir, rd.Snapshot); err != nil {
-					n.fatal(fmt.Errorf("save incoming snapshot: %w", err))
-					return
-				}
-				if err := n.storage.ApplySnapshot(rd.Snapshot); err != nil {
-					n.fatal(fmt.Errorf("apply incoming snapshot: %w", err))
-					return
-				}
-				if n.h.Restore != nil {
-					if err := n.h.Restore(rd.Snapshot.GetData()); err != nil {
-						n.fatal(fmt.Errorf("restore from incoming snapshot: %w", err))
-						return
-					}
-				}
-				idx := rd.Snapshot.GetMetadata().GetIndex()
-				n.appliedIndex, n.snapshotIndex = idx, idx
-				n.appliedAtomic.Store(idx)
-				log.Printf("raftnode: node %d restored from leader snapshot at index %d", n.cfg.ID, idx)
-			}
-
-			// 1. PERSIST — WAL (fsync'd) before MemoryStorage, and before any
-			// message goes out.
-			// A failure here means this node cannot keep its durability
-			// promise. It stops rather than continuing as a liar — but it
-			// stops ALONE, so a peer sharing the process survives.
-			if err := n.wal.Save(rd.HardState, rd.Entries); err != nil {
-				n.fatal(fmt.Errorf("wal save: %w", err))
+			if !n.handleReady(rd) {
 				return
 			}
-			if rd.HardState != nil && !raft.IsEmptyHardState(rd.HardState) {
-				if err := n.storage.SetHardState(rd.HardState); err != nil {
-					n.fatal(fmt.Errorf("set hardstate: %w", err))
-					return
-				}
-			}
-			if err := n.storage.Append(rd.Entries); err != nil {
-				n.fatal(fmt.Errorf("append: %w", err))
-				return
-			}
-
-			// 2. SEND — only now, because the entries these messages claim are
-			// durable actually are.
-			for _, m := range rd.Messages {
-				go n.tp.Send(m)
-			}
-
-			// 3. APPLY
-			for _, ent := range rd.CommittedEntries {
-				switch ent.GetType() {
-				case raftpb.EntryConfChange:
-					cc := &raftpb.ConfChange{}
-					if err := proto.Unmarshal(ent.GetData(), cc); err != nil {
-						n.fatal(fmt.Errorf("unmarshal conf change: %w", err))
-						return
-					}
-					// Kept because CreateSnapshot needs the membership that
-					// was in effect at the snapshot index.
-					n.confState = n.node.ApplyConfChange(cc)
-				case raftpb.EntryNormal:
-					if len(ent.GetData()) > 0 {
-						n.h.Apply(ent.GetData())
-					}
-					// An empty entry is a new leader's no-op. It still
-					// ADVANCES the index: skipping it here would make the
-					// snapshot claim coverage it does not have.
-				}
-				if idx := ent.GetIndex(); idx > n.appliedIndex {
-					n.appliedIndex = idx
-					n.appliedAtomic.Store(idx)
-				}
-			}
-
-			// 3b. COMPACT once enough has been applied to be worth it.
-			if err := n.maybeSnapshot(); err != nil {
-				n.fatal(err)
-				return
-			}
-
-			// 4. ADVANCE — raft holds the next Ready until this call.
-			n.node.Advance()
 		}
 	}
 }
@@ -507,4 +523,111 @@ func (n *Node) maybeSnapshot() error {
 	log.Printf("raftnode: node %d snapshotted at index %d (%d bytes), log compacted to %d",
 		n.cfg.ID, n.appliedIndex, len(data), compactIndex)
 	return nil
+}
+
+// handleReady processes one Ready batch. It returns false when the node must
+// stop.
+//
+// Split out of the select purely so processingSince is cleared by a DEFER.
+// The watchdog reads that field to tell "inside a batch" from "idle", and
+// every fatal path in here returns early — so clearing it only at the bottom
+// left it set forever on a halted node, and the watchdog then reported an
+// ever-growing stall for a loop that was not running at all. A phantom
+// violation is worse than none: it trains you to ignore the detector.
+func (n *Node) handleReady(rd raft.Ready) bool {
+	n.processingSince.Store(time.Now().UnixNano())
+	defer n.processingSince.Store(0)
+
+	// Leadership first, so the coordinator has started or stopped its
+	// leader-only parts before any of this batch is applied.
+	if rd.SoftState != nil {
+		n.setLeadership(rd.SoftState.Lead, rd.SoftState.RaftState == raft.StateLeader)
+	}
+
+	// 0. INCOMING SNAPSHOT. The leader ships one when this node has
+	// fallen further behind than its log can repair. Dropping it —
+	// which is what ignoring rd.Snapshot does — leaves the node stuck
+	// forever, so this must exist before compaction is ever enabled.
+	if !raft.IsEmptySnap(rd.Snapshot) {
+		if err := saveSnapshot(n.cfg.DataDir, rd.Snapshot); err != nil {
+			n.fatal(fmt.Errorf("save incoming snapshot: %w", err))
+			return false
+		}
+		if err := n.storage.ApplySnapshot(rd.Snapshot); err != nil {
+			n.fatal(fmt.Errorf("apply incoming snapshot: %w", err))
+			return false
+		}
+		if n.h.Restore != nil {
+			if err := n.h.Restore(rd.Snapshot.GetData()); err != nil {
+				n.fatal(fmt.Errorf("restore from incoming snapshot: %w", err))
+				return false
+			}
+		}
+		idx := rd.Snapshot.GetMetadata().GetIndex()
+		n.appliedIndex, n.snapshotIndex = idx, idx
+		n.appliedAtomic.Store(idx)
+		log.Printf("raftnode: node %d restored from leader snapshot at index %d", n.cfg.ID, idx)
+	}
+
+	// 1. PERSIST — WAL (fsync'd) before MemoryStorage, and before any
+	// message goes out.
+	// A failure here means this node cannot keep its durability
+	// promise. It stops rather than continuing as a liar — but it
+	// stops ALONE, so a peer sharing the process survives.
+	if err := n.wal.Save(rd.HardState, rd.Entries); err != nil {
+		n.fatal(fmt.Errorf("wal save: %w", err))
+		return false
+	}
+	if rd.HardState != nil && !raft.IsEmptyHardState(rd.HardState) {
+		if err := n.storage.SetHardState(rd.HardState); err != nil {
+			n.fatal(fmt.Errorf("set hardstate: %w", err))
+			return false
+		}
+	}
+	if err := n.storage.Append(rd.Entries); err != nil {
+		n.fatal(fmt.Errorf("append: %w", err))
+		return false
+	}
+
+	// 2. SEND — only now, because the entries these messages claim are
+	// durable actually are.
+	for _, m := range rd.Messages {
+		go n.tp.Send(m)
+	}
+
+	// 3. APPLY
+	for _, ent := range rd.CommittedEntries {
+		switch ent.GetType() {
+		case raftpb.EntryConfChange:
+			cc := &raftpb.ConfChange{}
+			if err := proto.Unmarshal(ent.GetData(), cc); err != nil {
+				n.fatal(fmt.Errorf("unmarshal conf change: %w", err))
+				return false
+			}
+			// Kept because CreateSnapshot needs the membership that
+			// was in effect at the snapshot index.
+			n.confState = n.node.ApplyConfChange(cc)
+		case raftpb.EntryNormal:
+			if len(ent.GetData()) > 0 {
+				n.h.Apply(ent.GetData())
+			}
+			// An empty entry is a new leader's no-op. It still
+			// ADVANCES the index: skipping it here would make the
+			// snapshot claim coverage it does not have.
+		}
+		if idx := ent.GetIndex(); idx > n.appliedIndex {
+			n.appliedIndex = idx
+			n.appliedAtomic.Store(idx)
+		}
+	}
+
+	// 3b. COMPACT once enough has been applied to be worth it.
+	if err := n.maybeSnapshot(); err != nil {
+		n.fatal(err)
+		return false
+	}
+
+	// 4. ADVANCE — raft holds the next Ready until this call.
+	n.node.Advance()
+	return true
 }

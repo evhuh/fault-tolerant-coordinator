@@ -190,6 +190,25 @@ func dump(s *StateStore) string {
 		fmt.Fprintf(&b, "eval %s job=%s prio=%d trigger=%s created=%d\n",
 			e.ID, e.JobID, e.Priority, e.TriggeredBy, e.CreatedMs)
 	}
+
+	// Sessions are replicated state too. Leaving them out made the
+	// determinism check blind to the dedup map — two replicas could disagree
+	// about which retries are still deduped and dump identically.
+	sessKeys := make([]sessionKey, 0, len(s.sessions))
+	for k := range s.sessions {
+		sessKeys = append(sessKeys, k)
+	}
+	sort.Slice(sessKeys, func(i, j int) bool {
+		if sessKeys[i].clientID != sessKeys[j].clientID {
+			return sessKeys[i].clientID < sessKeys[j].clientID
+		}
+		return sessKeys[i].requestID < sessKeys[j].requestID
+	})
+	for _, k := range sessKeys {
+		sess := s.sessions[k]
+		fmt.Fprintf(&b, "session %s/%s job=%s created=%d\n",
+			k.clientID, k.requestID, sess.result.JobID, sess.createdMs)
+	}
 	return b.String()
 }
 
@@ -872,7 +891,7 @@ func TestFailTaskRetriesUntilExhausted(t *testing.T) {
 		// emits a BACKOFF_ELAPSED eval; without that sweep the task would sit
 		// PENDING with nothing coming to dispatch it.
 		if attempt > 1 {
-			now += maxBackoffMs * 2
+			now += DefaultPolicy().MaxBackoffMs * 2
 			mustApply(t, s, tickCmd(now))
 		}
 		mustApply(t, s, registerWorkerCmd("w-1", 500, now+90000))
@@ -1119,9 +1138,10 @@ func TestMalformedCommandsAreRejected(t *testing.T) {
 // roll would place the same task at different times on different nodes — the
 // exact divergence the Tick design exists to prevent.
 func TestBackoffIsDeterministicAndDecorrelated(t *testing.T) {
+	s := New()
 	// Same input, same answer, every time and on every replica.
 	for i := 0; i < 50; i++ {
-		if a, b := backoffFor("task-1", 2), backoffFor("task-1", 2); a != b {
+		if a, b := s.backoffFor("task-1", 2), s.backoffFor("task-1", 2); a != b {
 			t.Fatalf("backoffFor is not deterministic: %d vs %d", a, b)
 		}
 	}
@@ -1130,18 +1150,18 @@ func TestBackoffIsDeterministicAndDecorrelated(t *testing.T) {
 	// the property jitter is actually for.
 	seen := make(map[int64]int)
 	for i := 0; i < 32; i++ {
-		seen[backoffFor(fmt.Sprintf("task-%d", i), 1)]++
+		seen[s.backoffFor(fmt.Sprintf("task-%d", i), 1)]++
 	}
 	if len(seen) < 8 {
 		t.Errorf("only %d distinct backoffs across 32 tasks; retries are correlated", len(seen))
 	}
 
 	// Exponential in the attempt, and capped.
-	a1, a2, a3 := backoffFor("t", 1), backoffFor("t", 2), backoffFor("t", 3)
+	a1, a2, a3 := s.backoffFor("t", 1), s.backoffFor("t", 2), s.backoffFor("t", 3)
 	if !(a1 < a2 && a2 < a3) {
 		t.Errorf("not increasing: %d, %d, %d", a1, a2, a3)
 	}
-	if got := backoffFor("t", 30); got > maxBackoffMs+maxBackoffMs/2 {
+	if got := s.backoffFor("t", 30); got > DefaultPolicy().MaxBackoffMs+DefaultPolicy().MaxBackoffMs/2 {
 		t.Errorf("backoff %d exceeded the cap", got)
 	}
 }
@@ -1256,7 +1276,7 @@ func TestSessionsExpireOnTTL(t *testing.T) {
 	first := mustApply(t, s, submitJobCmd("job-1", "client-a", "req-1", "task-1"))
 
 	// Within the TTL, the retry still returns the original job.
-	mustApply(t, s, tickCmd(1000+sessionTTLMs/2))
+	mustApply(t, s, tickCmd(1000+DefaultPolicy().SessionTTLMs/2))
 	retry := mustApply(t, s, submitJobCmd("job-X", "client-a", "req-1", "task-X"))
 	if retry.JobID != first.JobID {
 		t.Fatalf("retry returned %q, want the original %q", retry.JobID, first.JobID)
@@ -1266,7 +1286,7 @@ func TestSessionsExpireOnTTL(t *testing.T) {
 	}
 
 	// Past the TTL the session is swept, and the same request is a new job.
-	mustApply(t, s, tickCmd(1000+sessionTTLMs+1))
+	mustApply(t, s, tickCmd(1000+DefaultPolicy().SessionTTLMs+1))
 	if n := s.SessionCount(); n != 0 {
 		t.Errorf("session count = %d after the TTL, want 0 — the map would grow forever", n)
 	}
@@ -1622,7 +1642,7 @@ func TestSessionCreatedBeforeTheFirstTickSurvives(t *testing.T) {
 	}
 
 	// Rebased, not exempted: it still expires on schedule afterwards.
-	mustApply(t, s, tickCmd(realClock+sessionTTLMs+1))
+	mustApply(t, s, tickCmd(realClock+DefaultPolicy().SessionTTLMs+1))
 	if n := s.SessionCount(); n != 0 {
 		t.Errorf("session count = %d past the TTL, want 0 — rebasing must not make it immortal", n)
 	}
@@ -1641,4 +1661,86 @@ func TestSessionRebaseIsDeterministic(t *testing.T) {
 	if a, b := build(), build(); dump(a) != dump(b) {
 		t.Errorf("rebase diverged\nA:\n%s\nB:\n%s", dump(a), dump(b))
 	}
+}
+
+// Policy is injectable so the simulator can reach paths that production
+// durations put out of reach — a 10-minute session TTL and a 30-second
+// backoff cap against a sub-second run mean those branches never execute, and
+// a green run then says nothing about them.
+func TestPolicyCompressesSessionExpiry(t *testing.T) {
+	s := NewWithPolicy(Policy{SessionTTLMs: 500})
+	mustApply(t, s, tickCmd(1000))
+	first := mustApply(t, s, submitJobCmd("job-1", "client-a", "req-1", "task-1"))
+	if s.SessionCount() != 1 {
+		t.Fatalf("session count = %d, want 1", s.SessionCount())
+	}
+
+	// Inside the compressed TTL: still deduped.
+	mustApply(t, s, tickCmd(1400))
+	if retry := mustApply(t, s, submitJobCmd("job-X", "client-a", "req-1", "task-X")); retry.JobID != first.JobID {
+		t.Errorf("retry inside the TTL created a new job")
+	}
+
+	// Past it: swept, at 500ms rather than 10 minutes.
+	mustApply(t, s, tickCmd(1600))
+	if n := s.SessionCount(); n != 0 {
+		t.Errorf("session count = %d past a 500ms TTL, want 0", n)
+	}
+}
+
+func TestPolicyCompressesBackoff(t *testing.T) {
+	s := NewWithPolicy(Policy{BaseBackoffMs: 10, MaxBackoffMs: 40})
+	for attempt := int32(1); attempt <= 8; attempt++ {
+		if got := s.backoffFor("task-1", attempt); got > 40+20 {
+			t.Errorf("attempt %d backoff = %dms, want it capped near 40", attempt, got)
+		}
+	}
+	// Still exponential below the cap, and still jittered.
+	if a, b := s.backoffFor("t", 1), s.backoffFor("t", 3); a >= b {
+		t.Errorf("backoff not increasing under a compressed policy: %d then %d", a, b)
+	}
+}
+
+// Zero fields fall back to production, so a caller setting one knob does not
+// silently zero the others.
+func TestPolicyZeroFieldsFallBackToDefaults(t *testing.T) {
+	s := NewWithPolicy(Policy{SessionTTLMs: 500})
+	if got, want := s.policy.BaseBackoffMs, DefaultPolicy().BaseBackoffMs; got != want {
+		t.Errorf("BaseBackoffMs = %d, want the default %d", got, want)
+	}
+	if got, want := s.policy.MaxBackoffMs, DefaultPolicy().MaxBackoffMs; got != want {
+		t.Errorf("MaxBackoffMs = %d, want the default %d", got, want)
+	}
+	if got := s.policy.SessionTTLMs; got != 500 {
+		t.Errorf("SessionTTLMs = %d, want the configured 500", got)
+	}
+	if New().policy != DefaultPolicy() {
+		t.Error("New() did not use the production policy")
+	}
+}
+
+// A Policy mismatch between replicas is a DIVERGENCE HAZARD, which is why it
+// is not a per-node flag. This demonstrates the hazard concretely: the same
+// log applied under two policies reaches two different states.
+func TestDifferentPoliciesDivergeOnTheSameLog(t *testing.T) {
+	build := func(p Policy) *StateStore {
+		s := NewWithPolicy(p)
+		mustApply(t, s, tickCmd(1000))
+		mustApply(t, s, submitJobCmd("job-1", "client-a", "req-1", "task-1"))
+		mustApply(t, s, tickCmd(2000))
+		return s
+	}
+	short := build(Policy{SessionTTLMs: 500})
+	long := build(Policy{SessionTTLMs: 60_000})
+
+	if dump(short) == dump(long) {
+		t.Fatal("precondition: the two policies produced identical state, so this proves nothing")
+	}
+	if short.SessionCount() != 0 {
+		t.Errorf("short-TTL replica kept %d sessions", short.SessionCount())
+	}
+	if long.SessionCount() != 1 {
+		t.Errorf("long-TTL replica kept %d sessions, want 1", long.SessionCount())
+	}
+	// Exactly the divergence the one-policy-per-cluster contract prevents.
 }

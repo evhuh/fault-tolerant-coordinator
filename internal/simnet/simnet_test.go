@@ -2,6 +2,7 @@ package simnet
 
 import (
 	"context"
+	"math/rand"
 	"sync"
 	"testing"
 	"time"
@@ -230,5 +231,109 @@ func TestDropReasonsAreCountedSeparately(t *testing.T) {
 	}
 	if st.DroppedRandom != 0 {
 		t.Errorf("random drops = %d, want 0 — DropRate was zero", st.DroppedRandom)
+	}
+}
+
+// Corruption must reach the receiver and be REFUSED, never Stepped.
+//
+// Before this fault existed, simnet marshaled cleanly every time, so
+// proto.Unmarshal always succeeded and the "corrupt → drop" branch had never
+// executed — in simnet or in the HTTP transport. An untested guard against
+// feeding garbage to a consensus module is a comment, not a guard.
+func TestCorruptMessagesAreDiscardedNotStepped(t *testing.T) {
+	n := New(5, Faults{CorruptRate: 1.0}) // every message mangled
+	rs := wire(t, n, 1, 2)
+
+	const total = 300
+	for i := 0; i < total; i++ {
+		n.Transport(1).Send(msg(1, 2))
+	}
+	time.Sleep(200 * time.Millisecond)
+
+	st := n.Stats()
+	if st.Corrupted != total {
+		t.Errorf("corrupted = %d, want %d", st.Corrupted, total)
+	}
+	// THE INVARIANT: every corrupt message that ARRIVED was refused.
+	//
+	// Compared against CorruptArrived, not Corrupted: a corrupt message can
+	// also be dropped en route by a partition, and counting that as a leak
+	// would report a safety failure that did not happen.
+	if st.CorruptArrived != st.Corrupted {
+		t.Errorf("precondition: %d of %d corrupt messages never arrived (no partition here)",
+			st.Corrupted-st.CorruptArrived, st.Corrupted)
+	}
+	if st.CorruptDiscarded != st.CorruptArrived {
+		t.Errorf("discarded %d of %d corrupt messages that arrived — the rest reached Step",
+			st.CorruptDiscarded, st.CorruptArrived)
+	}
+	if got := rs[2].count(); got != 0 {
+		t.Errorf("%d corrupt messages were delivered to Step", got)
+	}
+}
+
+// Corruption must not break clean traffic: with the fault off, everything
+// still arrives. A corrupting transport that corrupts unconditionally would
+// make every other test pass for the wrong reason.
+func TestCorruptionIsOffByDefault(t *testing.T) {
+	n := New(5, Faults{})
+	rs := wire(t, n, 1, 2)
+	for i := 0; i < 20; i++ {
+		n.Transport(1).Send(msg(1, 2))
+	}
+	awaitCount(t, rs[2], 20, 2*time.Second)
+	if st := n.Stats(); st.Corrupted != 0 {
+		t.Errorf("corrupted = %d with CorruptRate 0", st.Corrupted)
+	}
+}
+
+// corruptBytes must actually change the bytes, and stay seed-reproducible.
+func TestCorruptBytesMangles(t *testing.T) {
+	orig := []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
+
+	same := 0
+	for seed := int64(0); seed < 50; seed++ {
+		got := corruptBytes(rand.New(rand.NewSource(seed)), append([]byte(nil), orig...))
+		if len(got) == len(orig) && string(got) == string(orig) {
+			same++
+		}
+	}
+	if same > 0 {
+		t.Errorf("%d/50 corruptions left the bytes unchanged", same)
+	}
+
+	// Same seed, same mangling.
+	a := corruptBytes(rand.New(rand.NewSource(7)), append([]byte(nil), orig...))
+	b := corruptBytes(rand.New(rand.NewSource(7)), append([]byte(nil), orig...))
+	if string(a) != string(b) {
+		t.Errorf("corruption is not reproducible from the seed: %v vs %v", a, b)
+	}
+}
+
+// A corrupt message dropped by a partition must not look like a leak.
+//
+// Corrupted counts at send; a partition can swallow the message before any
+// receiver sees it. Reporting Corrupted vs Discarded then shows a gap that
+// reads exactly like "a corrupt message reached Step" — a phantom safety
+// failure, which is worse than a missing metric.
+func TestCorruptMessageDroppedByPartitionIsNotALeak(t *testing.T) {
+	n := New(11, Faults{CorruptRate: 1.0})
+	wire(t, n, 1, 2)
+	n.Partition(2)
+
+	for i := 0; i < 10; i++ {
+		n.Transport(1).Send(msg(1, 2))
+	}
+	time.Sleep(150 * time.Millisecond)
+
+	st := n.Stats()
+	if st.CorruptArrived != 0 {
+		t.Errorf("CorruptArrived = %d across a partition, want 0", st.CorruptArrived)
+	}
+	if st.CorruptDiscarded != st.CorruptArrived {
+		t.Errorf("discarded %d but only %d arrived", st.CorruptDiscarded, st.CorruptArrived)
+	}
+	if st.DroppedPartition == 0 {
+		t.Error("nothing was dropped by the partition; the test proves nothing")
 	}
 }

@@ -30,6 +30,8 @@ func main() {
 	steps := flag.Int("steps", 40, "fault steps per run")
 	nodes := flag.Int("nodes", 3, "coordinator nodes")
 	dropRate := flag.Float64("drop-rate", 0.02, "probability a raft message is dropped")
+	corruptRate := flag.Float64("corrupt-rate", 0.01, "probability a raft message's bytes are mangled in flight")
+	failureRate := flag.Float64("failure-rate", 0.15, "fraction of task executions that report failure")
 	maxDelay := flag.Duration("max-delay", 5*time.Millisecond, "upper bound on message delay")
 	stepTime := flag.Duration("step-time", 150*time.Millisecond, "wall time the cluster runs per step")
 	verbose := flag.Bool("v", false, "log every fault as it is applied")
@@ -54,7 +56,7 @@ func main() {
 	failures := 0
 	for i := 0; i < *runs; i++ {
 		s := seed + int64(i)
-		if err := runOne(ctx, s, *steps, *nodes, *dropRate, *maxDelay, *stepTime, *verbose); err != nil {
+		if err := runOne(ctx, s, *steps, *nodes, *dropRate, *corruptRate, *failureRate, *maxDelay, *stepTime, *verbose); err != nil {
 			failures++
 			fmt.Printf("\nFAILED  seed=%d\n", s)
 			fmt.Printf("  %v\n", err)
@@ -72,7 +74,7 @@ func main() {
 	fmt.Printf("\n%d/%d runs passed\n", *runs, *runs)
 }
 
-func runOne(ctx context.Context, seed int64, steps, nodes int, dropRate float64,
+func runOne(ctx context.Context, seed int64, steps, nodes int, dropRate, corruptRate, failureRate float64,
 	maxDelay, stepTime time.Duration, verbose bool) error {
 
 	dir, err := os.MkdirTemp("", fmt.Sprintf("sim-%d-", seed))
@@ -95,7 +97,8 @@ func runOne(ctx context.Context, seed int64, steps, nodes int, dropRate float64,
 	cfg.Nodes = nodes
 	cfg.Steps = steps
 	cfg.StepTime = stepTime
-	cfg.Faults = simnet.Faults{DropRate: dropRate, MaxDelay: maxDelay}
+	cfg.Faults = simnet.Faults{DropRate: dropRate, CorruptRate: corruptRate, MaxDelay: maxDelay}
+	cfg.FailureRate = failureRate
 	cfg.Out = io.Discard
 	if verbose {
 		cfg.Out = os.Stdout
@@ -110,12 +113,19 @@ func runOne(ctx context.Context, seed int64, steps, nodes int, dropRate float64,
 		fmt.Printf("FAIL (%s)\n", elapsed)
 		return err
 	}
-	n := res.Faults.Net
+	n, c := res.Faults.Net, res.Coverage
 	fmt.Printf("ok (%s)\n", elapsed)
 	fmt.Printf("    faults:   kills=%d restarts=%d partitions=%d heals=%d\n",
 		res.Faults.NodeKills, res.Faults.NodeRestarts, res.Faults.Partitions, res.Faults.Heals)
-	fmt.Printf("    messages: sent=%d delivered=%d  dropped: random=%d partition=%d node-down=%d\n",
-		n.Sent, n.Delivered, n.DroppedRandom, n.DroppedPartition, n.DroppedDown)
+	fmt.Printf("    messages: sent=%d delivered=%d  dropped: random=%d partition=%d node-down=%d  corrupt: %d sent, %d arrived, %d discarded\n",
+		n.Sent, n.Delivered, n.DroppedRandom, n.DroppedPartition, n.DroppedDown,
+		n.Corrupted, n.CorruptArrived, n.CorruptDiscarded)
+	// Coverage, not configuration: which paths this run actually reached.
+	// "Zero violations" is only evidence about code that executed.
+	fmt.Printf("    reported: ok=%d retryable-fail=%d terminal-fail=%d\n",
+		c.ReportedOK, c.ReportedRetryable, c.ReportedTerminal)
+	fmt.Printf("    exercised: redispatched=%d backed-off=%d reached-FAILED=%d sessions-expired=%d\n",
+		c.TasksRedispatched, c.TasksBackedOff, c.TasksTerminalFail, c.SessionsExpired)
 	fmt.Printf("    state:    jobs=%d tasks=%d\n", res.Jobs, res.Tasks)
 	return nil
 }

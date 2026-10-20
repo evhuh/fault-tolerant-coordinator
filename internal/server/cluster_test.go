@@ -130,6 +130,25 @@ func (c *cluster) stop(id uint64) {
 	}
 }
 
+// awaitKnowsLeader waits for a node to learn who leads.
+//
+// Distinct from waiting for a leader to EXIST: a follower's view of
+// leadership lags the election, so it answers "NOT_LEADER: no leader elected"
+// for a window afterwards. A client pool seeded with only that node has
+// nowhere to rotate to, so a test that starts in that window fails for a
+// reason that has nothing to do with what it is testing.
+func (c *cluster) awaitKnowsLeader(n *clusterNode, within time.Duration) {
+	c.t.Helper()
+	deadline := time.Now().Add(within)
+	for time.Now().Before(deadline) {
+		if _, ok := n.coord.LeaderAddr(); ok {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	c.t.Fatalf("node %d never learned who leads within %s", n.id, within)
+}
+
 // follower returns any node that is not currently leading.
 func (c *cluster) follower(lead *clusterNode) *clusterNode {
 	c.t.Helper()
@@ -443,7 +462,10 @@ func TestClientPoolFollowsRedirectFromFollower(t *testing.T) {
 	fol := c.follower(lead)
 
 	// Seeded with ONLY the follower's address — the pool has never heard of
-	// the leader and must learn it from the redirect.
+	// the leader and must learn it from the redirect. The follower has to
+	// know who that is first, which lags the election by a beat.
+	c.awaitKnowsLeader(fol, 10*time.Second)
+
 	pool := client.NewPool(c.apiAddrs[fol.id])
 	defer pool.Close()
 
@@ -558,6 +580,10 @@ func TestRedirectedRetryStillDedups(t *testing.T) {
 	c := newCluster(t, 3)
 	lead := c.leader(10 * time.Second)
 	fol := c.follower(lead)
+
+	// The pool is seeded with ONLY this follower, so it must be able to
+	// redirect — which means it must already know where to redirect to.
+	c.awaitKnowsLeader(fol, 10*time.Second)
 
 	pool := client.NewPool(c.apiAddrs[fol.id])
 	defer pool.Close()
@@ -901,5 +927,53 @@ func TestLaggingNodeIsCaughtUpByAnInstalledSnapshot(t *testing.T) {
 			t.Fatalf("lagging node has %d jobs, want %d — it was never caught up", got, want)
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The mechanism the revocation-deadlock fix depends on
+// ---------------------------------------------------------------------------
+
+// Revocation must not block, full stop. This drives it directly and bounds
+// how long it may take — the deadlock it replaced held the Ready loop for a
+// whole proposal timeout.
+func TestRevocationDoesNotBlock(t *testing.T) {
+	c := newCluster(t, 3)
+	lead := c.leader(10 * time.Second)
+
+	// Give the scheduler something in flight so the path is not trivially
+	// empty.
+	if _, err := lead.svc.RegisterWorker(context.Background(), &schedulerpb.RegisterWorkerRequest{
+		WorkerId: "w-1", Capacity: 2,
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	specs := make([]*schedulerpb.TaskSpec, 0, 8)
+	for i := 0; i < 8; i++ {
+		specs = append(specs, &schedulerpb.TaskSpec{Command: "/bin/true", MaxAttempts: 3})
+	}
+	if _, err := lead.svc.SubmitJob(context.Background(), &schedulerpb.SubmitJobRequest{
+		ClientId: "c", RequestId: "r-1", Tasks: specs,
+	}); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+
+	done := make(chan time.Duration, 1)
+	go func() {
+		start := time.Now()
+		lead.coord.onLeadershipChanged(false)
+		done <- time.Since(start)
+	}()
+
+	select {
+	case elapsed := <-done:
+		// Generous bound: the point is "did not wait out a timeout", not a
+		// performance assertion.
+		if elapsed > 2*time.Second {
+			t.Errorf("revocation took %s — it blocked on work the Ready loop serves", elapsed)
+		}
+		t.Logf("revocation completed in %s", elapsed.Round(time.Millisecond))
+	case <-time.After(10 * time.Second):
+		t.Fatal("revocation never returned — the Ready loop is deadlocked against the scheduler")
 	}
 }

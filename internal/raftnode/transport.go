@@ -68,6 +68,9 @@ func (t *httpTransport) Listen(selfURL string, step func(context.Context, *raftp
 		if proto.Unmarshal(body, m) != nil {
 			return // corrupt → drop, never Step
 		}
+		if !plausible(body, m) {
+			return
+		}
 		_ = step(r.Context(), m)
 	})
 	t.srv = &http.Server{Addr: u.Host, Handler: mux}
@@ -102,4 +105,30 @@ func (t *httpTransport) Close() {
 		defer cancel()
 		_ = t.srv.Shutdown(ctx)
 	}
+}
+
+// plausible rejects decoded messages that cannot have come from a peer.
+//
+// Parsing successfully is NOT enough, and the gap is sharper than it looks:
+// an EMPTY body unmarshals cleanly into Message{Type: MsgHup, From: 0, To: 0},
+// and MsgHup is the message that makes a node start an election. So an empty
+// POST to /raft — or a corrupted frame truncated to zero length — forces the
+// receiver to campaign. Repeated, that is a liveness attack costing one HTTP
+// request each.
+//
+// Two checks are enough, and both are unambiguous:
+//
+//   - An empty body carries no information. Raft never sends one.
+//   - To == 0 addresses nobody. Send() resolves m.To through the peer map, so
+//     a message we would emit always names a real node id, and ids start at 1.
+//
+// Deliberately NOT validating further. The transport's job is to refuse the
+// structurally impossible; deciding whether a well-formed message is
+// legitimate is the consensus module's, and duplicating that judgement here
+// is how a transport starts silently dropping valid traffic.
+func plausible(body []byte, m *raftpb.Message) bool {
+	if len(body) == 0 {
+		return false
+	}
+	return m.GetTo() != 0
 }

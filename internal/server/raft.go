@@ -10,6 +10,8 @@ import (
 	"sync"
 	"time"
 
+	"go.etcd.io/raft/v3"
+
 	"github.com/evazheng/fault-tolerant-coordinator/internal/raftnode"
 	"github.com/evazheng/fault-tolerant-coordinator/internal/state"
 	commandpb "github.com/evazheng/fault-tolerant-coordinator/proto/commandpb"
@@ -148,6 +150,7 @@ func (c *Coordinator) StartRaft(cfg raftnode.Config) error {
 		Fatal:             c.fatal,
 		Snapshot:          c.snapshotState,
 		Restore:           c.restoreState,
+		Stalled:           c.onStalled,
 	})
 	if err != nil {
 		c.proposer = nil
@@ -160,13 +163,25 @@ func (c *Coordinator) StartRaft(cfg raftnode.Config) error {
 	return nil
 }
 
+// StopRaft halts this node's consensus.
+//
+// It deliberately does NOT nil c.raft or c.proposer. Those fields are read
+// without a lock by propose, IsLeader and applyCommitted, including from the
+// Tick proposer goroutine — which is cancelled by context but can be mid
+// propose when this runs. Clearing them underneath a live reader is a data
+// race, and it is the exact mirror of publishing them after the Ready loop
+// had already started.
+//
+// Nothing is gained by clearing them. A stopped node reports IsLeader()
+// false (the Ready loop gives up leadership on its way out), so propose
+// returns ErrNotLeader, LeaderAddr reports none, and Propose on a stopped
+// node fails. Every reader already does the right thing against a stopped
+// node; it only has to be able to read the pointer safely.
 func (c *Coordinator) StopRaft() {
 	if c.raft == nil {
 		return
 	}
 	c.raft.Stop()
-	c.raft = nil
-	c.proposer = nil
 }
 
 // applyCommitted runs on EVERY replica, in log order, for every committed
@@ -225,6 +240,25 @@ func (c *Coordinator) proposeRaft(cmd *commandpb.Command) (state.Result, error) 
 	ctx, cancel := context.WithTimeout(context.Background(), c.proposalTimeout())
 	defer cancel()
 	if err := c.proposer.node.Propose(ctx, data); err != nil {
+		// A proposal can fail to LAND for the same reasons it can fail to
+		// commit, and callers must not have to tell them apart.
+		//
+		// Propose itself blocks until raft accepts the entry, so a busy or
+		// stalled node makes it return the context deadline — which is
+		// exactly ErrProposalLost's meaning: abandoned, possibly committed
+		// later, safe to retry because every command is idempotent.
+		//
+		// Returning a bare wrapped error here instead meant the Tick
+		// proposer, which tolerates ErrProposalLost, PANICKED the process
+		// on a slow node. Classifying at the source rather than widening
+		// every caller's tolerance is what keeps that from recurring.
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			return state.Result{}, ErrProposalLost
+		}
+		if errors.Is(err, raft.ErrStopped) {
+			// The node is shutting down; it will never lead again.
+			return state.Result{}, ErrNotLeader
+		}
 		return state.Result{}, fmt.Errorf("propose: %w", err)
 	}
 
@@ -411,4 +445,23 @@ func (c *Coordinator) AppliedIndex() uint64 {
 		return 0
 	}
 	return c.raft.AppliedIndex()
+}
+
+// onStalled records that this node's Ready loop blocked too long.
+//
+// Nothing is recovered here — the loop is already wedged and will unwedge
+// when whatever it waits on times out. The point is that the stall becomes
+// EVIDENCE instead of an unexplained election: the simulator reads it as an
+// invariant violation and fails the run with its seed.
+func (c *Coordinator) onStalled(d time.Duration) {
+	c.stallMu.Lock()
+	c.stalls = append(c.stalls, d)
+	c.stallMu.Unlock()
+}
+
+// Stalls reports Ready-loop stalls observed on this node.
+func (c *Coordinator) Stalls() []time.Duration {
+	c.stallMu.Lock()
+	defer c.stallMu.Unlock()
+	return append([]time.Duration(nil), c.stalls...)
 }

@@ -43,6 +43,14 @@ type Config struct {
 	// ProposalTimeout bounds a caller's wait for its entry to commit. Zero
 	// means the default.
 	ProposalTimeout time.Duration
+	// StatePolicy holds the durations the state machine measures against its
+	// own clock. ONE PER CLUSTER, identical on every replica — see
+	// state.Policy. Zero means production defaults.
+	//
+	// Deliberately not a coordinator flag: the simulator compresses it so
+	// session expiry and retry backoff actually occur inside a sub-second
+	// run, and nothing else should be changing it.
+	StatePolicy state.Policy
 	// Rand is the source for generated ids. Nil means crypto/rand. The
 	// simulator seeds it so a reproduced run yields the same ids and two
 	// runs can be diffed.
@@ -114,6 +122,11 @@ type Coordinator struct {
 	// leaderCancel stops the leader-only goroutines on revocation.
 	leaderCancel context.CancelFunc
 
+	// stalls records Ready-loop stalls. A non-empty list means something on
+	// that goroutine blocked on work the goroutine itself serves.
+	stallMu sync.Mutex
+	stalls  []time.Duration
+
 	// fatalErr records an unrecoverable failure that halted this node.
 	fatalOnce sync.Once
 	fatalMu   sync.Mutex
@@ -128,7 +141,7 @@ func New(cfg Config) *Coordinator {
 	}
 	return &Coordinator{
 		cfg:   cfg,
-		store: state.New(),
+		store: state.NewWithPolicy(cfg.StatePolicy),
 		clk:   clk,
 		rand:  rnd,
 		now:   clk.Now,

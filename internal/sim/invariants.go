@@ -34,6 +34,22 @@ func (s *Sim) checkInvariants(step int) []Violation {
 		vs = append(vs, Violation{Seed: s.cfg.Seed, Step: step, What: fmt.Sprintf(format, args...)})
 	}
 
+	// A stalled Ready loop is a VIOLATION, not a log line. It means something
+	// on that goroutine blocked on work the goroutine itself serves, which
+	// self-heals after a timeout and leaves only an unexplained election
+	// behind. Checked across every node, not just the leader: a follower's
+	// loop stalling is the same bug.
+	for id := uint64(1); id <= uint64(s.cfg.Nodes); id++ {
+		n, up := s.nodes[id]
+		if !up {
+			continue
+		}
+		for _, d := range n.coord.Stalls() {
+			add("node %d Ready loop stalled %s — a blocking call on the loop's own goroutine",
+				id, d.Round(time.Millisecond))
+		}
+	}
+
 	lead.coord.ReadState(func(st *state.StateStore) {
 		// A task holds at most one worker, and only while it is live. The
 		// coordinator-side version of "never running on two workers": the
@@ -116,9 +132,18 @@ func (s *Sim) checkConverged() []Violation {
 		vs = append(vs, Violation{Seed: s.cfg.Seed, Step: s.result.Steps, What: fmt.Sprintf(format, args...)})
 	}
 
-	lead := s.leader()
+	// WAIT for a stable leader rather than sampling at one instant.
+	//
+	// leader() requires exactly one, and during an election there are zero —
+	// so a single-instant check fails whenever the restarts this function
+	// just performed trigger one, which is most of the time. That is the
+	// harness being unable to see, not the cluster being broken.
+	//
+	// A genuinely leaderless cluster still fails here; it just has to stay
+	// that way for the whole window.
+	lead := s.awaitLeader(15 * time.Second)
 	if lead == nil {
-		add("no leader after healing and restarting every node")
+		add("no leader 15s after healing and restarting every node")
 		return vs
 	}
 
@@ -134,8 +159,18 @@ func (s *Sim) checkConverged() []Violation {
 	// compare only where two nodes were seen at the SAME index. A mismatch
 	// there means apply stopped being a pure function of (state, command),
 	// which is the most serious bug this harness can find.
-	for _, d := range s.sampleDivergence(2 * time.Second) {
+	diffs, comparisons := s.sampleDivergence(2 * time.Second)
+	for _, d := range diffs {
 		add("%s", d)
+	}
+	// A run that structurally compared almost nothing must not pass green.
+	if min := s.cfg.MinComparisons; min > 0 && comparisons < min {
+		vs = append(vs, Violation{
+			Seed: s.cfg.Seed, Step: s.result.Steps, Inconclusive: true,
+			What: fmt.Sprintf(
+				"replica agreement made only %d cross-node comparisons (floor %d); "+
+					"the run proved nothing about convergence", comparisons, min),
+		})
 	}
 
 	// No task is stranded: nothing sits ASSIGNED or RUNNING forever against a
@@ -158,7 +193,7 @@ func (s *Sim) checkConverged() []Violation {
 // node is guaranteed to pause at the same index — the log keeps moving. Over
 // enough samples the nodes pass through common indices, and those are the
 // only comparisons that carry meaning.
-func (s *Sim) sampleDivergence(within time.Duration) []string {
+func (s *Sim) sampleDivergence(within time.Duration) (diffs []string, comparisons int) {
 	// node id -> applied index -> state hash
 	seen := map[uint64]map[uint64]string{}
 	deadline := time.Now().Add(within)
@@ -192,7 +227,7 @@ func (s *Sim) sampleDivergence(within time.Duration) []string {
 
 	// Compare every pair at every shared index, in sorted order so a failure
 	// message is stable run to run.
-	var out []string
+	var out []string //nolint:prealloc
 	ids := make([]uint64, 0, len(seen))
 	for id := range seen {
 		ids = append(ids, id)
@@ -221,12 +256,48 @@ func (s *Sim) sampleDivergence(within time.Duration) []string {
 		}
 	}
 
-	// A check that never compared anything proves nothing, and silently
-	// passing in that case is how a harness becomes decoration.
-	if shared == 0 && len(ids) > 1 {
-		out = append(out, fmt.Sprintf(
-			"no shared applied index across %d live nodes in %s; replica agreement was never actually checked",
-			len(ids), within))
+	return out, shared
+}
+
+// recordCoverage samples committed state for evidence that each path ran.
+//
+// Sampled rather than counted at the source because the interesting paths are
+// in the STATE MACHINE, not the workload: a task can be redispatched by lease
+// reclaim without any worker reporting anything, and the session sweep has no
+// caller at all — Tick does it.
+//
+// Called between steps on the Run goroutine, so the maps need no lock.
+func (s *Sim) recordCoverage() {
+	lead := s.leader()
+	if lead == nil {
+		return
 	}
-	return out
+	lead.coord.ReadState(func(st *state.StateStore) {
+		now := st.NowMs()
+		for _, id := range st.TaskIDs() {
+			t, _ := st.Task(id)
+			if t.Attempt > 1 {
+				s.seenRetried[id] = true
+			}
+			if t.NotBeforeMs > now {
+				s.seenBackoff[id] = true
+			}
+			if t.State == state.TaskFailed {
+				s.seenFailed[id] = true
+			}
+		}
+
+		// A DROP in the session count means the Tick TTL sweep removed
+		// something. Counting it this way rather than instrumenting the state
+		// machine keeps apply free of bookkeeping that is only for tests.
+		n := st.SessionCount()
+		if s.lastSessions >= 0 && n < s.lastSessions {
+			s.result.Coverage.SessionsExpired += s.lastSessions - n
+		}
+		s.lastSessions = n
+	})
+
+	s.result.Coverage.TasksRedispatched = len(s.seenRetried)
+	s.result.Coverage.TasksBackedOff = len(s.seenBackoff)
+	s.result.Coverage.TasksTerminalFail = len(s.seenFailed)
 }

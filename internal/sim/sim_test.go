@@ -3,6 +3,7 @@ package sim
 import (
 	"bytes"
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -164,4 +165,97 @@ func TestInvariantCheckerDetectsCorruptedState(t *testing.T) {
 		}
 	}
 	t.Logf("checker caught: %v", vs)
+}
+
+// A run that structurally compared almost nothing must fail as INCONCLUSIVE,
+// not pass green.
+//
+// "At least one comparison" was too weak: a heavily partitioned run can
+// compare a handful of indices and come back clean, which looks like evidence
+// about convergence and is not. The distinction matters — a violation says
+// the system is broken, inconclusive says the harness could not see.
+func TestImpossibleComparisonFloorIsInconclusiveNotAPass(t *testing.T) {
+	cfg := quickConfig(2024, 4)
+	cfg.MinComparisons = 1 << 30 // unreachable on purpose
+	res, err := New(cfg, dirsFor(t, cfg.Nodes)).Run(context.Background())
+
+	if err == nil {
+		t.Fatal("a run that compared far below the floor passed")
+	}
+	if len(res.Violations) == 0 {
+		t.Fatal("no violation recorded")
+	}
+	v := res.Violations[0]
+	if !v.Inconclusive {
+		t.Errorf("recorded as a violation, want INCONCLUSIVE: %v", v)
+	}
+	if !strings.Contains(v.Error(), "INCONCLUSIVE") {
+		t.Errorf("message does not distinguish itself: %q", v.Error())
+	}
+	t.Logf("%v", v)
+}
+
+// The default floor must be comfortably reachable, or every run fails.
+// Measured on this config: healthy runs make 100–300 comparisons.
+func TestDefaultComparisonFloorIsReachable(t *testing.T) {
+	cfg := quickConfig(31337, 10)
+	if cfg.MinComparisons == 0 {
+		t.Fatal("default MinComparisons is 0 — the floor is disabled")
+	}
+	res, err := New(cfg, dirsFor(t, cfg.Nodes)).Run(context.Background())
+	if err != nil {
+		t.Fatalf("a healthy run failed its own floor (%d): %v", cfg.MinComparisons, err)
+	}
+	for _, v := range res.Violations {
+		if v.Inconclusive {
+			t.Errorf("healthy run reported inconclusive: %v", v)
+		}
+	}
+}
+
+// COVERAGE IS PART OF THE RESULT. "Zero violations" is only evidence about
+// code that executed, and before the workload failed any tasks the entire
+// retry path was dark while every run came back green.
+//
+// This asserts the paths are reachable, not that they fire every time — a
+// seed that happens not to fail a task is legitimate. The simulator prints
+// these so a sweep that never reaches a path is visible.
+func TestRunExercisesTheFailurePaths(t *testing.T) {
+	var agg Coverage
+	for seed := int64(100); seed < 104; seed++ {
+		cfg := quickConfig(seed, 20)
+		res, err := New(cfg, dirsFor(t, cfg.Nodes)).Run(context.Background())
+		if err != nil {
+			t.Fatalf("seed %d: %v", seed, err)
+		}
+		c := res.Coverage
+		agg.ReportedOK += c.ReportedOK
+		agg.ReportedRetryable += c.ReportedRetryable
+		agg.ReportedTerminal += c.ReportedTerminal
+		agg.TasksRedispatched += c.TasksRedispatched
+		agg.TasksBackedOff += c.TasksBackedOff
+		agg.TasksTerminalFail += c.TasksTerminalFail
+		agg.SessionsExpired += c.SessionsExpired
+		t.Logf("seed %d: ok=%d retryable=%d terminal=%d | redispatched=%d backed-off=%d FAILED=%d sessions-expired=%d",
+			seed, c.ReportedOK, c.ReportedRetryable, c.ReportedTerminal,
+			c.TasksRedispatched, c.TasksBackedOff, c.TasksTerminalFail, c.SessionsExpired)
+	}
+
+	for _, tc := range []struct {
+		name string
+		got  int
+	}{
+		{"successful executions", agg.ReportedOK},
+		{"retryable failures reported", agg.ReportedRetryable},
+		{"terminal failures reported", agg.ReportedTerminal},
+		{"tasks redispatched (attempt > 1)", agg.TasksRedispatched},
+		{"tasks observed backing off", agg.TasksBackedOff},
+		{"tasks reaching FAILED", agg.TasksTerminalFail},
+		{"dedup sessions expired by Tick", agg.SessionsExpired},
+	} {
+		if tc.got == 0 {
+			t.Errorf("across 4 seeds, %s never happened — that path is unverified", tc.name)
+		}
+	}
+	t.Logf("TOTAL across 4 seeds: %+v", agg)
 }

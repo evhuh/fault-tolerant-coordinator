@@ -50,6 +50,22 @@ type Config struct {
 	LeaseTTL      time.Duration
 	TickPeriod    time.Duration
 	SnapshotEvery uint64
+	// MinComparisons is how many real cross-node state comparisons the
+	// convergence check must make before a run is allowed to pass.
+	//
+	// "At least one" is too weak: a heavily partitioned run can compare a
+	// handful and still come back green, which looks like evidence and is
+	// not. A run below this floor fails as INCONCLUSIVE — a distinct outcome
+	// from a violation, because nothing was found wrong; nothing was looked
+	// at.
+	//
+	// Healthy runs on this config measure 100–300, so 20 leaves wide margin.
+	MinComparisons int
+	// StatePolicy compresses the durations the STATE MACHINE measures.
+	// Without this, a 10-minute session TTL and a 30-second backoff cap
+	// against a sub-second run mean those paths never execute at all, and a
+	// green run says nothing about them.
+	StatePolicy state.Policy
 	// ProposalTimeout is compressed with everything else. At the production
 	// default a single leaderless moment parks every caller for 5s, which in
 	// simulated time is an eternity and makes a run mostly waiting.
@@ -62,25 +78,60 @@ type Config struct {
 	TasksPerJob int
 	WorkerCount int
 	WorkerSlots int32
-	Out         io.Writer
+
+	// FailureRate is the fraction of task executions that report failure
+	// rather than success.
+	//
+	// Without it the workload only ever reports ExitCode 0, so FailTask never
+	// fires and the whole retry path — backoff deadlines, BACKOFF_ELAPSED
+	// evals, terminal FAILED — is unreachable. A verifier that cannot reach a
+	// code path provides no evidence about it.
+	FailureRate float64
+	// RetryableFraction splits those failures. A retryable failure exercises
+	// backoff and redispatch; a non-retryable one exercises the immediate
+	// terminal path, which is a different branch.
+	RetryableFraction float64
+
+	Out io.Writer
 }
 
 func DefaultConfig() Config {
 	return Config{
-		Nodes:           3,
-		Steps:           40,
-		StepTime:        150 * time.Millisecond,
-		TickInterval:    10 * time.Millisecond,
-		ElectionTick:    10,
-		LeaseTTL:        300 * time.Millisecond,
-		TickPeriod:      20 * time.Millisecond,
-		SnapshotEvery:   50,
+		Nodes:    3,
+		Steps:    40,
+		StepTime: 150 * time.Millisecond,
+		// 25ms, not 10ms: ElectionTick x TickInterval must stay above the
+		// non-compressible disk floor. A snapshot plus WAL compaction costs
+		// 23-40ms of real fsync time no matter how far the clock is
+		// compressed, and at a 100ms election timeout the derived stall
+		// threshold (50ms) sat below it — so routine snapshots registered as
+		// Ready-loop stalls. 250ms election, 125ms threshold, ~40ms worst
+		// batch.
+		TickInterval: 25 * time.Millisecond,
+		ElectionTick: 10,
+		LeaseTTL:     300 * time.Millisecond,
+		TickPeriod:   20 * time.Millisecond,
+		// Frequent enough that compaction and Restore are genuinely
+		// exercised, rare enough that the run is not dominated by fsync.
+		SnapshotEvery:   150,
 		ProposalTimeout: 250 * time.Millisecond,
-		Faults:          simnet.Faults{DropRate: 0.02, MinDelay: 0, MaxDelay: 5 * time.Millisecond},
-		JobsPerStep:     1,
-		TasksPerJob:     3,
-		WorkerCount:     3,
-		WorkerSlots:     2,
+		MinComparisons:  20,
+		// Scaled to the run, not to production. A run spans well under a
+		// second of state-machine time, so these are set so that a retry
+		// backoff elapses within a step or two and a session outlives a few
+		// steps but not the run.
+		StatePolicy: state.Policy{
+			BaseBackoffMs: 25,
+			MaxBackoffMs:  150,
+			SessionTTLMs:  400,
+		},
+		Faults:            simnet.Faults{DropRate: 0.02, MinDelay: 0, MaxDelay: 5 * time.Millisecond},
+		JobsPerStep:       1,
+		TasksPerJob:       3,
+		WorkerCount:       3,
+		WorkerSlots:       2,
+		FailureRate:       0.15,
+		RetryableFraction: 0.7,
 	}
 }
 
@@ -90,8 +141,28 @@ type Result struct {
 	Steps      int
 	Violations []Violation
 	Faults     FaultCounts
+	Coverage   Coverage
 	Jobs       int
 	Tasks      int
+}
+
+// Coverage is which code paths a run actually reached.
+//
+// It exists because "zero violations" is only evidence about paths that
+// EXECUTED. A run that never failed a task says nothing about retries, and
+// reporting that honestly is the difference between verification and
+// decoration.
+type Coverage struct {
+	// Reported by the simulated workers.
+	ReportedOK        int
+	ReportedRetryable int
+	ReportedTerminal  int
+
+	// Observed in committed state, by sampling each step.
+	TasksRedispatched int // attempt > 1: a reclaim or retry actually happened
+	TasksBackedOff    int // distinct tasks seen holding a live NotBeforeMs
+	TasksTerminalFail int // distinct tasks that reached FAILED
+	SessionsExpired   int // the Tick TTL sweep actually removed something
 }
 
 // FaultCounts is the chaos actually induced, not the chaos configured.
@@ -109,10 +180,20 @@ type Violation struct {
 	Seed int64
 	Step int
 	What string
+	// Inconclusive marks a run that could not check something, as opposed to
+	// one that found something wrong. The distinction matters: a violation
+	// says the system is broken, inconclusive says the HARNESS could not see.
+	// Reporting the second as a pass is how a verifier quietly stops
+	// verifying.
+	Inconclusive bool
 }
 
 func (v Violation) Error() string {
-	return fmt.Sprintf("seed %d step %d: %s", v.Seed, v.Step, v.What)
+	kind := "VIOLATION"
+	if v.Inconclusive {
+		kind = "INCONCLUSIVE"
+	}
+	return fmt.Sprintf("%s seed %d step %d: %s", kind, v.Seed, v.Step, v.What)
 }
 
 type node struct {
@@ -134,6 +215,12 @@ type Sim struct {
 
 	mu     sync.Mutex
 	result Result
+
+	// Coverage bookkeeping, sampled between steps on the Run goroutine.
+	seenBackoff  map[string]bool
+	seenRetried  map[string]bool
+	seenFailed   map[string]bool
+	lastSessions int
 }
 
 // New builds a simulation. dirs must be writable; the caller owns cleanup.
@@ -148,6 +235,11 @@ func New(cfg Config, dirs map[uint64]string) *Sim {
 		nodes: map[uint64]*node{},
 		dirs:  dirs,
 		peers: map[uint64]string{},
+
+		seenBackoff:  map[string]bool{},
+		seenRetried:  map[string]bool{},
+		seenFailed:   map[string]bool{},
+		lastSessions: -1,
 	}
 	s.result.Seed = cfg.Seed
 	for i := 1; i <= cfg.Nodes; i++ {
@@ -178,6 +270,8 @@ func (s *Sim) start(id uint64) error {
 	cfg.Sched.LeaseTTLMs = s.cfg.LeaseTTL.Milliseconds()
 	cfg.Sched.Workers = 2
 	cfg.ProposalTimeout = s.cfg.ProposalTimeout
+	// IDENTICAL on every node, which is the contract Policy carries.
+	cfg.StatePolicy = s.cfg.StatePolicy
 	// Each node gets its own stream off the run's seed, so the ids a node
 	// mints are reproducible without every node drawing from one shared
 	// sequence whose order depends on goroutine scheduling.
@@ -193,6 +287,9 @@ func (s *Sim) start(id uint64) error {
 	rcfg.HeartbeatTick = 1
 	rcfg.SnapshotEntries = s.cfg.SnapshotEvery
 	rcfg.SnapshotCatchUpEntries = 5
+	// Derived from the election timeout by raftnode when zero; left zero
+	// here so the simulator inherits the same "strictly below the election
+	// timeout" rule the production default uses.
 	rcfg.Transport = s.net.Transport(id)
 
 	if err := coord.StartRaft(rcfg); err != nil {
@@ -278,7 +375,13 @@ func (s *Sim) Run(ctx context.Context) (Result, error) {
 		s.applyFault(step)
 		s.offerWork(step)
 		s.drainSomeWork()
+		// Sample IMMEDIATELY after the reports land. A retry backoff is
+		// deliberately shorter than a step, so a once-per-step sampler
+		// watches it elapse between looks and concludes it never happened —
+		// which is how a coverage number lies in the safe-looking direction.
+		s.recordCoverage()
 		time.Sleep(s.cfg.StepTime)
+		s.recordCoverage()
 
 		s.result.Steps = step
 		if vs := s.checkInvariants(step); len(vs) > 0 {
@@ -300,6 +403,7 @@ func (s *Sim) Run(ctx context.Context) (Result, error) {
 	}
 	s.awaitLeader(10 * time.Second)
 	time.Sleep(10 * s.cfg.StepTime)
+	s.recordCoverage()
 
 	if vs := s.checkConverged(); len(vs) > 0 {
 		s.result.Violations = append(s.result.Violations, vs...)

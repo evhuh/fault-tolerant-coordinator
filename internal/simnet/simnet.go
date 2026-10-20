@@ -37,6 +37,20 @@ type Faults struct {
 	// Raft tolerates this by design; the point is to make it happen often
 	// enough to matter.
 	DropRate float64
+	// CorruptRate is the probability a message's bytes are mangled in
+	// flight, 0..1.
+	//
+	// This exists to execute a branch that otherwise never runs. Clean
+	// marshaling every time means proto.Unmarshal always succeeds, so the
+	// "corrupt → drop, never Step" rule — the one transport invariant that
+	// actually protects safety — has no coverage at all. Feeding garbage into
+	// a consensus module is how a network fault becomes a safety violation,
+	// and an untested guard against that is a comment.
+	//
+	// Corruption is applied to the SERIALIZED BYTES, which is the only place
+	// it can happen for real: an in-process transport cannot corrupt a Go
+	// struct, but a network corrupts frames.
+	CorruptRate float64
 	// MinDelay and MaxDelay bound per-message latency. Delivery stays
 	// asynchronous, so messages can REORDER, which is the more interesting
 	// fault: a stale append arriving after a newer one is exactly the case
@@ -72,6 +86,9 @@ type Network struct {
 	droppedRandom    int // the configured drop rate
 	droppedPartition int // crossed a partition
 	droppedDown      int // addressed to a stopped node
+	corrupted        int // bytes mangled at send
+	corruptArrived   int // ...and actually reached a receiver
+	corruptDiscarded int // ...and were refused there
 }
 
 func New(seed int64, f Faults) *Network {
@@ -125,6 +142,9 @@ func (n *Network) Stats() Stats {
 		DroppedRandom:    n.droppedRandom,
 		DroppedPartition: n.droppedPartition,
 		DroppedDown:      n.droppedDown,
+		Corrupted:        n.corrupted,
+		CorruptArrived:   n.corruptArrived,
+		CorruptDiscarded: n.corruptDiscarded,
 	}
 }
 
@@ -134,6 +154,17 @@ type Stats struct {
 	DroppedRandom    int
 	DroppedPartition int
 	DroppedDown      int
+	// Corrupted counts messages mangled at send. Some are then dropped en
+	// route for an unrelated reason — a partition opening, the target going
+	// down — and never reach a receiver at all.
+	//
+	// The invariant is CorruptArrived == CorruptDiscarded. Comparing against
+	// Corrupted instead reports a phantom leak every time a corrupt message
+	// is dropped by a partition, which reads exactly like a corrupt message
+	// reaching Step.
+	Corrupted        int
+	CorruptArrived   int
+	CorruptDiscarded int
 }
 
 // Close stops delivery and waits for in-flight messages to finish, so a test
@@ -220,6 +251,13 @@ func (t *transport) Send(m *raftpb.Message) {
 		n.mu.Unlock()
 		return
 	}
+	// Corrupt AFTER the drop decisions, so the two faults stay independent
+	// and each count means what it says.
+	corrupt := n.f.CorruptRate > 0 && n.rng.Float64() < n.f.CorruptRate
+	if corrupt {
+		b = corruptBytes(n.rng, b)
+		n.corrupted++
+	}
 	delay := n.pickDelayLocked()
 	step := n.recv[m.GetTo()]
 	n.wg.Add(1)
@@ -252,9 +290,31 @@ func (t *transport) Send(m *raftpb.Message) {
 		n.delivered++
 		n.mu.Unlock()
 
+		if corrupt {
+			n.mu.Lock()
+			n.corruptArrived++
+			n.mu.Unlock()
+		}
+
 		msg := &raftpb.Message{}
 		if proto.Unmarshal(b, msg) != nil {
-			return // corrupt → drop, never Step
+			// THE RULE: corrupt → drop, never Step. Handing a malformed
+			// message to the consensus module is how a network fault turns
+			// into a safety violation.
+			n.mu.Lock()
+			n.corruptDiscarded++
+			n.mu.Unlock()
+			return
+		}
+		if corrupt {
+			// Mangled bytes that still parsed. Protobuf is not
+			// self-validating, so this happens; discard it anyway. The claim
+			// is "nothing corrupt was Stepped", not "every mangled byte was
+			// detectable by the decoder".
+			n.mu.Lock()
+			n.corruptDiscarded++
+			n.mu.Unlock()
+			return
 		}
 		_ = step(context.Background(), msg)
 	}()
@@ -278,4 +338,23 @@ func (t *transport) Close() {
 	t.net.mu.Lock()
 	defer t.net.mu.Unlock()
 	delete(t.net.recv, t.id)
+}
+
+// corruptBytes mangles a serialized message the way a bad link would: flip a
+// byte, or truncate the frame. Drawn from the seeded RNG, so a given seed
+// corrupts the same messages the same way.
+func corruptBytes(rng *rand.Rand, b []byte) []byte {
+	if len(b) == 0 {
+		return b
+	}
+	out := make([]byte, len(b))
+	copy(out, b)
+	if rng.Intn(2) == 0 {
+		i := rng.Intn(len(out))
+		out[i] ^= byte(1 + rng.Intn(255))
+		return out
+	}
+	// Truncation is the more realistic failure and the one most likely to
+	// produce a partially-valid parse.
+	return out[:rng.Intn(len(out))]
 }

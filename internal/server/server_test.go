@@ -905,3 +905,39 @@ func TestRetryableProposeErrorsAreActedOnByTheClient(t *testing.T) {
 		})
 	}
 }
+
+// A proposal can fail to LAND as well as fail to commit, and both must reach
+// the caller as ErrProposalLost.
+//
+// Propose blocks until raft accepts the entry, so a busy or stalled node
+// returns the context deadline from Propose itself rather than from the
+// waiter. That path was returning a bare wrapped error, which the Tick
+// proposer does not tolerate — so a slow node PANICKED the process. Same bug
+// class as the original ticker panic, one layer down.
+func TestProposeTimeoutsAllClassifyAsLost(t *testing.T) {
+	s, _ := newTestService(t)
+
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"deadline from Propose", context.DeadlineExceeded},
+		{"cancelled propose", context.Canceled},
+		{"waiter timed out", ErrProposalLost},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rpcErr := s.proposeError(tc.err, "tick")
+			// Whatever the source, the ticker must survive it and the client
+			// must be told to retry.
+			tolerated := errors.Is(tc.err, ErrProposalLost) ||
+				errors.Is(tc.err, context.DeadlineExceeded) ||
+				errors.Is(tc.err, context.Canceled)
+			if !tolerated {
+				t.Fatalf("precondition: %v is not a timeout", tc.err)
+			}
+			if code := status.Code(rpcErr); code == codes.Internal {
+				t.Errorf("%v surfaced as Internal; clients will not retry", tc.err)
+			}
+		})
+	}
+}

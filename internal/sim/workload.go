@@ -2,7 +2,9 @@ package sim
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
+	"hash/fnv"
 
 	schedulerpb "github.com/evazheng/fault-tolerant-coordinator/proto/schedulerpb"
 )
@@ -87,14 +89,80 @@ func (s *Sim) drainSomeWork() {
 			_, _ = lead.svc.Heartbeat(context.Background(), &schedulerpb.HeartbeatRequest{
 				WorkerId: workerID, RunningTaskIds: []string{task.GetTaskId()},
 			})
-			_, _ = lead.svc.ReportResult(context.Background(), &schedulerpb.ReportResultRequest{
-				WorkerId: workerID, TaskId: task.GetTaskId(), Attempt: task.GetAttempt(),
-				ExitCode: 0, ResultRef: "/sim/" + workerID,
-			})
+			_, _ = lead.svc.ReportResult(context.Background(), s.outcomeFor(task, workerID))
 			progressed = true
 		}
 		if !progressed {
 			return
 		}
 	}
+}
+
+// outcomeFor decides whether this execution succeeded, by HASHING
+// (seed, taskID, attempt) rather than drawing from the run's RNG.
+//
+// Drawing would have been the obvious thing and it is wrong. The number of
+// draws depends on how many tasks happened to be drained in a step, which
+// depends on goroutine timing — so every workload draw shifts the fault RNG's
+// sequence and the FAULT SCHEDULE stops being reproducible. That is the one
+// property the whole harness is built to provide, and adding failures to the
+// workload broke it until this was derived instead.
+//
+// Hashing gives the same answer for the same task on the same seed, costs the
+// fault sequence nothing, and is the same trick the state machine already
+// uses for retry jitter.
+//
+// The split between retryable and terminal matters: a retryable failure sends
+// the task back to PENDING with a backoff deadline and must later be woken by
+// a BACKOFF_ELAPSED eval, while a non-retryable one goes straight to FAILED.
+// Those are different branches, and exercising one proves nothing about the
+// other.
+func (s *Sim) outcomeFor(task *schedulerpb.Task, workerID string) *schedulerpb.ReportResultRequest {
+	req := &schedulerpb.ReportResultRequest{
+		WorkerId: workerID,
+		TaskId:   task.GetTaskId(),
+		Attempt:  task.GetAttempt(),
+	}
+	roll, split := s.outcomeRolls(task.GetTaskId(), task.GetAttempt())
+	if s.cfg.FailureRate <= 0 || roll >= s.cfg.FailureRate {
+		req.ExitCode = 0
+		req.ResultRef = "/sim/" + workerID
+		s.result.Coverage.ReportedOK++
+		return req
+	}
+	if split < s.cfg.RetryableFraction {
+		req.ExitCode = 1
+		req.Error = "simulated transient failure"
+		req.Retryable = true
+		s.result.Coverage.ReportedRetryable++
+		return req
+	}
+	req.ExitCode = 2
+	req.Error = "simulated permanent failure"
+	req.Retryable = false
+	s.result.Coverage.ReportedTerminal++
+	return req
+}
+
+// outcomeRolls derives two independent [0,1) values from (seed, taskID,
+// attempt): one for whether the execution fails, one for which kind.
+//
+// Two separate hashes rather than one split in half, so the failure decision
+// and the retryable/terminal decision cannot correlate — a task that fails is
+// no more likely to fail terminally than any other.
+func (s *Sim) outcomeRolls(taskID string, attempt int32) (roll, split float64) {
+	return s.hashUnit(taskID, attempt, "fail"), s.hashUnit(taskID, attempt, "kind")
+}
+
+func (s *Sim) hashUnit(taskID string, attempt int32, salt string) float64 {
+	h := fnv.New64a()
+	var b [8]byte
+	binary.BigEndian.PutUint64(b[:], uint64(s.cfg.Seed))
+	_, _ = h.Write(b[:])
+	_, _ = h.Write([]byte(taskID))
+	binary.BigEndian.PutUint32(b[:4], uint32(attempt))
+	_, _ = h.Write(b[:4])
+	_, _ = h.Write([]byte(salt))
+	// Top 53 bits, the same way a float64 in [0,1) is normally built.
+	return float64(h.Sum64()>>11) / float64(1<<53)
 }

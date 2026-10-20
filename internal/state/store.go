@@ -47,24 +47,66 @@ const defaultMaxAttempts int32 = 3
 // defaultCapacity applies when a worker registers without declaring one. Like defaultMaxAttempts it must be a CONSTANT: a replica that defaulted differently would diverge
 const defaultCapacity int32 = 1
 
-// Retry backoff policy. These are CONSTANTS for the same reason as the two
-// above: the backoff deadline is computed inside apply, so a replica
-// configured with a different base would place tasks at different times and
-// diverge. Policy that affects state cannot be configuration.
-const (
-	baseBackoffMs int64 = 200
-	maxBackoffMs  int64 = 30_000
-)
-
-// sessionTTLMs bounds (clientID, requestID) dedup. Without it the sessions
-// map grows forever, which is a real leak in an always-on coordinator.
+// Policy holds the durations the state machine itself measures against its
+// Tick-carried clock.
 //
-// The honest consequence: dedup is bounded IN TIME, not absolute. A client
-// that retries a submission more than this long after the original would get
-// a second job. So the TTL must comfortably exceed any sane client retry
-// window, and the guarantee is worth stating that way rather than as
-// "exactly once, forever".
-const sessionTTLMs int64 = 10 * 60 * 1000 // 10 minutes
+// READ THIS BEFORE CHANGING IT. These are not per-node tuning knobs. They are
+// evaluated inside apply, so two replicas holding different values place tasks
+// at different times and expire sessions at different log positions — they
+// diverge, silently, and the divergence only becomes visible when a leader
+// change makes one node's version authoritative.
+//
+// They are injectable for exactly one reason: a simulated run spans under a
+// second of state-machine time, and at production values a 10-minute session
+// TTL and a 30-second backoff cap mean those paths NEVER execute. A verifier
+// that cannot reach a code path provides no evidence about it.
+//
+// The contract, therefore: ONE Policy per cluster, identical on every replica,
+// chosen before the log has data. It is deliberately NOT exposed as a
+// coordinator flag — that is where the footgun would live. Only programmatic
+// callers (the simulator) set it.
+//
+// The harness enforces this by accident and on purpose: the convergence check
+// compares encoded state across replicas, so a mismatched Policy shows up as
+// a divergence rather than as a mystery.
+type Policy struct {
+	// BaseBackoffMs is the first retry delay; it doubles per attempt.
+	BaseBackoffMs int64
+	// MaxBackoffMs caps it.
+	MaxBackoffMs int64
+	// SessionTTLMs bounds (clientID, requestID) dedup. Without it the
+	// sessions map grows forever, which is a real leak in an always-on
+	// coordinator.
+	//
+	// The honest consequence: dedup is bounded IN TIME, not absolute. A
+	// client retrying later than this gets a second job, so the TTL must
+	// comfortably exceed any sane client retry window.
+	SessionTTLMs int64
+}
+
+// DefaultPolicy is production. Changing these values changes the meaning of
+// logs already on disk, so treat them like a schema.
+func DefaultPolicy() Policy {
+	return Policy{
+		BaseBackoffMs: 200,
+		MaxBackoffMs:  30_000,
+		SessionTTLMs:  10 * 60 * 1000, // 10 minutes
+	}
+}
+
+func (p Policy) withDefaults() Policy {
+	d := DefaultPolicy()
+	if p.BaseBackoffMs <= 0 {
+		p.BaseBackoffMs = d.BaseBackoffMs
+	}
+	if p.MaxBackoffMs <= 0 {
+		p.MaxBackoffMs = d.MaxBackoffMs
+	}
+	if p.SessionTTLMs <= 0 {
+		p.SessionTTLMs = d.SessionTTLMs
+	}
+	return p
+}
 
 // TaskState and JobState are the state machine's own types, deliberately not the generated API enums. The API schema evolves for clients; this one evolves for the log. Conversion happens at the server boundary.
 type TaskState uint8
@@ -281,12 +323,22 @@ type StateStore struct {
 
 	// sessions maps (clientID, requestID) to the Result first produced for it, so a retried SubmitJob returns the original response instead of creating a second job.
 	//
-	// BOUNDED by Tick, on sessionTTLMs. The honest consequence is that dedup is bounded IN TIME, not absolute: a client retrying later than the TTL gets a second job
+	// BOUNDED by Tick, on Policy.SessionTTLMs. The honest consequence is that dedup is bounded IN TIME, not absolute: a client retrying later than the TTL gets a second job
 	sessions map[sessionKey]session
+
+	// policy is fixed at construction and never changes for the life of the
+	// store. It must be identical on every replica — see Policy.
+	policy Policy
 }
 
-func New() *StateStore {
+// New builds a store with production policy.
+func New() *StateStore { return NewWithPolicy(DefaultPolicy()) }
+
+// NewWithPolicy builds a store with the given durations. Every replica in a
+// cluster must use the same Policy.
+func NewWithPolicy(p Policy) *StateStore {
 	return &StateStore{
+		policy:   p.withDefaults(),
 		jobs:     make(map[string]*Job),
 		tasks:    make(map[string]*Task),
 		workers:  make(map[string]*Worker),
@@ -593,7 +645,7 @@ func (s *StateStore) applyTick(c *commandpb.Tick) (Result, error) {
 		}
 	}
 	for key, sess := range s.sessions {
-		if sess.createdMs+sessionTTLMs < now {
+		if sess.createdMs+s.policy.SessionTTLMs < now {
 			delete(s.sessions, key)
 		}
 	}
@@ -857,7 +909,7 @@ func (s *StateStore) applyFailTask(c *commandpb.FailTask) (Result, error) {
 		// trying again. Lease expiry deliberately does NOT do this: there the
 		// worker died, the task never got its chance, and the reclaim budget
 		// ("within 3s of a missed heartbeat") has no room for a backoff.
-		t.NotBeforeMs = s.nowMs + backoffFor(t.ID, t.Attempt)
+		t.NotBeforeMs = s.nowMs + s.backoffFor(t.ID, t.Attempt)
 		res.EvalTriggers = append(res.EvalTriggers, EvalTrigger{
 			JobID:   t.JobID,
 			TaskID:  t.ID,
@@ -992,16 +1044,16 @@ func (s *StateStore) SessionCount() int { return len(s.sessions) }
 // lockstep. That is the property jitter is actually for.
 //
 // Exponential in the attempt number, capped, plus up to 50% spread.
-func backoffFor(taskID string, attempt int32) int64 {
+func (s *StateStore) backoffFor(taskID string, attempt int32) int64 {
 	if attempt < 1 {
 		attempt = 1
 	}
-	base := baseBackoffMs
-	for i := int32(1); i < attempt && base < maxBackoffMs; i++ {
+	base := s.policy.BaseBackoffMs
+	for i := int32(1); i < attempt && base < s.policy.MaxBackoffMs; i++ {
 		base *= 2
 	}
-	if base > maxBackoffMs {
-		base = maxBackoffMs
+	if base > s.policy.MaxBackoffMs {
+		base = s.policy.MaxBackoffMs
 	}
 
 	h := fnv.New64a()
