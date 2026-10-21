@@ -598,10 +598,14 @@ func (s *Sim) checkLinearizable() LinResult {
 		s.result.Violations = append(s.result.Violations,
 			Violation{Seed: s.cfg.Seed, Step: s.result.Steps, What: what})
 	case porcupine.Unknown:
+		what := fmt.Sprintf("linearizability search did not finish in %s over %d operations — "+
+			"no verdict, not a pass", s.cfg.LinCheckTimeout, res.Ops)
+		if res.Empty {
+			what = "no client operations were recorded, so linearizability was not checked at all — " +
+				"no verdict, not a pass"
+		}
 		s.result.Violations = append(s.result.Violations, Violation{
-			Seed: s.cfg.Seed, Step: s.result.Steps, Inconclusive: true,
-			What: fmt.Sprintf("linearizability search did not finish in %s over %d operations — "+
-				"no verdict, not a pass", s.cfg.LinCheckTimeout, res.Ops),
+			Seed: s.cfg.Seed, Step: s.result.Steps, Inconclusive: true, What: what,
 		})
 	}
 	return res

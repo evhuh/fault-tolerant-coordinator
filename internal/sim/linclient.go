@@ -124,8 +124,19 @@ func (s *Sim) linClient(ctx context.Context, client int) {
 
 		n, split := s.pickLeaderClaimant(rng)
 		if n == nil {
-			continue // mid-election; nobody will answer, so nothing happened
+			// Mid-election: nobody will answer, so nothing happened and
+			// NOTHING IS SPENT. Consuming the budget here produced empty
+			// histories — on short steps the cluster is between leaders
+			// whenever the budget refreshes, all of it burned in
+			// microseconds against a leaderless cluster, and the run
+			// recorded zero operations while looking like it had checked
+			// something.
+			if !s.linIdle(ctx) {
+				return
+			}
+			continue
 		}
+		budget.spend()
 		// Sampled at invocation, before the call: by the time it returns the
 		// partition may have healed, and the question is where the operation
 		// LANDED.
@@ -157,13 +168,32 @@ func (s *Sim) linClient(ctx context.Context, client int) {
 // construction: at most OpsPerStep operations per client per step, however
 // long or short a step turns out to take. The total is then bounded by
 // Steps x Clients x OpsPerStep and known before the run starts.
+//
+// The budget is SPENT on an operation issued, not on an attempt. Those are
+// different, and conflating them is what made short runs record nothing at
+// all.
 type linBudget struct {
 	step int64
 	left int
 }
 
+func (b *linBudget) spend() { b.left-- }
+
+// linIdle waits out a moment when there is nothing to talk to. Reports false
+// when the run is over.
+func (s *Sim) linIdle(ctx context.Context) bool {
+	t := time.NewTimer(2 * time.Millisecond)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
+}
+
 // awaitLinBudget blocks until this client may issue another operation. It
-// returns false when the run is over.
+// does NOT consume it; the caller spends it once it has something to call.
 func (s *Sim) awaitLinBudget(ctx context.Context, b *linBudget) bool {
 	for {
 		if step := s.stepNo.Load(); step != b.step {
@@ -171,7 +201,6 @@ func (s *Sim) awaitLinBudget(ctx context.Context, b *linBudget) bool {
 			b.left = s.cfg.LinOpsPerStep
 		}
 		if b.left > 0 {
-			b.left--
 			return true
 		}
 		// Budget spent for this step. Wait for the next one.

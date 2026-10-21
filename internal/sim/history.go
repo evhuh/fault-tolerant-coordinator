@@ -162,6 +162,9 @@ type LinResult struct {
 	// Rejected counts definitive InvalidArgument responses. This workload
 	// only ever sends valid requests, so a nonzero count is itself a finding.
 	Rejected int
+	// Empty means no operations were recorded at all, so there was nothing
+	// to check. Distinct from a search that timed out.
+	Empty bool
 	// VizPath is the HTML timeline, written only on a failure.
 	VizPath string
 	Elapsed time.Duration
@@ -193,8 +196,13 @@ func (h *history) check(timeout time.Duration, vizDir string) LinResult {
 			res.Gets++
 		}
 	}
+	// An empty history is not a timed-out search, and the first version
+	// reported it as one: "search did not finish in 20s over 0 operations",
+	// a sentence describing a search that never ran. Both are inconclusive,
+	// but they have different causes and different fixes.
 	if len(ops) == 0 {
 		res.Verdict = porcupine.Unknown
+		res.Empty = true
 		return res
 	}
 
