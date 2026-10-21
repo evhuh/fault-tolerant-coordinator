@@ -1,6 +1,7 @@
 package sim
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -40,7 +41,7 @@ func (s *Sim) checkInvariants(step int) []Violation {
 	// behind. Checked across every node, not just the leader: a follower's
 	// loop stalling is the same bug.
 	for id := uint64(1); id <= uint64(s.cfg.Nodes); id++ {
-		n, up := s.nodes[id]
+		n, up := s.nodeAt(id)
 		if !up {
 			continue
 		}
@@ -74,14 +75,30 @@ func (s *Sim) checkInvariants(step int) []Violation {
 	// partition or across a leadership change legitimately fail, so one
 	// stalled step is ordinary; several in a row with a leader present is
 	// not. At ~3 ticks per step, this is roughly 15 consecutive missed ticks.
-	if nowMs := s.stateClock(lead); nowMs == s.lastClock && s.lastClock > 0 {
+	//
+	// A CUT-OFF leader is exempt, and Day 9 is what made that necessary. The
+	// streak was calibrated against partitions that the next quiet step
+	// healed; held leader partitions keep a minority leader in place for
+	// several steps, and a minority leader's clock is frozen because its
+	// ticks cannot commit. That is the system behaving correctly — the
+	// frozen clock is the SYMPTOM of a working quorum rule — and firing here
+	// would mean the harness reporting a violation for an induced fault
+	// doing exactly what it was induced to do.
+	//
+	// The streak is reset rather than merely not reported, so the steps
+	// either side of the partition are not stitched into one false streak.
+	switch nowMs := s.stateClock(lead); {
+	case s.net.IsPartitioned(lead.id):
+		s.clockFrozenSteps = 0
+		s.lastClock = nowMs
+	case nowMs == s.lastClock && s.lastClock > 0:
 		s.clockFrozenSteps++
 		if s.clockFrozenSteps >= frozenClockSteps {
 			add("leader's state-machine clock stuck at %d for %d consecutive steps "+
 				"(%d tick failures) — ticks are being dropped silently, so no lease will ever expire",
 				nowMs, s.clockFrozenSteps, lead.coord.TickFailures())
 		}
-	} else {
+	default:
 		s.clockFrozenSteps = 0
 		s.lastClock = nowMs
 	}
@@ -236,7 +253,7 @@ func (s *Sim) sampleDivergence(within time.Duration) (diffs []string, comparison
 
 	for time.Now().Before(deadline) {
 		for id := uint64(1); id <= uint64(s.cfg.Nodes); id++ {
-			n, up := s.nodes[id]
+			n, up := s.nodeAt(id)
 			if !up {
 				continue
 			}
@@ -308,6 +325,12 @@ func (s *Sim) recordCoverage() {
 	if lead == nil {
 		return
 	}
+
+	// Under s.mu because this now runs from the background sampler as well
+	// as from the Run goroutine between steps.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	lead.coord.ReadState(func(st *state.StateStore) {
 		now := st.NowMs()
 		for _, id := range st.TaskIDs() {
@@ -336,6 +359,34 @@ func (s *Sim) recordCoverage() {
 	s.result.Coverage.TasksRedispatched = len(s.seenRetried)
 	s.result.Coverage.TasksBackedOff = len(s.seenBackoff)
 	s.result.Coverage.TasksTerminalFail = len(s.seenFailed)
+}
+
+// sampleCoverage polls for coverage continuously until ctx is done.
+//
+// A live retry backoff is the one thing here that cannot be observed after
+// the fact: NotBeforeMs is CLEARED the moment the Tick sweep wakes the task,
+// so a task that backed off and resumed leaves no trace in committed state.
+// Sampling between steps therefore measures luck — at a 25ms base backoff
+// against steps that take hundreds of milliseconds, two looks per step miss
+// it almost every time, and the aggregate across four seeds sat at 0-5,
+// which is a coverage assertion that fails on timing rather than on a
+// regression. Polling fast enough to be shorter than the shortest backoff
+// makes the number mean what it says.
+func (s *Sim) sampleCoverage(ctx context.Context) {
+	iv := s.cfg.CoverageSampleInterval
+	if iv <= 0 {
+		return
+	}
+	t := time.NewTicker(iv)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			s.recordCoverage()
+		}
+	}
 }
 
 // frozenClockSteps is how many consecutive steps a leader's clock may fail to

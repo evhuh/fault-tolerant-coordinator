@@ -148,6 +148,18 @@ func (n *Network) Partition(ids ...uint64) {
 // Heal removes every partition.
 func (n *Network) Heal() { n.Partition() }
 
+// IsPartitioned reports whether this node is currently cut off.
+//
+// Exported for COVERAGE, not for routing. A linearizability verdict over a
+// history in which no operation ever reached a cut-off node is a verdict
+// about a healthy cluster, which is trivially linearizable; the harness has
+// to be able to say how many operations actually landed on one.
+func (n *Network) IsPartitioned(id uint64) bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.partitioned[id]
+}
+
 // SetDown marks a node stopped or started. A down node neither sends nor
 // receives, and unlike a partition it is not coming back on its own.
 func (n *Network) SetDown(id uint64, down bool) {

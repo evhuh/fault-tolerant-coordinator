@@ -37,6 +37,10 @@ func main() {
 	failureRate := flag.Float64("failure-rate", 0.15, "fraction of task executions that report failure")
 	maxDelay := flag.Duration("max-delay", 5*time.Millisecond, "upper bound on message delay")
 	stepTime := flag.Duration("step-time", 150*time.Millisecond, "wall time the cluster runs per step")
+	linClients := flag.Int("lin-clients", 3,
+		"history-recording clients for the linearizability check; 0 disables it")
+	linVizDir := flag.String("lin-viz-dir", "",
+		"directory for the HTML timeline written when a history is not linearizable")
 	verbose := flag.Bool("v", false, "log every fault as it is applied")
 	flag.Parse()
 
@@ -60,7 +64,7 @@ func main() {
 	for i := 0; i < *runs; i++ {
 		s := seed + int64(i)
 		if err := runOne(ctx, s, *steps, *nodes, *dropRate, *corruptRate, *failureRate,
-			*deliverCorrupt, *maxDelay, *stepTime, *verbose); err != nil {
+			*deliverCorrupt, *maxDelay, *stepTime, *verbose, *linClients, *linVizDir); err != nil {
 			failures++
 			fmt.Printf("\nFAILED  seed=%d\n", s)
 			fmt.Printf("  %v\n", err)
@@ -79,7 +83,8 @@ func main() {
 }
 
 func runOne(ctx context.Context, seed int64, steps, nodes int, dropRate, corruptRate, failureRate float64,
-	deliverCorrupt bool, maxDelay, stepTime time.Duration, verbose bool) error {
+	deliverCorrupt bool, maxDelay, stepTime time.Duration, verbose bool,
+	linClients int, linVizDir string) error {
 
 	dir, err := os.MkdirTemp("", fmt.Sprintf("sim-%d-", seed))
 	if err != nil {
@@ -106,6 +111,8 @@ func runOne(ctx context.Context, seed int64, steps, nodes int, dropRate, corrupt
 		DeliverCorrupt: deliverCorrupt, MaxDelay: maxDelay,
 	}
 	cfg.FailureRate = failureRate
+	cfg.LinClients = linClients
+	cfg.LinVizDir = linVizDir
 	cfg.Out = io.Discard
 	if verbose {
 		cfg.Out = os.Stdout
@@ -122,8 +129,9 @@ func runOne(ctx context.Context, seed int64, steps, nodes int, dropRate, corrupt
 	}
 	n, c := res.Faults.Net, res.Coverage
 	fmt.Printf("ok (%s)\n", elapsed)
-	fmt.Printf("    faults:   kills=%d restarts=%d partitions=%d heals=%d\n",
-		res.Faults.NodeKills, res.Faults.NodeRestarts, res.Faults.Partitions, res.Faults.Heals)
+	fmt.Printf("    faults:   kills=%d restarts=%d partitions=%d (%d of the leader) heals=%d\n",
+		res.Faults.NodeKills, res.Faults.NodeRestarts, res.Faults.Partitions,
+		res.Faults.LeaderPartitions, res.Faults.Heals)
 	fmt.Printf("    messages: sent=%d delivered=%d  dropped: random=%d partition=%d node-down=%d  corrupt: %d mangled, %d dropped at link, %d delivered (%d refused by decoder, %d reached raft)\n",
 		n.Sent, n.Delivered, n.DroppedRandom, n.DroppedPartition, n.DroppedDown,
 		n.Corrupted, n.CorruptDroppedAtLink, n.CorruptDelivered,
@@ -135,5 +143,32 @@ func runOne(ctx context.Context, seed int64, steps, nodes int, dropRate, corrupt
 	fmt.Printf("    exercised: redispatched=%d backed-off=%d reached-FAILED=%d sessions-expired=%d\n",
 		c.TasksRedispatched, c.TasksBackedOff, c.TasksTerminalFail, c.SessionsExpired)
 	fmt.Printf("    state:    jobs=%d tasks=%d\n", res.Jobs, res.Tasks)
+	if l := res.Lin; l.Checked {
+		// The verdict is printed with the history's shape next to it on
+		// purpose. "Ok" over 12 operations is not the same evidence as "Ok"
+		// over 900, and a history that is mostly ambiguous checked very
+		// little regardless of its verdict.
+		fmt.Printf("    linearizable: %s  (%d ops: %d submits, %d gets; checked in %s)\n",
+			l.Verdict, l.Ops, l.Submits, l.Gets, l.Elapsed.Round(time.Millisecond))
+		// The ambiguous SHARE, not just the count. An ambiguous operation
+		// constrains nothing, so this is how much of the verdict is real.
+		fmt.Printf("      ambiguous: %d of %d ops (%.0f%%) returned without telling the client whether they took effect\n",
+			l.Ambiguous, l.Ops, l.AmbiguousShare()*100)
+		// Where the operations landed. A verdict over a history that never
+		// touched a cut-off node is a verdict about a healthy cluster.
+		fmt.Printf("      reached:  %d ops on a partitioned node, %d while two nodes claimed leadership\n",
+			l.Partitioned, l.SplitBrain)
+		if l.Dropped > 0 {
+			fmt.Printf("      NOTE: %d operations past the history cap were not recorded; "+
+				"the verdict covers the recorded prefix only\n", l.Dropped)
+		}
+		if l.Rejected > 0 {
+			fmt.Printf("      NOTE: %d submits were rejected as invalid; this workload only sends valid requests\n",
+				l.Rejected)
+		}
+		if l.VizPath != "" {
+			fmt.Printf("      timeline: %s\n", l.VizPath)
+		}
+	}
 	return nil
 }
