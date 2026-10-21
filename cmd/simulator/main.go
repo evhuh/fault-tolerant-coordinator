@@ -31,6 +31,9 @@ func main() {
 	nodes := flag.Int("nodes", 3, "coordinator nodes")
 	dropRate := flag.Float64("drop-rate", 0.02, "probability a raft message is dropped")
 	corruptRate := flag.Float64("corrupt-rate", 0.01, "probability a raft message's bytes are mangled in flight")
+	deliverCorrupt := flag.Bool("deliver-corrupt", false,
+		"deliver mangled frames instead of dropping them at the link; OUTSIDE raft's fault model, "+
+			"excluded from correctness claims")
 	failureRate := flag.Float64("failure-rate", 0.15, "fraction of task executions that report failure")
 	maxDelay := flag.Duration("max-delay", 5*time.Millisecond, "upper bound on message delay")
 	stepTime := flag.Duration("step-time", 150*time.Millisecond, "wall time the cluster runs per step")
@@ -56,7 +59,8 @@ func main() {
 	failures := 0
 	for i := 0; i < *runs; i++ {
 		s := seed + int64(i)
-		if err := runOne(ctx, s, *steps, *nodes, *dropRate, *corruptRate, *failureRate, *maxDelay, *stepTime, *verbose); err != nil {
+		if err := runOne(ctx, s, *steps, *nodes, *dropRate, *corruptRate, *failureRate,
+			*deliverCorrupt, *maxDelay, *stepTime, *verbose); err != nil {
 			failures++
 			fmt.Printf("\nFAILED  seed=%d\n", s)
 			fmt.Printf("  %v\n", err)
@@ -75,7 +79,7 @@ func main() {
 }
 
 func runOne(ctx context.Context, seed int64, steps, nodes int, dropRate, corruptRate, failureRate float64,
-	maxDelay, stepTime time.Duration, verbose bool) error {
+	deliverCorrupt bool, maxDelay, stepTime time.Duration, verbose bool) error {
 
 	dir, err := os.MkdirTemp("", fmt.Sprintf("sim-%d-", seed))
 	if err != nil {
@@ -97,7 +101,10 @@ func runOne(ctx context.Context, seed int64, steps, nodes int, dropRate, corrupt
 	cfg.Nodes = nodes
 	cfg.Steps = steps
 	cfg.StepTime = stepTime
-	cfg.Faults = simnet.Faults{DropRate: dropRate, CorruptRate: corruptRate, MaxDelay: maxDelay}
+	cfg.Faults = simnet.Faults{
+		DropRate: dropRate, CorruptRate: corruptRate,
+		DeliverCorrupt: deliverCorrupt, MaxDelay: maxDelay,
+	}
 	cfg.FailureRate = failureRate
 	cfg.Out = io.Discard
 	if verbose {
@@ -117,9 +124,10 @@ func runOne(ctx context.Context, seed int64, steps, nodes int, dropRate, corrupt
 	fmt.Printf("ok (%s)\n", elapsed)
 	fmt.Printf("    faults:   kills=%d restarts=%d partitions=%d heals=%d\n",
 		res.Faults.NodeKills, res.Faults.NodeRestarts, res.Faults.Partitions, res.Faults.Heals)
-	fmt.Printf("    messages: sent=%d delivered=%d  dropped: random=%d partition=%d node-down=%d  corrupt: %d sent, %d arrived, %d refused by decoder, %d by guard\n",
+	fmt.Printf("    messages: sent=%d delivered=%d  dropped: random=%d partition=%d node-down=%d  corrupt: %d mangled, %d dropped at link, %d delivered (%d refused by decoder, %d reached raft)\n",
 		n.Sent, n.Delivered, n.DroppedRandom, n.DroppedPartition, n.DroppedDown,
-		n.Corrupted, n.CorruptArrived, n.CorruptRejectedByDecoder, n.CorruptRejectedByGuard)
+		n.Corrupted, n.CorruptDroppedAtLink, n.CorruptDelivered,
+		n.CorruptRejectedByDecoder, n.CorruptReachedStep)
 	// Coverage, not configuration: which paths this run actually reached.
 	// "Zero violations" is only evidence about code that executed.
 	fmt.Printf("    reported: ok=%d retryable-fail=%d terminal-fail=%d\n",

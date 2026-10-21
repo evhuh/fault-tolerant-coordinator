@@ -37,6 +37,24 @@ type Faults struct {
 	// Raft tolerates this by design; the point is to make it happen often
 	// enough to matter.
 	DropRate float64
+	// DeliverCorrupt controls what happens to a mangled frame. OFF by
+	// default, because the default has to stay inside raft's fault model.
+	//
+	// Raft assumes a message arrives INTACT OR NOT AT ALL. It has no message
+	// checksums, so a frame that is mangled but still decodes into something
+	// plausible — a wrong index or term in an otherwise well-formed MsgApp
+	// from a real peer — is a BYZANTINE fault, and raft makes no claim to
+	// survive one. A corrupted MsgApp payload can be appended to a log.
+	//
+	// So by default a corrupted frame is dropped at the link, which is what
+	// production actually gets from TCP checksums and TLS. That keeps "zero
+	// violations across N seeds" a statement about raft's real guarantees
+	// rather than about an adversary it never promised to handle.
+	//
+	// Turning this on delivers them. Any violation found that way is a
+	// harness artifact unless the run is specifically a study of
+	// undetectable corruption; correctness runs leave it off.
+	DeliverCorrupt bool
 	// CorruptRate is the probability a message's bytes are mangled in
 	// flight, 0..1.
 	//
@@ -82,18 +100,18 @@ type Network struct {
 	// together produces a "drop rate" that is mostly messages to a node that
 	// is switched off, which is not a network fault at all — and a metric
 	// that reports 33% when 2% was configured is worse than no metric.
-	sent, delivered  int
-	droppedRandom    int // the configured drop rate
-	droppedPartition int // crossed a partition
-	droppedDown      int // addressed to a stopped node
-	corrupted        int // bytes mangled at send
-	corruptArrived   int // ...and actually reached a receiver
-	// Why each arrival was refused, kept apart because they test DIFFERENT
-	// things: one proves the decoder rejects garbage, the other proves the
-	// plausibility guard rejects garbage that decoded fine. A single
-	// "discarded" number cannot tell you whether the second ever ran.
+	sent, delivered      int
+	droppedRandom        int // the configured drop rate
+	droppedPartition     int // crossed a partition
+	droppedDown          int // addressed to a stopped node
+	corrupted            int // bytes mangled at send
+	corruptDroppedAtLink int // ...and discarded by link integrity (the default)
+	corruptDelivered     int // ...or handed to a receiver, under DeliverCorrupt
+	// Of those delivered: refused by the decoder, versus decoded cleanly and
+	// Stepped. The second is the Byzantine case and must be zero in any run
+	// whose results are being claimed.
 	corruptRejectedByDecoder int
-	corruptRejectedByGuard   int
+	corruptReachedStep       int
 }
 
 func New(seed int64, f Faults) *Network {
@@ -148,9 +166,10 @@ func (n *Network) Stats() Stats {
 		DroppedPartition:         n.droppedPartition,
 		DroppedDown:              n.droppedDown,
 		Corrupted:                n.corrupted,
-		CorruptArrived:           n.corruptArrived,
+		CorruptDroppedAtLink:     n.corruptDroppedAtLink,
+		CorruptDelivered:         n.corruptDelivered,
 		CorruptRejectedByDecoder: n.corruptRejectedByDecoder,
-		CorruptRejectedByGuard:   n.corruptRejectedByGuard,
+		CorruptReachedStep:       n.corruptReachedStep,
 	}
 }
 
@@ -164,19 +183,21 @@ type Stats struct {
 	// route for an unrelated reason — a partition opening, the target going
 	// down — and never reach a receiver at all.
 	//
-	// The invariant is CorruptArrived == CorruptRejectedByDecoder +
-	// CorruptRejectedByGuard. Comparing against Corrupted instead reports a
-	// phantom leak every time a corrupt message is dropped by a partition,
-	// which reads exactly like a corrupt message reaching Step.
+	// Corrupted counts frames mangled at send. By DEFAULT every one is then
+	// dropped at the link, so CorruptDroppedAtLink == Corrupted and
+	// CorruptDelivered == 0 — which is what keeps a run inside the fault
+	// model raft actually claims to handle.
 	//
-	// The two rejection reasons are separate because they exercise different
-	// code: the decoder refusing malformed bytes, and the plausibility guard
-	// refusing bytes that decoded into something a peer could not have sent.
-	// Summing them would hide a run in which the guard never ran at all.
-	Corrupted                int
-	CorruptArrived           int
+	// CorruptReachedStep is the number that decides whether a run's results
+	// can be claimed: frames that were mangled, decoded anyway, and were
+	// handed to raft. That is a Byzantine fault, and a correctness run must
+	// report ZERO.
+	Corrupted            int
+	CorruptDroppedAtLink int
+	CorruptDelivered     int
+
 	CorruptRejectedByDecoder int
-	CorruptRejectedByGuard   int
+	CorruptReachedStep       int
 }
 
 // Close stops delivery and waits for in-flight messages to finish, so a test
@@ -269,6 +290,16 @@ func (t *transport) Send(m *raftpb.Message) {
 	if corrupt {
 		b = corruptBytes(n.rng, b)
 		n.corrupted++
+		if !n.f.DeliverCorrupt {
+			// LINK INTEGRITY, the default. A failed checksum discards the
+			// frame before anything upstream sees it — what TCP and TLS give
+			// production, and what keeps this run inside the fault model
+			// raft actually claims to handle.
+			n.corruptDroppedAtLink++
+			n.mu.Unlock()
+			return
+		}
+		n.corruptDelivered++
 	}
 	delay := n.pickDelayLocked()
 	step := n.recv[m.GetTo()]
@@ -302,12 +333,6 @@ func (t *transport) Send(m *raftpb.Message) {
 		n.delivered++
 		n.mu.Unlock()
 
-		if corrupt {
-			n.mu.Lock()
-			n.corruptArrived++
-			n.mu.Unlock()
-		}
-
 		msg := &raftpb.Message{}
 		if proto.Unmarshal(b, msg) != nil {
 			// THE RULE: corrupt → drop, never Step. Handing a malformed
@@ -319,15 +344,16 @@ func (t *transport) Send(m *raftpb.Message) {
 			return
 		}
 		if corrupt {
-			// Mangled bytes that still PARSED. Protobuf is not
-			// self-validating, so this is common — a flipped byte often
-			// lands in a field value rather than in the framing. Counted
-			// separately because it is the case the decoder cannot catch and
-			// something above it must.
+			// Mangled bytes that still PARSED, and DeliverCorrupt is on, so
+			// they go to raft. Protobuf is not self-validating — a flipped
+			// byte often lands in a field value rather than in the framing —
+			// and raft has no checksum to catch it.
+			//
+			// THE BYZANTINE CASE. Counted loudly, because a run with a
+			// nonzero value here cannot support a correctness claim.
 			n.mu.Lock()
-			n.corruptRejectedByGuard++
+			n.corruptReachedStep++
 			n.mu.Unlock()
-			return
 		}
 		_ = step(context.Background(), msg)
 	}()

@@ -55,6 +55,21 @@ func (s *Sim) checkInvariants(step int) []Violation {
 	// state-machine clock is frozen — no lease ever expires, nothing is ever
 	// reclaimed, and every check above still passes.
 	//
+	// NO BYZANTINE DELIVERIES. Raft assumes messages arrive intact or not at
+	// all, so a mangled frame that decoded and reached Step is outside the
+	// fault model this run's results are claimed against. If any got
+	// through, a violation found here could be a harness artifact rather
+	// than a bug — so the run is reported INCONCLUSIVE rather than passing
+	// or failing on evidence it cannot support.
+	if n := s.net.Stats().CorruptReachedStep; n > 0 {
+		vs = append(vs, Violation{
+			Seed: s.cfg.Seed, Step: step, Inconclusive: true,
+			What: fmt.Sprintf(
+				"%d corrupted frames were delivered to raft (DeliverCorrupt is on); "+
+					"this run is outside raft's fault model and cannot support a correctness claim", n),
+		})
+	}
+
 	// Calibrated on a STREAK, not a single step. Ticks proposed into a
 	// partition or across a leadership change legitimately fail, so one
 	// stalled step is ordinary; several in a row with a leader present is

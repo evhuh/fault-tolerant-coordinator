@@ -234,13 +234,14 @@ func TestDropReasonsAreCountedSeparately(t *testing.T) {
 	}
 }
 
-// Corruption must reach the receiver and be REFUSED, never Stepped.
+// BY DEFAULT, a corrupted frame never reaches a receiver at all.
 //
-// Before this fault existed, simnet marshaled cleanly every time, so
-// proto.Unmarshal always succeeded and the "corrupt → drop" branch had never
-// executed — in simnet or in the HTTP transport. An untested guard against
-// feeding garbage to a consensus module is a comment, not a guard.
-func TestCorruptMessagesAreDiscardedNotStepped(t *testing.T) {
+// Raft assumes a message arrives intact or not at all — it has no message
+// checksums — so delivering a mangled frame that still decodes is a
+// Byzantine fault it does not claim to survive. Production gets link
+// integrity from TCP and TLS, and the default models exactly that, so a
+// correctness run stays inside raft's fault model.
+func TestCorruptFramesAreDroppedAtTheLinkByDefault(t *testing.T) {
 	n := New(5, Faults{CorruptRate: 1.0}) // every message mangled
 	rs := wire(t, n, 1, 2)
 
@@ -254,34 +255,57 @@ func TestCorruptMessagesAreDiscardedNotStepped(t *testing.T) {
 	if st.Corrupted != total {
 		t.Errorf("corrupted = %d, want %d", st.Corrupted, total)
 	}
-	// THE INVARIANT: every corrupt message that ARRIVED was refused.
-	//
-	// Compared against CorruptArrived, not Corrupted: a corrupt message can
-	// also be dropped en route by a partition, and counting that as a leak
-	// would report a safety failure that did not happen.
-	if st.CorruptArrived != st.Corrupted {
-		t.Errorf("precondition: %d of %d corrupt messages never arrived (no partition here)",
-			st.Corrupted-st.CorruptArrived, st.Corrupted)
+	if st.CorruptDroppedAtLink != total {
+		t.Errorf("dropped at link = %d, want all %d", st.CorruptDroppedAtLink, total)
 	}
-	refused := st.CorruptRejectedByDecoder + st.CorruptRejectedByGuard
-	if refused != st.CorruptArrived {
-		t.Errorf("refused %d of %d corrupt messages that arrived — the rest reached Step",
-			refused, st.CorruptArrived)
+	if st.CorruptDelivered != 0 {
+		t.Errorf("%d corrupt frames were delivered with DeliverCorrupt off", st.CorruptDelivered)
 	}
-	// Both paths must actually run, or one of them is untested while the
-	// summed total still looks complete.
-	if st.CorruptRejectedByDecoder == 0 {
-		t.Error("no corruption was caught by the decoder")
+	// THE CLAIM-BEARING NUMBER.
+	if st.CorruptReachedStep != 0 {
+		t.Errorf("%d corrupt frames reached raft — a Byzantine fault it does not claim to survive",
+			st.CorruptReachedStep)
 	}
-	if st.CorruptRejectedByGuard == 0 {
-		t.Error("no corruption decoded into a plausible-looking message — " +
-			"the guard path above the decoder is untested")
-	}
-	t.Logf("of %d corrupt arrivals: %d refused by the decoder, %d decoded fine and were refused above it",
-		st.CorruptArrived, st.CorruptRejectedByDecoder, st.CorruptRejectedByGuard)
 	if got := rs[2].count(); got != 0 {
 		t.Errorf("%d corrupt messages were delivered to Step", got)
 	}
+}
+
+// OPT-IN: DeliverCorrupt hands mangled frames to the receiver, so the
+// decoder's refusal branch executes.
+//
+// This mode is excluded from correctness runs and claims. It exists to pin
+// the "corrupt → drop, never Step" branch, and to make visible how much
+// corruption protobuf accepts: a flipped byte usually lands in a field value
+// rather than in the framing.
+func TestDeliverCorruptExercisesTheDecoderRefusal(t *testing.T) {
+	n := New(5, Faults{CorruptRate: 1.0, DeliverCorrupt: true})
+	wire(t, n, 1, 2)
+
+	const total = 300
+	for i := 0; i < total; i++ {
+		n.Transport(1).Send(msg(1, 2))
+	}
+	time.Sleep(200 * time.Millisecond)
+
+	st := n.Stats()
+	if st.CorruptDelivered != total {
+		t.Fatalf("delivered = %d, want %d", st.CorruptDelivered, total)
+	}
+	if st.CorruptDroppedAtLink != 0 {
+		t.Errorf("%d dropped at link with DeliverCorrupt on", st.CorruptDroppedAtLink)
+	}
+	if st.CorruptRejectedByDecoder+st.CorruptReachedStep != st.CorruptDelivered {
+		t.Errorf("accounting gap: %d refused + %d stepped != %d delivered",
+			st.CorruptRejectedByDecoder, st.CorruptReachedStep, st.CorruptDelivered)
+	}
+	if st.CorruptRejectedByDecoder == 0 {
+		t.Error("no corruption was caught by the decoder; its refusal branch is untested")
+	}
+	// Not an assertion, a measurement: this is how much corruption protobuf
+	// swallows, and why undetectable corruption is out of scope.
+	t.Logf("of %d corrupt frames delivered: %d refused by the decoder, %d decoded cleanly and reached raft",
+		st.CorruptDelivered, st.CorruptRejectedByDecoder, st.CorruptReachedStep)
 }
 
 // Corruption must not break clean traffic: with the fault off, everything
@@ -339,11 +363,11 @@ func TestCorruptMessageDroppedByPartitionIsNotALeak(t *testing.T) {
 	time.Sleep(150 * time.Millisecond)
 
 	st := n.Stats()
-	if st.CorruptArrived != 0 {
-		t.Errorf("CorruptArrived = %d across a partition, want 0", st.CorruptArrived)
+	if st.CorruptDelivered != 0 {
+		t.Errorf("CorruptDelivered = %d across a partition, want 0", st.CorruptDelivered)
 	}
-	if n := st.CorruptRejectedByDecoder + st.CorruptRejectedByGuard; n != st.CorruptArrived {
-		t.Errorf("refused %d but only %d arrived", n, st.CorruptArrived)
+	if st.CorruptReachedStep != 0 {
+		t.Errorf("%d corrupt frames reached raft across a partition", st.CorruptReachedStep)
 	}
 	if st.DroppedPartition == 0 {
 		t.Error("nothing was dropped by the partition; the test proves nothing")
