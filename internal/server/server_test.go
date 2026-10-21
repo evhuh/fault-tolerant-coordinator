@@ -1010,3 +1010,143 @@ func TestDroppedTicksAreCounted(t *testing.T) {
 		t.Errorf("TickFailures = %d, want 2", got)
 	}
 }
+
+// THE RETRY PATH, END TO END AND PINNED.
+//
+// PENDING → backoff → BACKOFF_ELAPSED → redispatch at attempt+1.
+//
+// The simulator reaches this path, but by SAMPLING: whether a given seed
+// fails a task, and whether the sampler catches the backoff before it
+// elapses, both vary — one seed reported zero backoffs. A path that is only
+// sometimes covered is not pinned, and a regression would show up as a seed
+// that "happened not to exercise it".
+//
+// This drives every transition explicitly, with a controlled clock.
+func TestRetryBackoffCycleEndToEnd(t *testing.T) {
+	s, clk := newTestService(t)
+	register(t, s, "w-1", 1)
+	submit(t, s, "req-1", 1)
+
+	first := awaitTask(t, s, "w-1")
+	if first.GetAttempt() != 1 {
+		t.Fatalf("first dispatch at attempt %d, want 1", first.GetAttempt())
+	}
+	taskID := first.GetTaskId()
+
+	// (1) A RETRYABLE failure sends it back to PENDING *with* a deadline.
+	if _, err := s.ReportResult(context.Background(), &schedulerpb.ReportResultRequest{
+		WorkerId: "w-1", TaskId: taskID, Attempt: 1,
+		ExitCode: 1, Error: "boom", Retryable: true,
+	}); err != nil {
+		t.Fatalf("report failure: %v", err)
+	}
+
+	backing := awaitState(t, s, taskID, state.TaskPending)
+	if backing.NotBeforeMs == 0 {
+		t.Fatal("a retryable failure set no backoff deadline")
+	}
+	if backing.Attempt != 1 {
+		t.Errorf("attempt = %d after failing, want it unchanged at 1 — "+
+			"only a dispatch increments it", backing.Attempt)
+	}
+	deadline := backing.NotBeforeMs
+
+	// (2) While backing off it must NOT be dispatched, even with a free
+	// worker sitting idle. This is the half that actually prevents a crash
+	// loop, and the half a sampling test is most likely to miss.
+	heartbeat(t, s, "w-1")
+	awaitNoTask(t, s, "w-1")
+	s.c.read(func(st *state.StateStore) {
+		if tk, _ := st.Task(taskID); tk.State != state.TaskPending {
+			t.Errorf("state = %s during backoff, want PENDING", tk.State)
+		}
+	})
+
+	// (3) Tick PAST the deadline clears it and emits BACKOFF_ELAPSED —
+	// without that eval nothing would ever look at this task again, because
+	// time passing is invisible to the scheduler.
+	clk.set(deadline + 1)
+	heartbeat(t, s, "w-1")
+	tick(t, s)
+
+	cleared := awaitState(t, s, taskID, state.TaskPending)
+	if cleared.NotBeforeMs != 0 {
+		t.Errorf("NotBeforeMs = %d after ticking past the deadline, want cleared", cleared.NotBeforeMs)
+	}
+
+	// (4) And it is redispatched, as the NEXT attempt.
+	retried := awaitTask(t, s, "w-1")
+	if retried.GetTaskId() != taskID {
+		t.Fatalf("redispatched %q, want %q", retried.GetTaskId(), taskID)
+	}
+	if retried.GetAttempt() != 2 {
+		t.Errorf("redispatch at attempt %d, want 2", retried.GetAttempt())
+	}
+
+	// (5) The cycle closes: completing the retry finishes the job.
+	if _, err := s.ReportResult(context.Background(), &schedulerpb.ReportResultRequest{
+		WorkerId: "w-1", TaskId: taskID, Attempt: 2,
+		ExitCode: 0, ResultRef: "/data/w-1/attempt-2",
+	}); err != nil {
+		t.Fatalf("report success: %v", err)
+	}
+	done := awaitState(t, s, taskID, state.TaskComplete)
+	if done.ResultRef != "/data/w-1/attempt-2" {
+		t.Errorf("result_ref = %q, want the retry's", done.ResultRef)
+	}
+}
+
+// Backoff GROWS with the attempt, so a task that keeps failing waits longer
+// each time rather than hammering at a fixed rate.
+func TestRetryBackoffGrowsAcrossAttempts(t *testing.T) {
+	s, clk := newTestService(t)
+	register(t, s, "w-1", 1)
+	submit(t, s, "req-1", 1)
+
+	var delays []int64
+	task := awaitTask(t, s, "w-1")
+	taskID := task.GetTaskId()
+
+	for attempt := int32(1); attempt <= 3; attempt++ {
+		if _, err := s.ReportResult(context.Background(), &schedulerpb.ReportResultRequest{
+			WorkerId: "w-1", TaskId: taskID, Attempt: attempt,
+			ExitCode: 1, Error: "boom", Retryable: true,
+		}); err != nil {
+			t.Fatalf("attempt %d report: %v", attempt, err)
+		}
+
+		var tk state.Task
+		var now int64
+		s.c.read(func(st *state.StateStore) {
+			tk, _ = st.Task(taskID)
+			now = st.NowMs()
+		})
+		if tk.State == state.TaskFailed {
+			break // attempts exhausted; nothing more to measure
+		}
+		if tk.NotBeforeMs == 0 {
+			t.Fatalf("attempt %d set no backoff", attempt)
+		}
+		delays = append(delays, tk.NotBeforeMs-now)
+
+		clk.set(tk.NotBeforeMs + 1)
+		heartbeat(t, s, "w-1")
+		tick(t, s)
+		if attempt < 3 {
+			if got := awaitTask(t, s, "w-1"); got.GetAttempt() != attempt+1 {
+				t.Fatalf("redispatch at attempt %d, want %d", got.GetAttempt(), attempt+1)
+			}
+		}
+	}
+
+	if len(delays) < 2 {
+		t.Fatalf("only measured %d backoffs, want at least 2", len(delays))
+	}
+	for i := 1; i < len(delays); i++ {
+		if delays[i] <= delays[i-1] {
+			t.Errorf("backoff did not grow: %v", delays)
+			break
+		}
+	}
+	t.Logf("backoff per attempt (ms): %v", delays)
+}
