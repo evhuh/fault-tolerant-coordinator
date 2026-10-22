@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/anishathalye/porcupine"
+
 	"github.com/evazheng/fault-tolerant-coordinator/internal/simnet"
 	"github.com/evazheng/fault-tolerant-coordinator/internal/state"
 )
@@ -187,16 +189,40 @@ func TestSameSeedReproducesTheFaultSchedule(t *testing.T) {
 // the execution, so this catching something is informative and this passing
 // is not a guarantee. The deterministic scenario tests are the reliable
 // artifact.
+// How wide the sweep is, and how much of it must have been able to find
+// something for the result to count.
+//
+// CALIBRATED, not chosen. Measured conclusive counts over six sweeps of six
+// 8-step seeds were 1, 4, 2, 2, 2, 4 — 15 of 36, a rate near 42%, with enough
+// variance that one sweep managed a single conclusive run. At six seeds no
+// floor above one is stable (a floor of two would fail roughly one sweep in
+// six), so the sweep is WIDER rather than the floor lower: at sixteen seeds
+// the expected conclusive count is near seven and a floor of three sits about
+// two standard deviations below it. A first run at that width measured nine.
+//
+// The real remedy is more STEPS per run, not more seeds — 12-step runs are
+// conclusive about 87% of the time against 47% here, because a short run
+// often never rolls a leader partition at all. That is deferred to Day 10,
+// and until then this is a wide-and-shallow detector that says so.
+var (
+	seedSweepRuns          int64 = 16
+	seedSweepMinConclusive       = 3
+)
+
 func TestSeedSweep(t *testing.T) {
 	if testing.Short() {
 		t.Skip("sweep is slow; -short runs the single-seed test only")
 	}
-	conclusive := 0
-	for seed := int64(1); seed <= 6; seed++ {
+	var conclusive, inconclusive, illegal int
+	for seed := int64(1); seed <= seedSweepRuns; seed++ {
 		cfg := quickConfig(seed, 8)
 		res, err := New(cfg, dirsFor(t, cfg.Nodes)).Run(context.Background())
+		if res.Lin.Verdict == porcupine.Illegal {
+			illegal++
+		}
 		// Inconclusive outcomes are REPORTED, not failed.
 		if inconclusiveOnly(res) {
+			inconclusive++
 			t.Logf("seed %d inconclusive, not a finding: %v", seed, res.Violations)
 			continue
 		}
@@ -210,15 +236,20 @@ func TestSeedSweep(t *testing.T) {
 		conclusive++
 	}
 
-	// A sweep in which NOTHING was conclusive is not a pass. Tolerating
-	// inconclusive runs individually is correct; tolerating all of them
-	// would turn the detector into a function that always succeeds, which
-	// is the same failure MinComparisons exists to prevent one level down.
-	if conclusive == 0 {
-		t.Error("no run in the sweep reached a fault that could produce a violation — " +
-			"the sweep proved nothing and must not be read as a pass")
+	// A MINIMUM, not "at least one".
+	//
+	// "At least one" is the floor this project already rejected for
+	// MinComparisons, and for the same reason: a sweep that managed a single
+	// conclusive run out of many has barely looked, and passing it reports
+	// evidence that does not exist.
+	if conclusive < seedSweepMinConclusive {
+		t.Errorf("sweep of %d seeds produced only %d conclusive runs (floor %d): "+
+			"%d conclusive, %d inconclusive, %d NOT LINEARIZABLE — "+
+			"too little of this sweep could have found anything for its result to mean much",
+			seedSweepRuns, conclusive, seedSweepMinConclusive, conclusive, inconclusive, illegal)
 	}
-	t.Logf("%d of 6 seeds were conclusive", conclusive)
+	t.Logf("sweep of %d seeds: %d conclusive, %d inconclusive, %d illegal",
+		seedSweepRuns, conclusive, inconclusive, illegal)
 }
 
 // The invariant checker has to be able to FAIL, or a green run means nothing.

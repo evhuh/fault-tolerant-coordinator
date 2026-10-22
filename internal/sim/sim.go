@@ -133,6 +133,13 @@ type Config struct {
 	// LinVizDir is where the HTML timeline is written on a failure. Empty
 	// writes none.
 	LinVizDir string
+	// DisableCheckQuorum reproduces the pre-liveness configuration, in which
+	// a cut-off leader keeps its term and keeps answering reads
+	// indefinitely. Set by the negative control only; see raftnode.Config.
+	DisableCheckQuorum bool
+	// DisablePreVote likewise, used only to prove the PreVote test can
+	// fail. A test that passes with the option off is not testing it.
+	DisablePreVote bool
 	// StallThreshold overrides raftnode's derived Ready-loop stall budget.
 	//
 	// Normally left zero so the simulator inherits the same "strictly below
@@ -488,6 +495,8 @@ func (s *Sim) start(id uint64) error {
 	rcfg.SnapshotEntries = s.cfg.SnapshotEvery
 	rcfg.SnapshotCatchUpEntries = 5
 	rcfg.StallThreshold = s.cfg.StallThreshold
+	rcfg.DisableCheckQuorum = s.cfg.DisableCheckQuorum
+	rcfg.DisablePreVote = s.cfg.DisablePreVote
 	// Derived from the election timeout by raftnode when zero; left zero
 	// here so the simulator inherits the same "strictly below the election
 	// timeout" rule the production default uses.

@@ -467,6 +467,14 @@ func (c *Coordinator) restoreState(data []byte) error {
 // Raft. The invariant checker uses it to compare replicas at the same log
 // position — comparing two nodes at DIFFERENT positions is meaningless, since
 // a node a few entries behind legitimately holds different state.
+// RaftStatus exposes raft's view of this node, for tests and diagnostics.
+func (c *Coordinator) RaftStatus() raft.Status {
+	if c.raft == nil {
+		return raft.Status{}
+	}
+	return c.raft.Status()
+}
+
 // AppliedIndex is the log position of the state the store currently holds.
 //
 // Read under the apply lock, and advanced under it, so it is COHERENT with

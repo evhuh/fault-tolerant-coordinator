@@ -41,6 +41,23 @@ type Config struct {
 	ElectionTick  int
 	HeartbeatTick int
 
+	// DisableCheckQuorum and DisablePreVote turn OFF the two liveness
+	// options, which are ON by default.
+	//
+	// Expressed as negatives so the safe configuration is the zero value: a
+	// caller that forgets these gets the quorum checks, not the absence of
+	// them. Nothing in cmd/ exposes them; they are reachable only from Go
+	// code, and exactly one caller sets one.
+	//
+	// That caller is the negative control reproducing the configuration the
+	// Day 9 stale read lived in. Without CheckQuorum a cut-off leader keeps
+	// its term indefinitely and keeps answering reads; with it, the leader
+	// steps down after an election timeout. The regression test needs the
+	// former to prove the linearizability checker can still see a stale
+	// read, and production needs the latter.
+	DisableCheckQuorum bool
+	DisablePreVote     bool
+
 	// SnapshotEntries is how many applied entries trigger a snapshot. Without
 	// one the log grows forever and restart replay grows with uptime, which
 	// is the thing that makes snapshots non-optional for an always-on
@@ -247,6 +264,14 @@ type Node struct {
 	fatalErr  error
 }
 
+// Status exposes raft's view of this node: term, leader, progress.
+//
+// For TESTS and diagnostics. Read the term through st.HardState.GetTerm(),
+// never st.Term — Term is reached through an embedded pointer, and reading
+// it the obvious way compares pointer addresses, which once made a term that
+// had not moved look unmoved for entirely the wrong reason.
+func (n *Node) Status() raft.Status { return n.node.Status() }
+
 // AppliedIndex is the highest log index this node has applied.
 func (n *Node) AppliedIndex() uint64 { return n.appliedAtomic.Load() }
 
@@ -323,11 +348,31 @@ func New(cfg Config, h Handler) (*Node, error) {
 		}
 	}
 
+	// CheckQuorum and PreVote are LIVENESS, not the read fix.
+	//
+	// CheckQuorum makes a leader that stops hearing from a majority step
+	// down after an election timeout, which SHORTENS the window in which a
+	// cut-off leader believes it leads. It does not close it: reads served
+	// inside that timeout are still stale, which is why the ReadIndex
+	// barrier — not this — is what makes reads linearizable.
+	//
+	// PreVote stops a node that was partitioned away from deposing a
+	// healthy leader on rejoin. Without it the returning node has been
+	// incrementing its term in failed elections the whole time it was cut
+	// off, and arrives with a higher one, forcing an election the cluster
+	// did not need. With it, it asks whether it could win before
+	// incrementing anything.
+	//
+	// Landed separately from the barrier on purpose: had they arrived
+	// together, a clean Porcupine result could not have been attributed to
+	// either.
 	rc := &raft.Config{
 		ID:              cfg.ID,
 		ElectionTick:    cfg.ElectionTick,
 		HeartbeatTick:   cfg.HeartbeatTick,
 		Storage:         storage,
+		CheckQuorum:     !cfg.DisableCheckQuorum,
+		PreVote:         !cfg.DisablePreVote,
 		MaxSizePerMsg:   1024 * 1024,
 		MaxInflightMsgs: 256,
 		Logger:          &raft.DefaultLogger{Logger: log.New(log.Writer(), "raft ", log.LstdFlags)},

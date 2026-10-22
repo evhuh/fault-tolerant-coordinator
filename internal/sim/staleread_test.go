@@ -98,6 +98,25 @@ func runStaleReadScenario(t *testing.T, mode server.ReadMode, seed int64) porcup
 	cfg.Seed = seed
 	cfg.ReadMode = mode
 	cfg.Steps = 0
+	// PIN THE ADVERSARY: no CheckQuorum, so the cut-off leader keeps its
+	// term and keeps believing it leads for as long as the scenario needs.
+	//
+	// This is the scenario's PREMISE, not a convenience. With CheckQuorum on
+	// (the production default since the liveness change) the old leader
+	// steps down about one election timeout after being cut off, while the
+	// majority needs its own randomized timeout to elect a successor — so
+	// the window in which both believe they lead is narrow and sometimes
+	// absent. Racing it was tried and is flaky: the control passed, then
+	// failed within twenty runs with "got Ok", which is the most dangerous
+	// possible failure here because it reads as "the bug is fixed".
+	//
+	// Both modes face the same pinned adversary, which is what makes the two
+	// results comparable: ReadLocal answers from stale state and the history
+	// is Illegal; ReadIndexBarrier refuses the read and it is Ok. CheckQuorum
+	// narrows this window in production but does not close it — reads served
+	// inside the step-down timeout are still stale — which is precisely why
+	// the barrier, not CheckQuorum, is the fix.
+	cfg.DisableCheckQuorum = true
 	// No fault schedule and no recorded clients: this test IS the schedule.
 	cfg.LinClients = 0
 	cfg.Faults.DropRate = 0
