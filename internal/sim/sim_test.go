@@ -64,15 +64,21 @@ func notMine(err error) bool {
 	return v.Kind.IsLinearizability() || v.Kind.IsEnvironment()
 }
 
-// environmentOnly reports whether every violation recorded was an
-// environment one, which is how the detector sweep tells "nothing was found"
+// inconclusiveOnly reports whether every violation recorded was an
+// INCONCLUSIVE one, which is how the detector sweep tells "nothing was found"
 // from "nothing could be looked at".
-func environmentOnly(res Result) bool {
+//
+// Those are opposite claims and only one of them is a defect. A short run
+// that never rolled a partition, a host whose fsyncs blew past the run's
+// compressed timings, a run that left raft's fault model — none of them
+// found anything wrong, and failing the sweep on them is how a detector
+// becomes nondeterministically red.
+func inconclusiveOnly(res Result) bool {
 	if len(res.Violations) == 0 {
 		return false
 	}
 	for _, v := range res.Violations {
-		if !v.Kind.IsEnvironment() {
+		if !v.Inconclusive {
 			return false
 		}
 	}
@@ -185,15 +191,13 @@ func TestSeedSweep(t *testing.T) {
 	if testing.Short() {
 		t.Skip("sweep is slow; -short runs the single-seed test only")
 	}
+	conclusive := 0
 	for seed := int64(1); seed <= 6; seed++ {
 		cfg := quickConfig(seed, 8)
 		res, err := New(cfg, dirsFor(t, cfg.Nodes)).Run(context.Background())
-		// Environment-only outcomes are REPORTED, not failed. A host whose
-		// fsyncs ran past the run's compressed timings did not find a bug
-		// and did not clear the system either; failing on it is how a
-		// detector becomes nondeterministically red on a busy laptop.
-		if environmentOnly(res) {
-			t.Logf("seed %d inconclusive (environment, not a finding): %v", seed, res.Violations)
+		// Inconclusive outcomes are REPORTED, not failed.
+		if inconclusiveOnly(res) {
+			t.Logf("seed %d inconclusive, not a finding: %v", seed, res.Violations)
 			continue
 		}
 		if err != nil {
@@ -203,12 +207,24 @@ func TestSeedSweep(t *testing.T) {
 		if len(res.Violations) > 0 {
 			t.Errorf("seed %d: %v", seed, res.Violations)
 		}
+		conclusive++
 	}
+
+	// A sweep in which NOTHING was conclusive is not a pass. Tolerating
+	// inconclusive runs individually is correct; tolerating all of them
+	// would turn the detector into a function that always succeeds, which
+	// is the same failure MinComparisons exists to prevent one level down.
+	if conclusive == 0 {
+		t.Error("no run in the sweep reached a fault that could produce a violation — " +
+			"the sweep proved nothing and must not be read as a pass")
+	}
+	t.Logf("%d of 6 seeds were conclusive", conclusive)
 }
 
 // The invariant checker has to be able to FAIL, or a green run means nothing.
 // This plants a contradiction directly in a node's state machine and asserts
 // the checker notices.
+
 func TestInvariantCheckerDetectsCorruptedState(t *testing.T) {
 	cfg := quickConfig(99, 3)
 	s := New(cfg, dirsFor(t, cfg.Nodes))

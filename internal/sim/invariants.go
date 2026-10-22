@@ -110,8 +110,16 @@ func (s *Sim) checkInvariants(step int) []Violation {
 	//
 	// The streak is reset rather than merely not reported, so the steps
 	// either side of the partition are not stitched into one false streak.
+	//
+	// NO QUORUM is the same exemption for the same reason, and it is the
+	// one that matters: a kill plus a partition can leave fewer reachable
+	// nodes than a majority, and then NOTHING commits anywhere — ticks
+	// included — because that is what a quorum rule is for. The first
+	// attempt at this stopped the adversary from creating that state, which
+	// narrowed the fault space to keep an invariant quiet. Below quorum is a
+	// real fault state; the invariant is what had to learn about it.
 	switch nowMs := s.stateClock(lead); {
-	case s.net.IsPartitioned(lead.id):
+	case !s.hasQuorum(), s.net.IsPartitioned(lead.id):
 		s.clockFrozenSteps = 0
 		s.lastClock = nowMs
 	case nowMs == s.lastClock && s.lastClock > 0:

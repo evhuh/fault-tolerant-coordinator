@@ -159,6 +159,10 @@ type LinResult struct {
 	// linearizable, which needs no checker to establish.
 	Partitioned int
 	SplitBrain  int
+	// Covered reports whether any operation reached a fault state that could
+	// have produced a violation. False means the verdict is about a healthy
+	// cluster and proves nothing.
+	Covered bool
 	// Rejected counts definitive InvalidArgument responses. This workload
 	// only ever sends valid requests, so a nonzero count is itself a finding.
 	Rejected int

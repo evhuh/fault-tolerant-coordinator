@@ -285,6 +285,15 @@ const (
 	// KindLinearizabilityTimeout means the search did not finish, or there
 	// was nothing to search, so there is no verdict. Inconclusive.
 	KindLinearizabilityTimeout ViolationKind = "linearizability-timeout"
+	// KindLinearizabilityCoverage means the history never reached a state
+	// that could produce a violation: no operation landed on a cut-off node
+	// and none ran while two nodes claimed leadership.
+	//
+	// Inconclusive, on the MinComparisons precedent. Such a run is green
+	// about a HEALTHY cluster, which is trivially linearizable and needs no
+	// checker, so counting it toward "N histories, zero violations" inflates
+	// the claim with runs that could not have failed.
+	KindLinearizabilityCoverage ViolationKind = "linearizability-coverage"
 )
 
 // IsEnvironment reports whether this kind says the HOST or the harness could
@@ -303,7 +312,9 @@ func (k ViolationKind) IsEnvironment() bool {
 // linearizability check produces. Tests that are not about linearizability
 // use it to ignore exactly those.
 func (k ViolationKind) IsLinearizability() bool {
-	return k == KindLinearizability || k == KindLinearizabilityTimeout
+	return k == KindLinearizability ||
+		k == KindLinearizabilityTimeout ||
+		k == KindLinearizabilityCoverage
 }
 
 // Violation is an invariant that failed, with the seed and step needed to get
@@ -690,6 +701,24 @@ func (s *Sim) checkLinearizable() LinResult {
 	})
 
 	res := s.history.check(s.cfg.LinCheckTimeout, s.cfg.LinVizDir)
+
+	// COVERAGE FIRST. A verdict over a history that never touched a
+	// partitioned node or a split-brain window is a verdict about a healthy
+	// cluster. Reported before the verdict is examined, because an Ok from
+	// such a run is not evidence and must not be counted as one.
+	res.Covered = res.Partitioned > 0 || res.SplitBrain > 0
+	if res.Ops > 0 && !res.Covered {
+		s.result.Violations = append(s.result.Violations, Violation{
+			Seed: s.cfg.Seed, Step: s.result.Steps,
+			Kind: KindLinearizabilityCoverage, Inconclusive: true,
+			What: fmt.Sprintf(
+				"history of %d operations never reached a fault that could produce a violation "+
+					"(0 ops on a partitioned node, 0 under split brain) — a healthy cluster is "+
+					"trivially linearizable, so this run cannot count toward a claim", res.Ops),
+		})
+		return res
+	}
+
 	switch res.Verdict {
 	case porcupine.Illegal:
 		what := fmt.Sprintf("history of %d client operations (%d submits, %d gets, %d ambiguous, %.0f%%) is NOT LINEARIZABLE",
@@ -825,13 +854,6 @@ func (s *Sim) applyFault(step int) {
 	case roll < 58:
 		// Partition a minority. A minority CANNOT elect or commit, so this
 		// tests that the majority carries on and the minority rejoins.
-		//
-		// Refused when it would leave no quorum: combined with a kill or an
-		// existing partition, one more cut can take the reachable set below
-		// a majority, and then nothing commits for the rest of the run.
-		if s.wouldBreakQuorum() {
-			return
-		}
 		victim := s.pickNode()
 		if victim == 0 {
 			return
@@ -854,9 +876,6 @@ func (s *Sim) applyFault(step int) {
 		// something new before any read of it could be stale. A partition
 		// that the next quiet step heals is over before that sequence can
 		// finish.
-		if s.wouldBreakQuorum() {
-			return
-		}
 		lead := s.leader()
 		if lead == nil {
 			return
@@ -877,14 +896,16 @@ func (s *Sim) applyFault(step int) {
 
 	case roll < 93:
 		// Kill a node, but never below quorum: with 3 nodes at most one may
-		// be unavailable, or the cluster stops being able to commit at all
-		// and the rest of the run tests nothing.
+		// be down, or the cluster stops being able to commit at all and the
+		// rest of the run tests nothing.
 		//
-		// Counted over REACHABLE nodes, not live ones. A node that is live
-		// but partitioned cannot help form a quorum, so killing a second
-		// node while one is cut off breaks the very guarantee this guard
-		// exists to provide.
-		if s.wouldBreakQuorum() {
+		// Counted over LIVE nodes deliberately, not reachable ones. A kill
+		// plus a partition CAN leave the cluster without a quorum, and that
+		// is a real fault state the claim has to cover — guarding against
+		// it here would narrow the adversary to make an invariant quieter,
+		// which is a selection effect, not a fix. The invariants are what
+		// know that no quorum means no progress is expected.
+		if len(s.liveIDs()) <= quorum(s.cfg.Nodes) {
 			return
 		}
 		victim := s.pickNode()
@@ -931,17 +952,16 @@ func quorum(n int) int { return n/2 + 1 }
 // reachableCount is how many nodes can currently form a quorum together:
 // live AND not partitioned.
 //
-// Liveness alone is not the right count, and Day 9 is what exposed that. The
-// kill branch guarded on live nodes, which was correct while partitions
-// lasted less than a step; holding a leader partition for three steps made
-// "live" and "available" different things. Seed 9005 then killed the
-// partitioned leader and partitioned a second node, leaving ONE reachable
-// node out of three — below quorum, nothing could commit, and the
+// Used by the INVARIANTS, never by fault selection. Holding a leader
+// partition for three steps made "live" and "available" different things,
+// and one seed then killed the partitioned leader and partitioned a second
+// node, leaving one reachable node of three. Nothing could commit and the
 // frozen-clock invariant fired on a cluster that was behaving correctly.
 //
-// The harness documents that it never drives the cluster below quorum,
-// because a cluster that cannot commit stops testing anything. This is the
-// count that makes that true.
+// The first fix was to stop the adversary creating that state, which was
+// wrong: below quorum is a real fault state and the claim has to cover it.
+// A cluster with no quorum makes no progress BY DESIGN, so what needed
+// changing is the invariant that read a correctly-stalled clock as a defect.
 func (s *Sim) reachableCount() int {
 	n := 0
 	for _, id := range s.liveIDs() {
@@ -952,10 +972,10 @@ func (s *Sim) reachableCount() int {
 	return n
 }
 
-// wouldBreakQuorum reports whether removing one more node from the reachable
-// set would leave the cluster unable to commit.
-func (s *Sim) wouldBreakQuorum() bool {
-	return s.reachableCount()-1 < quorum(s.cfg.Nodes)
+// hasQuorum reports whether enough nodes can currently reach each other to
+// commit anything at all.
+func (s *Sim) hasQuorum() bool {
+	return s.reachableCount() >= quorum(s.cfg.Nodes)
 }
 
 // pickNode chooses a live node deterministically from the seed. Sorted ids,

@@ -11,6 +11,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -19,6 +20,8 @@ import (
 	"strconv"
 	"syscall"
 	"time"
+
+	"github.com/anishathalye/porcupine"
 
 	"github.com/evazheng/fault-tolerant-coordinator/internal/server"
 	"github.com/evazheng/fault-tolerant-coordinator/internal/sim"
@@ -71,12 +74,13 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	failures := 0
+	var tally tally
 	for i := 0; i < *runs; i++ {
 		s := seed + int64(i)
-		if err := runOne(ctx, s, *steps, *nodes, *dropRate, *corruptRate, *failureRate,
-			*deliverCorrupt, *maxDelay, *stepTime, *verbose, *linClients, *linVizDir, mode, *stallThreshold); err != nil {
-			failures++
+		res, err := runOne(ctx, s, *steps, *nodes, *dropRate, *corruptRate, *failureRate,
+			*deliverCorrupt, *maxDelay, *stepTime, *verbose, *linClients, *linVizDir, mode, *stallThreshold)
+		tally.add(res, err)
+		if err != nil {
 			fmt.Printf("\nFAILED  seed=%d\n", s)
 			fmt.Printf("  %v\n", err)
 			fmt.Printf("  reproduce with:  simulator -seed %d -steps %d -nodes %d -v\n", s, *steps, *nodes)
@@ -86,20 +90,71 @@ func main() {
 		}
 	}
 
-	if failures > 0 {
-		fmt.Printf("\n%d/%d runs failed\n", failures, *runs)
+	tally.report(*runs)
+	if tally.violations > 0 {
 		os.Exit(1)
 	}
-	fmt.Printf("\n%d/%d runs passed\n", *runs, *runs)
+}
+
+// tally separates the three outcomes a sweep can produce, because "22 runs
+// passed" over a set where half the histories never reached a fault is a
+// number that overstates itself.
+type tally struct {
+	// Linearizability outcomes.
+	covered      int // reached a fault AND came back Ok
+	inconclusive int // could not have failed, or reached no verdict
+	illegal      int
+	// violations counts real findings of any kind, which is what the exit
+	// code reflects. An inconclusive run is not a pass, but it is not a
+	// defect either, and exiting 1 on it would make a busy laptop look like
+	// a broken system.
+	violations int
+}
+
+func (t *tally) add(res sim.Result, err error) {
+	switch {
+	case res.Lin.Verdict == porcupine.Illegal:
+		t.illegal++
+	case res.Lin.Checked && res.Lin.Covered && res.Lin.Verdict == porcupine.Ok:
+		t.covered++
+	case res.Lin.Checked:
+		t.inconclusive++
+	}
+	for _, v := range res.Violations {
+		if !v.Inconclusive {
+			t.violations++
+			break
+		}
+	}
+	if err != nil && !sim.IsLinearizabilityErr(err) && t.violations == 0 {
+		// A non-linearizability failure (a real invariant or convergence
+		// violation, or a run that could not start) still fails the sweep.
+		var v sim.Violation
+		if !errors.As(err, &v) || !v.Inconclusive {
+			t.violations++
+		}
+	}
+}
+
+func (t *tally) report(runs int) {
+	fmt.Printf("\n%d runs: %d covered+linearizable, %d inconclusive, %d NOT LINEARIZABLE\n",
+		runs, t.covered, t.inconclusive, t.illegal)
+	if t.inconclusive > 0 {
+		fmt.Printf("  inconclusive runs proved nothing about linearizability — a history that never\n" +
+			"  reached a partitioned node or a split brain is green about a healthy cluster\n")
+	}
+	if t.violations > 0 {
+		fmt.Printf("  %d runs had real violations\n", t.violations)
+	}
 }
 
 func runOne(ctx context.Context, seed int64, steps, nodes int, dropRate, corruptRate, failureRate float64,
 	deliverCorrupt bool, maxDelay, stepTime time.Duration, verbose bool,
-	linClients int, linVizDir string, mode server.ReadMode, stallThreshold time.Duration) error {
+	linClients int, linVizDir string, mode server.ReadMode, stallThreshold time.Duration) (sim.Result, error) {
 
 	dir, err := os.MkdirTemp("", fmt.Sprintf("sim-%d-", seed))
 	if err != nil {
-		return err
+		return sim.Result{}, err
 	}
 	defer os.RemoveAll(dir)
 
@@ -107,7 +162,7 @@ func runOne(ctx context.Context, seed int64, steps, nodes int, dropRate, corrupt
 	for i := 1; i <= nodes; i++ {
 		d := fmt.Sprintf("%s/node-%d", dir, i)
 		if err := os.MkdirAll(d, 0o755); err != nil {
-			return err
+			return sim.Result{}, err
 		}
 		dirs[uint64(i)] = d
 	}
@@ -139,7 +194,12 @@ func runOne(ctx context.Context, seed int64, steps, nodes int, dropRate, corrupt
 
 	if err != nil {
 		fmt.Printf("FAIL (%s)\n", elapsed)
-		return err
+		// Print the linearizability detail anyway. An inconclusive run's
+		// ambiguous share and coverage are exactly what explain WHY it
+		// concluded nothing, and returning before printing them left the
+		// sweep unable to say anything about its own weakest runs.
+		reportLin(res)
+		return res, err
 	}
 	n, c := res.Faults.Net, res.Coverage
 	fmt.Printf("ok (%s)\n", elapsed)
@@ -157,6 +217,11 @@ func runOne(ctx context.Context, seed int64, steps, nodes int, dropRate, corrupt
 	fmt.Printf("    exercised: redispatched=%d backed-off=%d reached-FAILED=%d sessions-expired=%d\n",
 		c.TasksRedispatched, c.TasksBackedOff, c.TasksTerminalFail, c.SessionsExpired)
 	fmt.Printf("    state:    jobs=%d tasks=%d\n", res.Jobs, res.Tasks)
+	reportLin(res)
+	return res, nil
+}
+
+func reportLin(res sim.Result) {
 	if l := res.Lin; l.Checked {
 		// The verdict is printed with the history's shape next to it on
 		// purpose. "Ok" over 12 operations is not the same evidence as "Ok"
@@ -183,6 +248,9 @@ func runOne(ctx context.Context, seed int64, steps, nodes int, dropRate, corrupt
 		if l.VizPath != "" {
 			fmt.Printf("      timeline: %s\n", l.VizPath)
 		}
+		if !l.Covered {
+			fmt.Printf("      NOT COVERED: no operation reached a partitioned node or a split brain; " +
+				"this run cannot count toward a linearizability claim\n")
+		}
 	}
-	return nil
 }
