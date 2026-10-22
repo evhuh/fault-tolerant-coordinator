@@ -20,8 +20,12 @@ import (
 	"testing"
 	"time"
 
+	"fmt"
+
 	"github.com/anishathalye/porcupine"
 	"google.golang.org/grpc/codes"
+
+	"github.com/evazheng/fault-tolerant-coordinator/internal/server"
 
 	schedulerpb "github.com/evazheng/fault-tolerant-coordinator/proto/schedulerpb"
 )
@@ -43,26 +47,56 @@ func (s *Sim) awaitLeaderExcept(excluded uint64, within time.Duration) *node {
 	return nil
 }
 
-// TestPartitionedLeaderServesStaleReads is the Day 9 hunt, made explicit.
+// TestPartitionedLeaderServesStaleReads_Local is the NEGATIVE CONTROL, and it
+// is permanent.
 //
-// It does not assert that the read is stale. It records what happens and
-// checks the history, so the test states the TRUTH about the system rather
-// than the hope: if reads are linearizable it passes quietly, and if they are
-// not it fails with the history that proves it.
+// It runs ReadLocal and asserts the history is ILLEGAL. That is not a test of
+// a bug left in; it is a test of the CHECKER. A linearizability harness that
+// only ever runs against the fixed configuration cannot tell "the system is
+// correct" from "the checker stopped looking", and those two produce
+// identical green output. This fails if the model, the recorder, the
+// classification of NOT_FOUND as definitive, or the scenario itself ever
+// stops being able to see a stale read.
 //
-// IT CURRENTLY FAILS, and that failure is the finding. It stays until the
-// read path is decided — through the log, behind a ReadIndex barrier, or
-// documented as explicitly non-linearizable.
-func TestPartitionedLeaderServesStaleReads(t *testing.T) {
-	if res := runStaleReadScenario(t, 20261020); res != porcupine.Ok {
-		t.Fatalf("NOT LINEARIZABLE: a leader on the minority side of a partition answered a read "+
-			"from its own stale state. Verdict %s.", res)
+// If this starts passing, do not delete it — find out what broke.
+func TestPartitionedLeaderServesStaleReads_Local(t *testing.T) {
+	res := runStaleReadScenario(t, server.ReadLocal, 20261020)
+	if res != porcupine.Illegal {
+		t.Fatalf("expected the checker to find a stale read under ReadLocal, got %s. "+
+			"Either the coordinator stopped serving local reads, or the harness stopped "+
+			"being able to detect one — the second is the dangerous case.", res)
 	}
 }
 
-func runStaleReadScenario(t *testing.T, seed int64) porcupine.CheckResult {
+// TestPartitionedLeaderReadIndexIsLinearizable is the same scenario with the
+// barrier on, across several seeds.
+//
+// Under ReadIndexBarrier the cut-off leader cannot get a quorum to confirm it
+// still leads, so the read is REFUSED rather than answered. A refused read
+// returns no value, makes no claim, and is recorded ambiguous — legal,
+// because the client learned nothing. The violation is gone because the wrong
+// answer is gone, not because the question stopped being asked, which is what
+// the majority-side read inside the scenario pins down.
+func TestPartitionedLeaderReadIndexIsLinearizable(t *testing.T) {
+	for _, seed := range []int64{20261020, 20261021, 20261022, 20261023} {
+		t.Run(fmt.Sprintf("seed-%d", seed), func(t *testing.T) {
+			if res := runStaleReadScenario(t, server.ReadIndexBarrier, seed); res != porcupine.Ok {
+				t.Fatalf("ReadIndexBarrier should make this history linearizable, got %s", res)
+			}
+		})
+	}
+}
+
+// runStaleReadScenario drives the sequence by hand and returns the verdict,
+// so the two tests above differ only in the read mode.
+//
+// It does not assert staleness itself. It records what happened and checks
+// the history, so each test states the TRUTH about its configuration rather
+// than the hope.
+func runStaleReadScenario(t *testing.T, mode server.ReadMode, seed int64) porcupine.CheckResult {
 	cfg := DefaultConfig()
 	cfg.Seed = seed
+	cfg.ReadMode = mode
 	cfg.Steps = 0
 	// No fault schedule and no recorded clients: this test IS the schedule.
 	cfg.LinClients = 0
@@ -121,8 +155,9 @@ func runStaleReadScenario(t *testing.T, seed int64) porcupine.CheckResult {
 	// making the system useless. This one must come back FOUND, which it can
 	// only do by obtaining a real quorum confirmation.
 	if !recordGet(ctx, h, fresh, 3, during) {
-		t.Fatal("the majority leader could not serve a read of the job it had just committed; " +
-			"a verdict over a history of nothing but refusals would mean nothing")
+		t.Fatalf("the majority leader could not serve a read of the job it had just committed; "+
+			"the barrier is refusing reads it should allow, and a passing verdict here would "+
+			"mean nothing (mode=%s)", mode)
 	}
 
 	ops := h.snapshot()

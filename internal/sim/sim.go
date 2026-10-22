@@ -21,6 +21,7 @@ package sim
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -69,6 +70,16 @@ type Config struct {
 	// against a sub-second run mean those paths never execute at all, and a
 	// green run says nothing about them.
 	StatePolicy state.Policy
+	// ReadMode is how client reads are served. The simulator runs
+	// ReadIndexBarrier by default, because the linearizability claim is
+	// about the configuration that is shipped; ReadLocal is selected
+	// explicitly by the regression test that asserts the bug is still
+	// visible.
+	ReadMode server.ReadMode
+	// ReadTimeout bounds a read barrier. Compressed like ProposalTimeout:
+	// at the production default a read into a partition parks for seconds,
+	// which in simulated time is the whole run.
+	ReadTimeout time.Duration
 	// ProposalTimeout is compressed with everything else. At the production
 	// default a single leaderless moment parks every caller for 5s, which in
 	// simulated time is an eternity and makes a run mostly waiting.
@@ -122,6 +133,15 @@ type Config struct {
 	// LinVizDir is where the HTML timeline is written on a failure. Empty
 	// writes none.
 	LinVizDir string
+	// StallThreshold overrides raftnode's derived Ready-loop stall budget.
+	//
+	// Normally left zero so the simulator inherits the same "strictly below
+	// the election timeout" rule production uses. It is settable because
+	// LOWERING it is a measurement tool: a rare tail stall cannot be
+	// attributed by waiting for it (2 in 88 runs), but turning the threshold
+	// down until stalls are common shows which phase owns the slow tail,
+	// which is the same question answered cheaply.
+	StallThreshold time.Duration
 	// CoverageSampleInterval is how often the background sampler looks at
 	// committed state. It must be shorter than BaseBackoffMs, or live retry
 	// backoffs are observed only by luck.
@@ -155,6 +175,8 @@ func DefaultConfig() Config {
 		// exercised, rare enough that the run is not dominated by fsync.
 		SnapshotEvery:   150,
 		ProposalTimeout: 250 * time.Millisecond,
+		ReadMode:        server.ReadIndexBarrier,
+		ReadTimeout:     250 * time.Millisecond,
 		MinComparisons:  20,
 		// Scaled to the run, not to production. A run spans well under a
 		// second of state-machine time, so these are set so that a retry
@@ -227,11 +249,69 @@ type FaultCounts struct {
 	Net              simnet.Stats
 }
 
+// ViolationKind says WHICH check failed.
+//
+// It exists because a bare error from Run is ambiguous, and the ambiguity was
+// not harmless. When the linearizability check started failing runs, four
+// unrelated tests went red: a comparison-floor test reported "a healthy run
+// failed its own floor" over a run whose floor was fine and whose history was
+// illegal, and a schedule-reproducibility test went red for a violation that
+// has nothing to do with schedules. A test that names the wrong cause sends
+// the next person to the wrong code.
+//
+// The rule this enforces: every test asserts only its OWN property. A
+// detector fails on its own kind deliberately; everything else ignores kinds
+// it does not own.
+type ViolationKind string
+
+const (
+	// KindInvariant is a per-step state invariant, checked mid-chaos.
+	KindInvariant ViolationKind = "invariant"
+	// KindConvergence is a post-heal disagreement between replicas.
+	KindConvergence ViolationKind = "convergence"
+	// KindComparisonFloor means the convergence check did not compare
+	// enough to conclude anything. Inconclusive, not a violation.
+	KindComparisonFloor ViolationKind = "comparison-floor"
+	// KindFaultModel means the run left raft's fault model, so its results
+	// cannot support a correctness claim. Inconclusive.
+	KindFaultModel ViolationKind = "fault-model"
+	// KindHostIO means the Ready loop stalled waiting on the DISK, long
+	// enough that the run's compressed timings stopped holding.
+	// Inconclusive: the host could not meet the premise, so the run proved
+	// nothing — it does not say the system is wrong.
+	KindHostIO ViolationKind = "host-io"
+	// KindLinearizability is an illegal client history.
+	KindLinearizability ViolationKind = "linearizability"
+	// KindLinearizabilityTimeout means the search did not finish, or there
+	// was nothing to search, so there is no verdict. Inconclusive.
+	KindLinearizabilityTimeout ViolationKind = "linearizability-timeout"
+)
+
+// IsEnvironment reports whether this kind says the HOST or the harness could
+// not support a claim, as opposed to saying the system is wrong.
+//
+// Both members are "we could not look", not "we looked and it was broken": a
+// run whose fsyncs blew past its compressed timings, and a run that left
+// raft's fault model. Neither is any individual property's business, so the
+// per-property tests ignore them — otherwise a slow disk turns six unrelated
+// tests red and every one of them names the wrong cause.
+func (k ViolationKind) IsEnvironment() bool {
+	return k == KindHostIO || k == KindFaultModel
+}
+
+// IsLinearizability reports whether this kind is one of the two the
+// linearizability check produces. Tests that are not about linearizability
+// use it to ignore exactly those.
+func (k ViolationKind) IsLinearizability() bool {
+	return k == KindLinearizability || k == KindLinearizabilityTimeout
+}
+
 // Violation is an invariant that failed, with the seed and step needed to get
 // back to it.
 type Violation struct {
 	Seed int64
 	Step int
+	Kind ViolationKind
 	What string
 	// Inconclusive marks a run that could not check something, as opposed to
 	// one that found something wrong. The distinction matters: a violation
@@ -242,11 +322,30 @@ type Violation struct {
 }
 
 func (v Violation) Error() string {
-	kind := "VIOLATION"
+	label := "VIOLATION"
 	if v.Inconclusive {
-		kind = "INCONCLUSIVE"
+		label = "INCONCLUSIVE"
 	}
-	return fmt.Sprintf("%s seed %d step %d: %s", kind, v.Seed, v.Step, v.What)
+	return fmt.Sprintf("%s [%s] seed %d step %d: %s", label, v.Kind, v.Seed, v.Step, v.What)
+}
+
+// IsKind reports whether err is a Violation of this kind.
+func IsKind(err error, kind ViolationKind) bool {
+	var v Violation
+	if !errors.As(err, &v) {
+		return false
+	}
+	return v.Kind == kind
+}
+
+// IsLinearizabilityErr reports whether err is a linearizability finding —
+// either an illegal history or a search that reached no verdict.
+func IsLinearizabilityErr(err error) bool {
+	var v Violation
+	if !errors.As(err, &v) {
+		return false
+	}
+	return v.Kind.IsLinearizability()
 }
 
 type node struct {
@@ -358,6 +457,8 @@ func (s *Sim) start(id uint64) error {
 	cfg.Sched.LeaseTTLMs = s.cfg.LeaseTTL.Milliseconds()
 	cfg.Sched.Workers = 2
 	cfg.ProposalTimeout = s.cfg.ProposalTimeout
+	cfg.ReadMode = s.cfg.ReadMode
+	cfg.ReadTimeout = s.cfg.ReadTimeout
 	// IDENTICAL on every node, which is the contract Policy carries.
 	cfg.StatePolicy = s.cfg.StatePolicy
 	// Each node gets its own stream off the run's seed, so the ids a node
@@ -375,6 +476,7 @@ func (s *Sim) start(id uint64) error {
 	rcfg.HeartbeatTick = 1
 	rcfg.SnapshotEntries = s.cfg.SnapshotEvery
 	rcfg.SnapshotCatchUpEntries = 5
+	rcfg.StallThreshold = s.cfg.StallThreshold
 	// Derived from the election timeout by raftnode when zero; left zero
 	// here so the simulator inherits the same "strictly below the election
 	// timeout" rule the production default uses.
@@ -596,7 +698,7 @@ func (s *Sim) checkLinearizable() LinResult {
 			what += " — timeline: " + res.VizPath
 		}
 		s.result.Violations = append(s.result.Violations,
-			Violation{Seed: s.cfg.Seed, Step: s.result.Steps, What: what})
+			Violation{Seed: s.cfg.Seed, Step: s.result.Steps, Kind: KindLinearizability, What: what})
 	case porcupine.Unknown:
 		what := fmt.Sprintf("linearizability search did not finish in %s over %d operations — "+
 			"no verdict, not a pass", s.cfg.LinCheckTimeout, res.Ops)
@@ -605,7 +707,8 @@ func (s *Sim) checkLinearizable() LinResult {
 				"no verdict, not a pass"
 		}
 		s.result.Violations = append(s.result.Violations, Violation{
-			Seed: s.cfg.Seed, Step: s.result.Steps, Inconclusive: true, What: what,
+			Seed: s.cfg.Seed, Step: s.result.Steps,
+			Kind: KindLinearizabilityTimeout, Inconclusive: true, What: what,
 		})
 	}
 	return res
@@ -722,6 +825,13 @@ func (s *Sim) applyFault(step int) {
 	case roll < 58:
 		// Partition a minority. A minority CANNOT elect or commit, so this
 		// tests that the majority carries on and the minority rejoins.
+		//
+		// Refused when it would leave no quorum: combined with a kill or an
+		// existing partition, one more cut can take the reachable set below
+		// a majority, and then nothing commits for the rest of the run.
+		if s.wouldBreakQuorum() {
+			return
+		}
 		victim := s.pickNode()
 		if victim == 0 {
 			return
@@ -744,6 +854,9 @@ func (s *Sim) applyFault(step int) {
 		// something new before any read of it could be stale. A partition
 		// that the next quiet step heals is over before that sequence can
 		// finish.
+		if s.wouldBreakQuorum() {
+			return
+		}
 		lead := s.leader()
 		if lead == nil {
 			return
@@ -764,9 +877,14 @@ func (s *Sim) applyFault(step int) {
 
 	case roll < 93:
 		// Kill a node, but never below quorum: with 3 nodes at most one may
-		// be down, or the cluster stops being able to commit at all and the
-		// rest of the run tests nothing.
-		if len(s.liveIDs()) <= quorum(s.cfg.Nodes) {
+		// be unavailable, or the cluster stops being able to commit at all
+		// and the rest of the run tests nothing.
+		//
+		// Counted over REACHABLE nodes, not live ones. A node that is live
+		// but partitioned cannot help form a quorum, so killing a second
+		// node while one is cut off breaks the very guarantee this guard
+		// exists to provide.
+		if s.wouldBreakQuorum() {
 			return
 		}
 		victim := s.pickNode()
@@ -809,6 +927,36 @@ func (s *Sim) heal(step int) bool {
 }
 
 func quorum(n int) int { return n/2 + 1 }
+
+// reachableCount is how many nodes can currently form a quorum together:
+// live AND not partitioned.
+//
+// Liveness alone is not the right count, and Day 9 is what exposed that. The
+// kill branch guarded on live nodes, which was correct while partitions
+// lasted less than a step; holding a leader partition for three steps made
+// "live" and "available" different things. Seed 9005 then killed the
+// partitioned leader and partitioned a second node, leaving ONE reachable
+// node out of three — below quorum, nothing could commit, and the
+// frozen-clock invariant fired on a cluster that was behaving correctly.
+//
+// The harness documents that it never drives the cluster below quorum,
+// because a cluster that cannot commit stops testing anything. This is the
+// count that makes that true.
+func (s *Sim) reachableCount() int {
+	n := 0
+	for _, id := range s.liveIDs() {
+		if !s.net.IsPartitioned(id) {
+			n++
+		}
+	}
+	return n
+}
+
+// wouldBreakQuorum reports whether removing one more node from the reachable
+// set would leave the cluster unable to commit.
+func (s *Sim) wouldBreakQuorum() bool {
+	return s.reachableCount()-1 < quorum(s.cfg.Nodes)
+}
 
 // pickNode chooses a live node deterministically from the seed. Sorted ids,
 // because ranging a map would make the choice depend on Go's map iteration

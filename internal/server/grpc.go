@@ -134,20 +134,47 @@ func (s *Service) SubmitJob(ctx context.Context, req *schedulerpb.SubmitJobReque
 	return &schedulerpb.SubmitJobResponse{JobId: res.JobID}, nil
 }
 
+// GetJob reads through readClient, so under ReadIndexBarrier it is served
+// only after a quorum confirmed this node still leads.
+//
+// The ORDER matters: the barrier runs before NOT_FOUND is decided. Deciding
+// absence from local state and then confirming leadership would answer
+// NOT_FOUND for a job the cluster had already committed — which is precisely
+// the Day 9 violation, moved one line later.
 func (s *Service) GetJob(ctx context.Context, req *schedulerpb.GetJobRequest) (*schedulerpb.GetJobResponse, error) {
 	if err := s.requireLeader(); err != nil {
 		return nil, err
 	}
 	var out *schedulerpb.Job
-	s.c.read(func(st *state.StateStore) {
+	if err := s.c.readClient(ctx, func(st *state.StateStore) {
 		if j, ok := st.Job(req.GetJobId()); ok {
 			out = jobToProto(st, j)
 		}
-	})
+	}); err != nil {
+		return nil, s.readError(err, "get job")
+	}
 	if out == nil {
 		return nil, status.Errorf(codes.NotFound, "unknown job %q", req.GetJobId())
 	}
 	return &schedulerpb.GetJobResponse{Job: out}, nil
+}
+
+// readError maps a refused read onto a gRPC code.
+//
+// Unavailable, never NotFound and never an empty success. A read that could
+// not be confirmed returned no value, and the one thing it must not look like
+// is an answer — a client handed NOT_FOUND for an unconfirmed read draws
+// exactly the false conclusion the barrier exists to prevent.
+func (s *Service) readError(err error, what string) error {
+	switch {
+	case errors.Is(err, ErrNotLeader):
+		return s.notLeader()
+	case errors.Is(err, ErrReadBarrier):
+		return status.Errorf(codes.Unavailable,
+			"%s: read barrier not confirmed by a quorum, retry: %v", what, err)
+	default:
+		return status.Errorf(codes.Internal, "%s: %v", what, err)
+	}
 }
 
 func (s *Service) ListJobs(ctx context.Context, req *schedulerpb.ListJobsRequest) (*schedulerpb.ListJobsResponse, error) {
@@ -155,7 +182,7 @@ func (s *Service) ListJobs(ctx context.Context, req *schedulerpb.ListJobsRequest
 		return nil, err
 	}
 	out := &schedulerpb.ListJobsResponse{}
-	s.c.read(func(st *state.StateStore) {
+	if err := s.c.readClient(ctx, func(st *state.StateStore) {
 		for _, id := range st.JobIDs() {
 			if req.GetLimit() > 0 && int32(len(out.Jobs)) >= req.GetLimit() {
 				return
@@ -164,7 +191,9 @@ func (s *Service) ListJobs(ctx context.Context, req *schedulerpb.ListJobsRequest
 				out.Jobs = append(out.Jobs, jobToProto(st, j))
 			}
 		}
-	})
+	}); err != nil {
+		return nil, s.readError(err, "list jobs")
+	}
 	return out, nil
 }
 

@@ -20,6 +20,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/evazheng/fault-tolerant-coordinator/internal/server"
 	"github.com/evazheng/fault-tolerant-coordinator/internal/sim"
 	"github.com/evazheng/fault-tolerant-coordinator/internal/simnet"
 )
@@ -41,6 +42,10 @@ func main() {
 		"history-recording clients for the linearizability check; 0 disables it")
 	linVizDir := flag.String("lin-viz-dir", "",
 		"directory for the HTML timeline written when a history is not linearizable")
+	readMode := flag.String("read-mode", "readindex",
+		"how client reads are served: readindex (quorum barrier) or local (NOT linearizable)")
+	stallThreshold := flag.Duration("stall-threshold", 0,
+		"override the Ready-loop stall budget; LOWER it to profile which phase owns the slow tail")
 	verbose := flag.Bool("v", false, "log every fault as it is applied")
 	flag.Parse()
 
@@ -57,6 +62,12 @@ func main() {
 		seed = time.Now().UnixNano()
 	}
 
+	mode, err := server.ParseReadMode(*readMode)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -64,7 +75,7 @@ func main() {
 	for i := 0; i < *runs; i++ {
 		s := seed + int64(i)
 		if err := runOne(ctx, s, *steps, *nodes, *dropRate, *corruptRate, *failureRate,
-			*deliverCorrupt, *maxDelay, *stepTime, *verbose, *linClients, *linVizDir); err != nil {
+			*deliverCorrupt, *maxDelay, *stepTime, *verbose, *linClients, *linVizDir, mode, *stallThreshold); err != nil {
 			failures++
 			fmt.Printf("\nFAILED  seed=%d\n", s)
 			fmt.Printf("  %v\n", err)
@@ -84,7 +95,7 @@ func main() {
 
 func runOne(ctx context.Context, seed int64, steps, nodes int, dropRate, corruptRate, failureRate float64,
 	deliverCorrupt bool, maxDelay, stepTime time.Duration, verbose bool,
-	linClients int, linVizDir string) error {
+	linClients int, linVizDir string, mode server.ReadMode, stallThreshold time.Duration) error {
 
 	dir, err := os.MkdirTemp("", fmt.Sprintf("sim-%d-", seed))
 	if err != nil {
@@ -111,6 +122,8 @@ func runOne(ctx context.Context, seed int64, steps, nodes int, dropRate, corrupt
 		DeliverCorrupt: deliverCorrupt, MaxDelay: maxDelay,
 	}
 	cfg.FailureRate = failureRate
+	cfg.ReadMode = mode
+	cfg.StallThreshold = stallThreshold
 	cfg.LinClients = linClients
 	cfg.LinVizDir = linVizDir
 	cfg.Out = io.Discard
@@ -118,7 +131,8 @@ func runOne(ctx context.Context, seed int64, steps, nodes int, dropRate, corrupt
 		cfg.Out = os.Stdout
 	}
 
-	fmt.Printf("seed=%-20d nodes=%d steps=%d drop=%.0f%% ... ", seed, nodes, steps, dropRate*100)
+	fmt.Printf("seed=%-20d nodes=%d steps=%d drop=%.0f%% reads=%s ... ",
+		seed, nodes, steps, dropRate*100, mode)
 	start := time.Now()
 	res, err := sim.New(cfg, dirs).Run(ctx)
 	elapsed := time.Since(start).Round(time.Millisecond)

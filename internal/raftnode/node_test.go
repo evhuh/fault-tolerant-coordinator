@@ -1,6 +1,7 @@
 package raftnode
 
 import (
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -131,7 +132,7 @@ func TestIdleLoopIsNotReportedAsStalled(t *testing.T) {
 		stopc: make(chan struct{}),
 		done:  make(chan struct{}),
 	}
-	n.h = Handler{Stalled: func(time.Duration) { fired.Add(1) }}
+	n.h = Handler{Stalled: func(Stall) { fired.Add(1) }}
 
 	go n.watchStalls()
 	defer close(n.stopc)
@@ -152,7 +153,7 @@ func TestStalledLoopIsReportedOnce(t *testing.T) {
 		stopc: make(chan struct{}),
 		done:  make(chan struct{}),
 	}
-	n.h = Handler{Stalled: func(time.Duration) { fired.Add(1) }}
+	n.h = Handler{Stalled: func(Stall) { fired.Add(1) }}
 
 	go n.watchStalls()
 	defer close(n.stopc)
@@ -178,5 +179,85 @@ func TestStalledLoopIsReportedOnce(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 	if fired.Load() != 2 {
 		t.Errorf("second stall reported %d times total, want 2", fired.Load())
+	}
+}
+
+// A stall must say WHICH phase blocked. Without it the report names a class
+// of bug rather than a line of code, and a real stall that does not reproduce
+// gets filed as flakiness — which is exactly what happened to a 176ms stall
+// seen on one simulator run in twenty-four.
+func TestStallReportsThePhaseItBlockedIn(t *testing.T) {
+	var got Stall
+	var fired atomic.Int64
+	n := &Node{
+		cfg:   Config{TickInterval: 2 * time.Millisecond, ElectionTick: 10}, // threshold 10ms
+		clk:   clock.Real{},
+		stopc: make(chan struct{}),
+		done:  make(chan struct{}),
+	}
+	n.h = Handler{Stalled: func(s Stall) {
+		got = s
+		fired.Add(1)
+	}}
+
+	go n.watchStalls()
+	defer close(n.stopc)
+
+	// Stall inside the compaction phase specifically.
+	n.phase.Store(phaseCompact)
+	n.processingSince.Store(time.Now().UnixNano())
+	time.Sleep(100 * time.Millisecond)
+
+	if fired.Load() == 0 {
+		t.Fatal("no stall reported")
+	}
+	if got.Phase != "snapshot+compact" {
+		t.Errorf("stall phase = %q, want %q", got.Phase, "snapshot+compact")
+	}
+	if got.Duration <= 0 {
+		t.Errorf("stall duration = %s, want positive", got.Duration)
+	}
+	// The String form is what lands in the simulator's violation message.
+	if !strings.Contains(got.String(), "snapshot+compact") {
+		t.Errorf("stall string %q does not name the phase", got.String())
+	}
+}
+
+// The two causes a stall can have must be distinguishable, because they have
+// opposite meanings: an fsync is the host being slow, and an apply that blocks
+// is this program deadlocking on its own goroutine. Reporting them the same
+// way meant a 3.42s fsync was announced as "a blocking call on the loop's own
+// goroutine", and would equally have let a real deadlock be dismissed as a
+// slow disk.
+func TestStallDistinguishesDiskFromBlockingCall(t *testing.T) {
+	for _, tc := range []struct {
+		phase   int32
+		name    string
+		ioBound bool
+	}{
+		{phasePersist, "persist", true},
+		{phaseCompact, "snapshot+compact", true},
+		{phaseSnapshotIn, "restore-incoming-snapshot", true},
+		{phaseApply, "apply", false},
+		{phaseSoftState, "leadership-change", false},
+		{phaseSend, "send", false},
+	} {
+		if got := phaseName(tc.phase); got != tc.name {
+			t.Errorf("phaseName(%d) = %q, want %q", tc.phase, got, tc.name)
+		}
+		if got := ioBoundPhase(tc.phase); got != tc.ioBound {
+			t.Errorf("ioBoundPhase(%s) = %v, want %v", tc.name, got, tc.ioBound)
+		}
+	}
+
+	// The string form carries the distinction too, since that is what lands
+	// in the simulator's message.
+	disk := Stall{Duration: 3420 * time.Millisecond, Phase: "persist", IOBound: true}
+	if !strings.Contains(disk.String(), "host I/O") {
+		t.Errorf("disk stall %q does not name its cause", disk.String())
+	}
+	logic := Stall{Duration: 200 * time.Millisecond, Phase: "apply"}
+	if !strings.Contains(logic.String(), "blocking call") {
+		t.Errorf("logic stall %q does not name its cause", logic.String())
 	}
 }

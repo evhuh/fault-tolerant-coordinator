@@ -13,6 +13,7 @@ package raftnode
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"log"
 	"sync"
@@ -85,7 +86,20 @@ type Handler struct {
 	// Apply is called for every committed entry, on EVERY node, in log order.
 	// It must be deterministic: this is the apply path, so no wall clock, no
 	// randomness, no map-order dependence.
-	Apply func(data []byte)
+	//
+	// index is the entry's log position, passed so the state machine can
+	// record it UNDER ITS OWN LOCK, in the same critical section as the
+	// mutation.
+	//
+	// That is not a convenience. Node.AppliedIndex is advanced by the Ready
+	// loop after Apply returns, so between the two a reader sees state that
+	// already contains the entry while the index still reports the previous
+	// one — and a reader comparing two replicas at "the same index" is then
+	// comparing different positions. The simulator's divergence detector hit
+	// exactly that and reported a false divergence at index 555. The index
+	// has to move with the state, and only the state machine's lock can make
+	// that true.
+	Apply func(index uint64, data []byte)
 
 	// LeadershipChanged fires when this node gains or loses leadership. The
 	// coordinator uses it to start and stop the leader-only components —
@@ -104,7 +118,7 @@ type Handler struct {
 	//
 	// The simulator treats a stall as an invariant violation and fails the
 	// run with its seed.
-	Stalled func(time.Duration)
+	Stalled func(Stall)
 
 	// Fatal reports an unrecoverable node error: a WAL write that failed, or
 	// storage that rejected an entry raft already durably logged. This node
@@ -131,6 +145,52 @@ type Handler struct {
 	// lagging follower would receive a snapshot it silently dropped and stay
 	// stuck forever.
 	Restore func([]byte) error
+
+	// RestoredAt reports the log position a Restore landed on, so the state
+	// machine records the index belonging to the state it just installed
+	// rather than the one it had before. Same coherence requirement as
+	// Apply's index.
+	RestoredAt func(index uint64)
+}
+
+// Stall is one observed Ready-loop stall, with the phase it was in.
+type Stall struct {
+	Duration time.Duration
+	// Phase is which part of the batch was running, e.g. "snapshot+compact"
+	// or "leadership-change". Naming it is what makes a stall investigable.
+	Phase string
+	// IOBound distinguishes the two very different things a stall can mean,
+	// which the detector used to report identically.
+	//
+	// A stall in persist or snapshot+compact is the loop waiting on an
+	// fsync. The code is doing the right thing — append and sync once per
+	// batch, the same as etcd — and the duration is the HOST's disk
+	// latency, not a property of this program. Observed: 26-36ms on a quiet
+	// disk, and 3.42s on a machine that had just run a hundred and seventy
+	// simulator runs back to back.
+	//
+	// A stall in apply, leadership-change or send is the thing the invariant
+	// was actually built to catch: something on that goroutine blocking on
+	// work the goroutine itself serves. Day 8's leadership-revocation
+	// deadlock was exactly this, in leadership-change.
+	//
+	// Conflating them means a slow disk gets reported as a concurrency bug,
+	// and — worse — a real concurrency bug gets dismissed as a slow disk.
+	IOBound bool
+}
+
+func (s Stall) String() string {
+	kind := "blocking call"
+	if s.IOBound {
+		kind = "host I/O"
+	}
+	return fmt.Sprintf("%s in %s (%s)", s.Duration.Round(time.Millisecond), s.Phase, kind)
+}
+
+// ioBoundPhase reports whether a phase's duration is dominated by waiting on
+// the disk rather than by this program's own logic.
+func ioBoundPhase(p int32) bool {
+	return p == phasePersist || p == phaseCompact || p == phaseSnapshotIn
 }
 
 type Node struct {
@@ -158,6 +218,22 @@ type Node struct {
 	confState     *raftpb.ConfState
 
 	appliedAtomic atomic.Uint64
+
+	// rb tracks in-flight ReadIndex barriers. See readindex.go.
+	rb *readBarrier
+
+	// phase is which part of the current batch the Ready loop is in, so a
+	// stall report can name the blocking call instead of merely asserting
+	// that there was one.
+	//
+	// The invariant's message — "a blocking call on the loop's own
+	// goroutine" — is not actionable without this. A 176ms stall appeared on
+	// roughly one run in twenty-four, did not reproduce on replay, and could
+	// have been a snapshot fsync, a leadership revocation waiting on the
+	// scheduler, or an Apply; those have different fixes and guessing
+	// between them from timing alone is how a real stall gets filed as
+	// flakiness.
+	phase atomic.Int32
 
 	// processingSince is the unix-nano instant the Ready loop began handling
 	// the current batch, or 0 when idle.
@@ -230,6 +306,9 @@ func New(cfg Config, h Handler) (*Node, error) {
 			if err := h.Restore(snap.GetData()); err != nil {
 				return nil, fmt.Errorf("raftnode: restore state machine: %w", err)
 			}
+			if h.RestoredAt != nil {
+				h.RestoredAt(snap.GetMetadata().GetIndex())
+			}
 		}
 		hadState = true // a snapshot IS a past: restart, never bootstrap
 	}
@@ -261,6 +340,7 @@ func New(cfg Config, h Handler) (*Node, error) {
 	n := &Node{
 		cfg: cfg, h: h, storage: storage, wal: w,
 		tp:            tp,
+		rb:            newReadBarrier(),
 		clk:           clock.OrReal(cfg.Clock),
 		stopc:         make(chan struct{}),
 		done:          make(chan struct{}),
@@ -317,6 +397,40 @@ func (n *Node) Run() {
 // threshold sat under the fsync floor, and legitimate snapshots looked like
 // stalls. The budget has to stay above the hardware, not just internally
 // consistent.
+// Phases of one Ready batch, in the order handleReady runs them.
+const (
+	phaseIdle int32 = iota
+	phaseSoftState
+	phaseSnapshotIn // receiving and restoring a leader's snapshot
+	phasePersist    // WAL save, hardstate, append
+	phaseSend
+	phaseApply
+	phaseCompact // maybeSnapshot: serialize, fsync, rewrite the WAL
+	phaseAdvance
+)
+
+func phaseName(p int32) string {
+	switch p {
+	case phaseIdle:
+		return "idle"
+	case phaseSoftState:
+		return "leadership-change"
+	case phaseSnapshotIn:
+		return "restore-incoming-snapshot"
+	case phasePersist:
+		return "persist"
+	case phaseSend:
+		return "send"
+	case phaseApply:
+		return "apply"
+	case phaseCompact:
+		return "snapshot+compact"
+	case phaseAdvance:
+		return "advance"
+	}
+	return "unknown"
+}
+
 func (n *Node) stallThreshold() time.Duration {
 	if n.cfg.StallThreshold > 0 {
 		return n.cfg.StallThreshold
@@ -355,11 +469,15 @@ func (n *Node) watchStalls() {
 			}
 			if elapsed := time.Since(time.Unix(0, since)); elapsed > threshold {
 				reportedFor = since
-				log.Printf("raftnode: node %d READY LOOP STALLED for %s (threshold %s) — "+
+				ph := n.phase.Load()
+				where := phaseName(ph)
+				log.Printf("raftnode: node %d READY LOOP STALLED for %s in %s (threshold %s) — "+
 					"something on that goroutine is blocking on work the goroutine itself serves",
-					n.cfg.ID, elapsed.Round(time.Millisecond), threshold)
+					n.cfg.ID, elapsed.Round(time.Millisecond), where, threshold)
 				if n.h.Stalled != nil {
-					n.h.Stalled(elapsed)
+					n.h.Stalled(Stall{
+						Duration: elapsed, Phase: where, IOBound: ioBoundPhase(ph),
+					})
 				}
 			}
 		}
@@ -430,6 +548,10 @@ func (n *Node) Stop() {
 // run is the Ready loop: the whole contract this package exists to implement.
 func (n *Node) run() {
 	defer close(n.done)
+	// Fail in-flight barriers on the way out. A caller blocked on a loop
+	// that has exited would otherwise wait out its whole context for an
+	// answer that is never coming.
+	defer n.rb.failAll()
 	defer n.tp.Close()
 	defer n.node.Stop()
 	defer func() { _ = n.wal.Close() }()
@@ -537,6 +659,8 @@ func (n *Node) maybeSnapshot() error {
 func (n *Node) handleReady(rd raft.Ready) bool {
 	n.processingSince.Store(time.Now().UnixNano())
 	defer n.processingSince.Store(0)
+	n.phase.Store(phaseSoftState)
+	defer n.phase.Store(phaseIdle)
 
 	// Leadership first, so the coordinator has started or stopped its
 	// leader-only parts before any of this batch is applied.
@@ -548,6 +672,7 @@ func (n *Node) handleReady(rd raft.Ready) bool {
 	// fallen further behind than its log can repair. Dropping it —
 	// which is what ignoring rd.Snapshot does — leaves the node stuck
 	// forever, so this must exist before compaction is ever enabled.
+	n.phase.Store(phaseSnapshotIn)
 	if !raft.IsEmptySnap(rd.Snapshot) {
 		if err := saveSnapshot(n.cfg.DataDir, rd.Snapshot); err != nil {
 			n.fatal(fmt.Errorf("save incoming snapshot: %w", err))
@@ -562,10 +687,14 @@ func (n *Node) handleReady(rd raft.Ready) bool {
 				n.fatal(fmt.Errorf("restore from incoming snapshot: %w", err))
 				return false
 			}
+			if n.h.RestoredAt != nil {
+				n.h.RestoredAt(rd.Snapshot.GetMetadata().GetIndex())
+			}
 		}
 		idx := rd.Snapshot.GetMetadata().GetIndex()
 		n.appliedIndex, n.snapshotIndex = idx, idx
 		n.appliedAtomic.Store(idx)
+		n.rb.notifyApplied()
 		log.Printf("raftnode: node %d restored from leader snapshot at index %d", n.cfg.ID, idx)
 	}
 
@@ -574,6 +703,7 @@ func (n *Node) handleReady(rd raft.Ready) bool {
 	// A failure here means this node cannot keep its durability
 	// promise. It stops rather than continuing as a liar — but it
 	// stops ALONE, so a peer sharing the process survives.
+	n.phase.Store(phasePersist)
 	if err := n.wal.Save(rd.HardState, rd.Entries); err != nil {
 		n.fatal(fmt.Errorf("wal save: %w", err))
 		return false
@@ -591,11 +721,13 @@ func (n *Node) handleReady(rd raft.Ready) bool {
 
 	// 2. SEND — only now, because the entries these messages claim are
 	// durable actually are.
+	n.phase.Store(phaseSend)
 	for _, m := range rd.Messages {
 		go n.tp.Send(m)
 	}
 
 	// 3. APPLY
+	n.phase.Store(phaseApply)
 	for _, ent := range rd.CommittedEntries {
 		switch ent.GetType() {
 		case raftpb.EntryConfChange:
@@ -609,7 +741,7 @@ func (n *Node) handleReady(rd raft.Ready) bool {
 			n.confState = n.node.ApplyConfChange(cc)
 		case raftpb.EntryNormal:
 			if len(ent.GetData()) > 0 {
-				n.h.Apply(ent.GetData())
+				n.h.Apply(ent.GetIndex(), ent.GetData())
 			}
 			// An empty entry is a new leader's no-op. It still
 			// ADVANCES the index: skipping it here would make the
@@ -620,14 +752,33 @@ func (n *Node) handleReady(rd raft.Ready) bool {
 			n.appliedAtomic.Store(idx)
 		}
 	}
+	// Wake read barriers once per batch rather than once per entry: a
+	// waiter only cares whether it has reached its index, and waking it
+	// mid-batch just makes it look again at a number that is still moving.
+	if len(rd.CommittedEntries) > 0 {
+		n.rb.notifyApplied()
+	}
+
+	// ReadStates, delivered AFTER the batch is applied. Each one is a quorum
+	// confirmation that this node still leads, carrying the index the read
+	// must not be served below; handing them over here means a barrier whose
+	// index this batch already covered returns without another wakeup.
+	for _, rs := range rd.ReadStates {
+		if len(rs.RequestCtx) != 8 {
+			continue // not ours
+		}
+		n.rb.deliver(binary.BigEndian.Uint64(rs.RequestCtx), rs.Index)
+	}
 
 	// 3b. COMPACT once enough has been applied to be worth it.
+	n.phase.Store(phaseCompact)
 	if err := n.maybeSnapshot(); err != nil {
 		n.fatal(err)
 		return false
 	}
 
 	// 4. ADVANCE — raft holds the next Ready until this call.
+	n.phase.Store(phaseAdvance)
 	n.node.Advance()
 	return true
 }

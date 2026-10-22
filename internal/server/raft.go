@@ -27,6 +27,15 @@ var (
 	// came back. A leader change or a partition does this. The caller RETRIES,
 	// and (clientID, requestID) dedup is what makes the retry safe.
 	ErrProposalLost = errors.New("proposal lost")
+	// ErrReadBarrier means a linearizable read could not confirm, with a
+	// quorum, that this node still leads. The read was NOT served.
+	//
+	// It is distinct from ErrNotLeader on purpose: this node may well still
+	// be the leader, and telling the client to go elsewhere would send it
+	// looking for a leader that does not exist. The caller RETRIES, like a
+	// lost proposal, and unlike a lost proposal there is nothing to be
+	// idempotent about, because a refused read has no effect.
+	ErrReadBarrier = errors.New("read barrier not confirmed")
 )
 
 // defaultProposalTimeout bounds how long a caller waits for its entry to
@@ -146,6 +155,7 @@ func (c *Coordinator) StartRaft(cfg raftnode.Config) error {
 	// simulator hit it within ten steps.
 	node, err := raftnode.New(cfg, raftnode.Handler{
 		Apply:             c.applyCommitted,
+		RestoredAt:        c.restoredAt,
 		LeadershipChanged: c.onLeadershipChanged,
 		Fatal:             c.fatal,
 		Snapshot:          c.snapshotState,
@@ -186,7 +196,17 @@ func (c *Coordinator) StopRaft() {
 
 // applyCommitted runs on EVERY replica, in log order, for every committed
 // entry. It is the only writer to the StateStore once Raft is wired.
-func (c *Coordinator) applyCommitted(data []byte) {
+// applyCommitted applies one committed entry and records its log position in
+// the SAME critical section as the mutation.
+//
+// The index has to move with the state. raftnode advances its own applied
+// index after this returns, so a reader that sampled the index first and the
+// state second could encode state containing this entry while the index still
+// reported the previous one — and the simulator's divergence detector, which
+// compares two replicas only at indices they share, then compares different
+// positions and calls it divergence. It did: a false "nodes 1 and 3 DIVERGED
+// at applied index 555" on one run in twenty-two.
+func (c *Coordinator) applyCommitted(index uint64, data []byte) {
 	cmd := &commandpb.Command{}
 	if err := proto.Unmarshal(data, cmd); err != nil {
 		// A command this build cannot decode is a schema-evolution failure,
@@ -203,6 +223,13 @@ func (c *Coordinator) applyCommitted(data []byte) {
 
 	c.mu.Lock()
 	res, err := c.store.Apply(cmd)
+	// Inside the lock, next to the mutation, so (state, appliedIndex) is
+	// never observed skewed. Advanced even when Apply returns an error: the
+	// entry is committed and consumed either way, and a replica that
+	// rejected it is at this position too.
+	if index > c.appliedIndex {
+		c.appliedIndex = index
+	}
 	c.mu.Unlock()
 
 	// The waiter is leader-side only; followers have none and skip this.
@@ -440,11 +467,23 @@ func (c *Coordinator) restoreState(data []byte) error {
 // Raft. The invariant checker uses it to compare replicas at the same log
 // position — comparing two nodes at DIFFERENT positions is meaningless, since
 // a node a few entries behind legitimately holds different state.
+// AppliedIndex is the log position of the state the store currently holds.
+//
+// Read under the apply lock, and advanced under it, so it is COHERENT with
+// what ReadState would encode. raftnode keeps its own applied index for
+// compaction; that one is allowed to lag behind this by the width of an
+// Apply, and is not what a replica comparison may use.
 func (c *Coordinator) AppliedIndex() uint64 {
-	if c.raft == nil {
-		return 0
-	}
-	return c.raft.AppliedIndex()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.appliedIndex
+}
+
+// restoredAt resets the recorded position to the snapshot a Restore installed.
+func (c *Coordinator) restoredAt(index uint64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.appliedIndex = index
 }
 
 // onStalled records that this node's Ready loop blocked too long.
@@ -453,15 +492,15 @@ func (c *Coordinator) AppliedIndex() uint64 {
 // when whatever it waits on times out. The point is that the stall becomes
 // EVIDENCE instead of an unexplained election: the simulator reads it as an
 // invariant violation and fails the run with its seed.
-func (c *Coordinator) onStalled(d time.Duration) {
+func (c *Coordinator) onStalled(st raftnode.Stall) {
 	c.stallMu.Lock()
-	c.stalls = append(c.stalls, d)
+	c.stalls = append(c.stalls, st)
 	c.stallMu.Unlock()
 }
 
 // Stalls reports Ready-loop stalls observed on this node.
-func (c *Coordinator) Stalls() []time.Duration {
+func (c *Coordinator) Stalls() []raftnode.Stall {
 	c.stallMu.Lock()
 	defer c.stallMu.Unlock()
-	return append([]time.Duration(nil), c.stalls...)
+	return append([]raftnode.Stall(nil), c.stalls...)
 }

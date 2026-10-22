@@ -63,6 +63,11 @@ type Config struct {
 	// deadlines. Nil means the real one. The apply path has no clock at all
 	// and never will — that is what Tick is for.
 	Clock clock.Clock
+	// ReadMode decides how client reads are served. See ReadMode.
+	ReadMode ReadMode
+	// ReadTimeout bounds a linearizable read's wait for its quorum barrier.
+	// Zero means the default. Ignored under ReadLocal, which never waits.
+	ReadTimeout time.Duration
 	// APIAddrs maps a raft node id to that node's gRPC address.
 	//
 	// It exists because the two address spaces are DIFFERENT: the raft peer
@@ -78,7 +83,57 @@ func DefaultConfig() Config {
 		TickPeriod:     200 * time.Millisecond,
 		CommandVersion: state.CommandVersionPartialPlan,
 		Sched:          sched.DefaultConfig(),
+		ReadMode:       ReadIndexBarrier,
+		ReadTimeout:    2 * time.Second,
 	}
+}
+
+// ReadMode decides whether a client read is linearizable.
+//
+// It is a switch rather than a constant because the two modes are the
+// evidence for each other. ReadLocal is kept — and kept TESTED — because the
+// Day 9 regression test runs under it and asserts the history is Illegal:
+// that is the proof the linearizability checker can still see the bug it was
+// built to find. A checker that only ever runs against the fixed
+// configuration cannot distinguish "correct" from "no longer looking", and a
+// green result from one is indistinguishable from a green result from the
+// other.
+type ReadMode int
+
+const (
+	// ReadLocal serves reads from the leader's own state machine with no
+	// quorum check. Fast, and NOT LINEARIZABLE: a leader on the minority
+	// side of a partition keeps answering from state the cluster has
+	// already moved past. This was the behaviour Day 9 found and it is
+	// retained only as the negative control.
+	ReadLocal ReadMode = iota
+	// ReadIndexBarrier takes a ReadIndex barrier before serving: a quorum
+	// must confirm this node still leads, and the local state machine must
+	// have applied up to the index that confirmation carried. A cut-off
+	// leader cannot obtain the confirmation, so the read fails instead of
+	// lying.
+	ReadIndexBarrier
+)
+
+func (m ReadMode) String() string {
+	switch m {
+	case ReadLocal:
+		return "local"
+	case ReadIndexBarrier:
+		return "readindex"
+	}
+	return "unknown"
+}
+
+// ParseReadMode maps the CLI spelling onto a mode.
+func ParseReadMode(s string) (ReadMode, error) {
+	switch s {
+	case "local":
+		return ReadLocal, nil
+	case "readindex":
+		return ReadIndexBarrier, nil
+	}
+	return ReadLocal, fmt.Errorf("unknown read mode %q (want \"local\" or \"readindex\")", s)
 }
 
 type Coordinator struct {
@@ -90,6 +145,9 @@ type Coordinator struct {
 	// any real load.
 	mu    sync.Mutex
 	store *state.StateStore
+	// appliedIndex is the log position of the state store, advanced inside
+	// the same critical section as the mutation. See applyCommitted.
+	appliedIndex uint64
 
 	rand io.Reader
 	// clk is this node's view of wall time. Everything inside the state
@@ -133,7 +191,7 @@ type Coordinator struct {
 	// stalls records Ready-loop stalls. A non-empty list means something on
 	// that goroutine blocked on work the goroutine itself serves.
 	stallMu sync.Mutex
-	stalls  []time.Duration
+	stalls  []raftnode.Stall
 
 	// fatalErr records an unrecoverable failure that halted this node.
 	fatalOnce sync.Once
@@ -287,6 +345,65 @@ func (c *Coordinator) read(fn func(s *state.StateStore)) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	fn(c.store)
+}
+
+// readClient serves a CLIENT read, taking whatever barrier ReadMode requires
+// before touching local state.
+//
+// This is where Day 9's decision landed, and the split from read() is the
+// important part. read() is the local, unbarriered accessor, and it still has
+// callers that must stay local: the invariant checker reads FOLLOWERS to
+// compare replicas, and the worker RPCs read state they are about to propose
+// against, where the state machine re-checks the lease at apply time and a
+// stale read cannot produce a wrong effect. A barrier on those would be cost
+// without a guarantee.
+//
+// Client reads are the opposite case: the answer IS the effect, there is no
+// apply-time re-check downstream, and a stale one is a wrong answer handed to
+// a caller with no way to know.
+//
+// The barrier runs OUTSIDE c.mu. Holding the apply lock across a quorum
+// round-trip would block every proposal on the node — including the
+// heartbeats the barrier itself is waiting for, which is a deadlock of
+// exactly the shape Day 8 found in leadership revocation.
+func (c *Coordinator) readClient(ctx context.Context, fn func(s *state.StateStore)) error {
+	if c.cfg.ReadMode == ReadIndexBarrier {
+		if err := c.readBarrier(ctx); err != nil {
+			return err
+		}
+	}
+	c.read(fn)
+	return nil
+}
+
+// readBarrier waits for a quorum to confirm this node still leads.
+func (c *Coordinator) readBarrier(ctx context.Context) error {
+	node := c.raft
+	if node == nil {
+		// Single-node, no raft: proposals apply directly, so there is no
+		// quorum to consult and nothing can be stale.
+		return nil
+	}
+
+	timeout := c.cfg.ReadTimeout
+	if timeout <= 0 {
+		timeout = 2 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	err := node.ReadIndex(ctx)
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, raftnode.ErrNotLeaderNode):
+		return ErrNotLeader
+	default:
+		// Includes the case this exists for: a cut-off leader whose
+		// heartbeats no quorum answers. The honest report is "could not
+		// confirm", which a client retries, not an answer.
+		return fmt.Errorf("%w: %w", ErrReadBarrier, err)
+	}
 }
 
 // RunTicker proposes Tick{nowMs} until ctx is cancelled. It is the ONLY

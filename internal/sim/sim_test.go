@@ -3,6 +3,7 @@ package sim
 import (
 	"bytes"
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -20,6 +21,75 @@ func dirsFor(t *testing.T, n int) map[uint64]string {
 	return out
 }
 
+// EVERY TEST ASSERTS ONLY ITS OWN PROPERTY.
+//
+// Run checks several unrelated things, so a bare "err != nil" turns a test
+// red for a reason it was not written to detect — and then reports the wrong
+// cause. When the linearizability check landed, the comparison-floor test
+// announced "a healthy run failed its own floor" over a run whose floor was
+// fine, and the schedule-reproducibility test went red over a violation that
+// has nothing to do with schedules. Both sent the reader to the wrong code.
+//
+// So the tests below select on KIND. Only the dedicated linearizability tests
+// may fail on an illegal history: the stale-read finding under ReadLocal, its
+// ReadIndexBarrier counterpart, and TestSeedSweep, which is kept deliberately
+// as a broad detector.
+
+// ownViolations drops the violations a test does not own, so what remains is
+// what that test is actually about.
+func ownViolations(res Result, ignore func(ViolationKind) bool) []Violation {
+	var out []Violation
+	for _, v := range res.Violations {
+		if ignore(v.Kind) {
+			continue
+		}
+		out = append(out, v)
+	}
+	return out
+}
+
+// notLinearizability is the usual filter: this test is about something else.
+// Environment kinds are dropped alongside, since "the host's disk stalled"
+// and "the run left the fault model" are nobody's property.
+func notLinearizability(k ViolationKind) bool {
+	return k.IsLinearizability() || k.IsEnvironment()
+}
+
+// notMine is the same filter as an error predicate.
+func notMine(err error) bool {
+	var v Violation
+	if !errors.As(err, &v) {
+		return false
+	}
+	return v.Kind.IsLinearizability() || v.Kind.IsEnvironment()
+}
+
+// environmentOnly reports whether every violation recorded was an
+// environment one, which is how the detector sweep tells "nothing was found"
+// from "nothing could be looked at".
+func environmentOnly(res Result) bool {
+	if len(res.Violations) == 0 {
+		return false
+	}
+	for _, v := range res.Violations {
+		if !v.Kind.IsEnvironment() {
+			return false
+		}
+	}
+	return true
+}
+
+// findKind returns the first violation of a kind, which is how a test asserts
+// on the check it owns rather than on whatever failed first.
+func findKind(res Result, kind ViolationKind) (Violation, bool) {
+	for _, v := range res.Violations {
+		if v.Kind == kind {
+			return v, true
+		}
+	}
+	return Violation{}, false
+}
+
 func quickConfig(seed int64, steps int) Config {
 	cfg := DefaultConfig()
 	cfg.Seed = seed
@@ -35,11 +105,13 @@ func quickConfig(seed int64, steps int) Config {
 func TestShortRunCompletes(t *testing.T) {
 	cfg := quickConfig(42, 10)
 	res, err := New(cfg, dirsFor(t, cfg.Nodes)).Run(context.Background())
-	if err != nil {
+	// This test is about completing without wedging, not about
+	// linearizability; the dedicated tests own that.
+	if err != nil && !notMine(err) {
 		t.Fatalf("seed %d: %v", cfg.Seed, err)
 	}
-	if len(res.Violations) != 0 {
-		t.Errorf("violations: %v", res.Violations)
+	if vs := ownViolations(res, notLinearizability); len(vs) != 0 {
+		t.Errorf("violations: %v", vs)
 	}
 	t.Logf("seed=%d kills=%d restarts=%d partitions=%d heals=%d jobs=%d tasks=%d",
 		res.Seed, res.Faults.NodeKills, res.Faults.NodeRestarts,
@@ -63,7 +135,11 @@ func TestSameSeedReproducesTheFaultSchedule(t *testing.T) {
 		var log bytes.Buffer
 		cfg.Out = &log
 		res, err := New(cfg, dirsFor(t, cfg.Nodes)).Run(context.Background())
-		if err != nil {
+		// Schedule reproducibility is the only claim here. A linearizability
+		// violation says nothing about whether the seed drove the same
+		// adversary, and failing on one made this test red for seed 5678
+		// over an entirely unrelated finding.
+		if err != nil && !notMine(err) {
 			t.Fatalf("seed %d: %v", seed, err)
 		}
 		return log.String(), res.Faults
@@ -97,6 +173,14 @@ func TestSameSeedReproducesTheFaultSchedule(t *testing.T) {
 
 // A sweep of seeds, each short. This is the shape Day 10 scales up: breadth
 // across adversaries beats depth on one.
+//
+// Unlike every other test here, this one is a DETECTOR and fails on any kind
+// of violation, linearizability included. It is the broad net; the tests
+// above each own one property. Note what that costs: detection here is
+// seed-and-timing dependent, since the seed reproduces the adversary and not
+// the execution, so this catching something is informative and this passing
+// is not a guarantee. The deterministic scenario tests are the reliable
+// artifact.
 func TestSeedSweep(t *testing.T) {
 	if testing.Short() {
 		t.Skip("sweep is slow; -short runs the single-seed test only")
@@ -104,6 +188,14 @@ func TestSeedSweep(t *testing.T) {
 	for seed := int64(1); seed <= 6; seed++ {
 		cfg := quickConfig(seed, 8)
 		res, err := New(cfg, dirsFor(t, cfg.Nodes)).Run(context.Background())
+		// Environment-only outcomes are REPORTED, not failed. A host whose
+		// fsyncs ran past the run's compressed timings did not find a bug
+		// and did not clear the system either; failing on it is how a
+		// detector becomes nondeterministically red on a busy laptop.
+		if environmentOnly(res) {
+			t.Logf("seed %d inconclusive (environment, not a finding): %v", seed, res.Violations)
+			continue
+		}
 		if err != nil {
 			t.Errorf("seed %d FAILED: %v  (reproduce: simulator -seed %d -steps 8 -v)", seed, err, seed)
 			continue
@@ -182,10 +274,13 @@ func TestImpossibleComparisonFloorIsInconclusiveNotAPass(t *testing.T) {
 	if err == nil {
 		t.Fatal("a run that compared far below the floor passed")
 	}
-	if len(res.Violations) == 0 {
-		t.Fatal("no violation recorded")
+	// The floor violation specifically, not "whatever failed first": with an
+	// unreachable floor a linearizability finding can sort ahead of it, and
+	// then this test would be asserting on the wrong violation.
+	v, ok := findKind(res, KindComparisonFloor)
+	if !ok {
+		t.Fatalf("no comparison-floor violation recorded; got %v", res.Violations)
 	}
-	v := res.Violations[0]
 	if !v.Inconclusive {
 		t.Errorf("recorded as a violation, want INCONCLUSIVE: %v", v)
 	}
@@ -202,11 +297,15 @@ func TestDefaultComparisonFloorIsReachable(t *testing.T) {
 	if cfg.MinComparisons == 0 {
 		t.Fatal("default MinComparisons is 0 — the floor is disabled")
 	}
-	res, err := New(cfg, dirsFor(t, cfg.Nodes)).Run(context.Background())
-	if err != nil {
-		t.Fatalf("a healthy run failed its own floor (%d): %v", cfg.MinComparisons, err)
+	res, _ := New(cfg, dirsFor(t, cfg.Nodes)).Run(context.Background())
+
+	// The FLOOR is this test's subject. It used to fail reporting "a healthy
+	// run failed its own floor" over a run that made 115 comparisons and
+	// failed its linearizability check instead.
+	if v, ok := findKind(res, KindComparisonFloor); ok {
+		t.Fatalf("a healthy run failed its own floor (%d): %v", cfg.MinComparisons, v)
 	}
-	for _, v := range res.Violations {
+	for _, v := range ownViolations(res, notLinearizability) {
 		if v.Inconclusive {
 			t.Errorf("healthy run reported inconclusive: %v", v)
 		}
@@ -225,7 +324,13 @@ func TestRunExercisesTheFailurePaths(t *testing.T) {
 	for seed := int64(100); seed < 104; seed++ {
 		cfg := quickConfig(seed, 20)
 		res, err := New(cfg, dirsFor(t, cfg.Nodes)).Run(context.Background())
-		if err != nil {
+		// A violation does not invalidate the COVERAGE this run measured,
+		// and coverage is this test's subject. Aborting the sweep on a
+		// linearizability finding reported nothing about the paths already
+		// exercised, which is the one thing a coverage test must not do.
+		// Invariant and convergence failures still abort: those mean the
+		// state the coverage was read from is not trustworthy.
+		if err != nil && !notMine(err) {
 			t.Fatalf("seed %d: %v", seed, err)
 		}
 		c := res.Coverage

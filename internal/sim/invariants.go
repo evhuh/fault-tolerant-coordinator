@@ -32,7 +32,10 @@ func (s *Sim) checkInvariants(step int) []Violation {
 
 	var vs []Violation
 	add := func(format string, args ...any) {
-		vs = append(vs, Violation{Seed: s.cfg.Seed, Step: step, What: fmt.Sprintf(format, args...)})
+		vs = append(vs, Violation{
+			Seed: s.cfg.Seed, Step: step, Kind: KindInvariant,
+			What: fmt.Sprintf(format, args...),
+		})
 	}
 
 	// A stalled Ready loop is a VIOLATION, not a log line. It means something
@@ -45,9 +48,29 @@ func (s *Sim) checkInvariants(step int) []Violation {
 		if !up {
 			continue
 		}
-		for _, d := range n.coord.Stalls() {
+		for _, st := range n.coord.Stalls() {
+			// SPLIT BY CAUSE. The phase says which of two unrelated things
+			// happened, and reporting them identically was a defect in this
+			// invariant: a 3.42s fsync was announced as "a blocking call on
+			// the loop's own goroutine", which is not what it was.
+			if st.IOBound {
+				// The host, not the system. A multi-second fsync against a
+				// 250ms election timeout means the run's compressed timings
+				// were never valid — every node would see spurious
+				// elections — so the run cannot support a claim either way.
+				// Same treatment as a run that left raft's fault model.
+				vs = append(vs, Violation{
+					Seed: s.cfg.Seed, Step: step, Kind: KindHostIO, Inconclusive: true,
+					What: fmt.Sprintf(
+						"node %d Ready loop waited %s on the disk — the host's I/O latency "+
+							"exceeded this run's compressed timings (election timeout %s), so "+
+							"the run proved nothing; it does not indicate a defect",
+						id, st, time.Duration(s.cfg.ElectionTick)*s.cfg.TickInterval),
+				})
+				continue
+			}
 			add("node %d Ready loop stalled %s — a blocking call on the loop's own goroutine",
-				id, d.Round(time.Millisecond))
+				id, st)
 		}
 	}
 
@@ -64,7 +87,7 @@ func (s *Sim) checkInvariants(step int) []Violation {
 	// or failing on evidence it cannot support.
 	if n := s.net.Stats().CorruptReachedStep; n > 0 {
 		vs = append(vs, Violation{
-			Seed: s.cfg.Seed, Step: step, Inconclusive: true,
+			Seed: s.cfg.Seed, Step: step, Kind: KindFaultModel, Inconclusive: true,
 			What: fmt.Sprintf(
 				"%d corrupted frames were delivered to raft (DeliverCorrupt is on); "+
 					"this run is outside raft's fault model and cannot support a correctness claim", n),
@@ -182,7 +205,10 @@ func (s *Sim) checkInvariants(step int) []Violation {
 func (s *Sim) checkConverged() []Violation {
 	var vs []Violation
 	add := func(format string, args ...any) {
-		vs = append(vs, Violation{Seed: s.cfg.Seed, Step: s.result.Steps, What: fmt.Sprintf(format, args...)})
+		vs = append(vs, Violation{
+			Seed: s.cfg.Seed, Step: s.result.Steps, Kind: KindConvergence,
+			What: fmt.Sprintf(format, args...),
+		})
 	}
 
 	// WAIT for a stable leader rather than sampling at one instant.
@@ -219,7 +245,7 @@ func (s *Sim) checkConverged() []Violation {
 	// A run that structurally compared almost nothing must not pass green.
 	if min := s.cfg.MinComparisons; min > 0 && comparisons < min {
 		vs = append(vs, Violation{
-			Seed: s.cfg.Seed, Step: s.result.Steps, Inconclusive: true,
+			Seed: s.cfg.Seed, Step: s.result.Steps, Kind: KindComparisonFloor, Inconclusive: true,
 			What: fmt.Sprintf(
 				"replica agreement made only %d cross-node comparisons (floor %d); "+
 					"the run proved nothing about convergence", comparisons, min),
