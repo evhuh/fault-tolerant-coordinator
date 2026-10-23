@@ -320,13 +320,19 @@ func (s *Sim) targetedReadAfterWake(woken, majority *node) {
 	})
 	out := s.classifySubmit(resp, err)
 	op.done(out)
+	s.result.Pause.MajorityCommitted = !out.Unknown
 	if out.Unknown {
+		s.logf("MISS post-wake submit via majority node %d was not acknowledged", majority.id)
 		return // never acknowledged; reading it back proves nothing
 	}
 	s.knownJobs.add(out.JobID)
 
-	// The woken node must not be able to answer this correctly.
+	// The woken node must not be able to answer this correctly. By
+	// construction this runs BEFORE simnet.Release, so the read is inside
+	// the gap; recorded rather than assumed, because the ordering is the
+	// experiment and a future edit could reorder it.
 	s.recordTargetedRead(ctx, woken, 0, out.JobID)
+	s.result.Pause.ReadLandedInGap = s.net.IsHeld(woken.id)
 }
 
 // recordTargetedRead files a read against a specific node, marked as the

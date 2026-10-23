@@ -92,6 +92,20 @@ type Network struct {
 	// held holds nodes that are PAUSED, and queued is what arrived for them
 	// while they were.
 	//
+	// A pause is asymmetric, and getting that wrong made the fault useless.
+	// INBOUND is queued: the kernel buffers packets for a process that is
+	// not scheduled, and delivering them on resume is what keeps the node
+	// unaware that it was deposed. OUTBOUND is SUPPRESSED, because a
+	// descheduled process does not generate messages at all.
+	//
+	// The first version only queued inbound. The paused node's goroutines
+	// still ran, so client submits still reached it, it still proposed, and
+	// its MsgApp still went out — which RESET every follower's election
+	// timer. Diagnosed from the node states at wake: the followers sat at
+	// term 2 pointing at the paused leader, having never become candidates,
+	// so the majority never elected and there was nothing newer for the
+	// woken leader to be stale about.
+	//
 	// A pause is neither of the other two, which is the whole reason it
 	// needs its own state. A partitioned node's messages are DROPPED; a
 	// paused node's are QUEUED, because the kernel buffers packets for a
@@ -130,8 +144,11 @@ type Network struct {
 	// messages were queued for a paused node, and how many were handed over
 	// when it resumed. They must agree by the end of a run; a gap means
 	// messages were queued for a node that never came back.
-	heldCount          int
-	releasedCount      int
+	heldCount     int
+	releasedCount int
+	// suppressedOut counts messages a paused node would have sent but,
+	// being descheduled, never generated.
+	suppressedOut      int
 	corruptReachedStep int
 }
 
@@ -405,6 +422,15 @@ func (t *transport) Send(m *raftpb.Message) {
 		}
 		if r := n.dropReason(t.id, m.GetTo()); r != reasonNone {
 			n.countDrop(r)
+			n.mu.Unlock()
+			return
+		}
+		// OUTBOUND from a paused node never existed: a descheduled process
+		// produces no messages, so this one is discarded rather than queued.
+		// Queueing it would deliver a burst of stale heartbeats on resume
+		// that the real process would never have sent.
+		if n.held[t.id] {
+			n.suppressedOut++
 			n.mu.Unlock()
 			return
 		}

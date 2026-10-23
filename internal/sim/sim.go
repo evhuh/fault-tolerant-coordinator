@@ -115,6 +115,38 @@ type Config struct {
 	// handful they buy a history the checker cannot finish, which reports
 	// Unknown and is worth nothing.
 	LinClients int
+	// ReplayWindow forces the injected window to fire at a given step
+	// against a given node, instead of choosing at runtime.
+	//
+	// This is what makes a sweep failure investigable. Take the WindowPlan
+	// the failing run reported, feed it back, and the adversary is the same
+	// one — which is as close to replay as a reactive fault can get.
+	ReplayWindow *WindowPlan
+	// DriveWindow makes the run OPEN a split-brain window on purpose — an
+	// injected leader partition or pause at a seeded step — and protects it
+	// from the schedule's kills and partitions until it has been used.
+	//
+	// OFF BY DEFAULT, for two separate reasons, and it took both to get the
+	// boundary right.
+	//
+	// First, protecting the window narrows the adversary. Below-quorum
+	// states, mid-pause kills and unlucky timing are real fault states the
+	// claim has to cover, and suppressing them to keep an experiment tidy is
+	// a selection effect. This was briefly folded into TargetStaleReads,
+	// which defaults ON — so "confined to targeted mode" confined it to
+	// nothing and every ordinary run had its kills suppressed.
+	//
+	// Second, and worse, INJECTING the window breaks schedule
+	// reproducibility, which is the Day 8 checkpoint. The injection has to
+	// find the current leader and defers when there is none, so whether and
+	// when it fires depends on timing rather than on the seed — two runs of
+	// one seed logged different schedules, intermittently.
+	//
+	// What stays on by default is TargetStaleReads: the clients AIM at a
+	// window when the seeded schedule happens to produce one. That changes
+	// no faults and logs nothing, so the schedule stays byte-reproducible.
+	// Driving the window is the validation sweeps' business.
+	DriveWindow bool
 	// TargetStaleReads aims the clients at the split-brain window instead of
 	// sampling for it: whenever a cut-off leader and a majority leader both
 	// exist, write through the majority and read through the minority.
@@ -234,6 +266,67 @@ func DefaultConfig() Config {
 	}
 }
 
+// WindowPlan is a realized injected window: when it actually fired, against
+// which node, and whether it was a pause or a partition.
+//
+// It exists because a DriveWindow run is NOT reproducible from its seed. The
+// injection has to find the current leader and defers when there is none, so
+// the step it lands on and the node it hits depend on timing. A failure found
+// in a sweep therefore cannot be replayed from the seed alone — the seed
+// reproduces the adversary's INTENT, not its realization.
+//
+// So the realization is recorded and can be fed back in. Replay(plan) forces
+// the same step and the same victim, which is the difference between a
+// failure you can put back in front of the system and one you can only
+// describe.
+type WindowPlan struct {
+	// Fired is false when the injection never managed to open a window.
+	Fired bool
+	// Step is the step it fired on, which may be later than the step drawn
+	// from the seed if it had to defer.
+	Step int
+	// NodeID is the leader it targeted.
+	NodeID uint64
+	// Paused is true for a process pause, false for a network partition.
+	Paused bool
+}
+
+func (w WindowPlan) String() string {
+	if !w.Fired {
+		return "window never opened"
+	}
+	kind := "partition"
+	if w.Paused {
+		kind = "pause"
+	}
+	return fmt.Sprintf("%s of node %d at step %d", kind, w.NodeID, w.Step)
+}
+
+// PauseDiag records why a pause run did or did not reach the window.
+//
+// "The pause covers 4 of 8" is not a diagnosis, and the first attempt to fix
+// that coverage by adding seeds would have buried three real defects. Each
+// way the sequence can fall through is recorded here instead.
+type PauseDiag struct {
+	// Woke is the step the paused node was resumed on.
+	Woke int
+	// MajorityElected is whether a leader OTHER than the paused node existed
+	// at wake. Without one there is nothing newer to be stale about.
+	MajorityElected bool
+	// MajorityCommitted is whether the post-wake submit through that leader
+	// was acknowledged. An unacknowledged write proves nothing when read
+	// back.
+	MajorityCommitted bool
+	// WokenStillLeader is whether the woken node still believed it led when
+	// asked. If it had already stepped down it refuses the read instead of
+	// answering staly.
+	WokenStillLeader bool
+	// ReadLandedInGap is whether the targeted read was served before the
+	// queued raft messages were released. False means the window closed
+	// before the read.
+	ReadLandedInGap bool
+}
+
 // Result is what a run produces.
 type Result struct {
 	Seed       int64
@@ -244,6 +337,10 @@ type Result struct {
 	Jobs       int
 	Tasks      int
 	Lin        LinResult
+	// Window is the injected window as REALIZED, for replay.
+	Window WindowPlan
+	// Pause explains the pause sequence when one was injected.
+	Pause PauseDiag
 }
 
 // Coverage is which code paths a run actually reached.
@@ -437,6 +534,21 @@ type Sim struct {
 	// targetedPartitionStep is the step at which targeted mode INJECTS a
 	// held leader partition, drawn once from the run's seed.
 	targetedPartitionStep int
+	// windowPending is true while targeted mode is still trying to open, or
+	// still inside, its injected window.
+	//
+	// While it is set, the fault schedule's KILLS and PARTITIONS are
+	// suppressed. Those were destroying the thing the run exists to
+	// measure: one seed had a node killed mid-pause, leaving a single
+	// reachable node that could not elect, and another never opened a
+	// window at all because membership never recovered between kills.
+	//
+	// This is a narrowing of the adversary and would be a selection effect
+	// in the default sweep — which keeps the full schedule. It is confined
+	// to TARGETED mode, which is opt-in validation whose entire purpose is
+	// the injected window; letting an unrelated kill eat it measures
+	// nothing and reports it as coverage.
+	windowPending bool
 	// paused is the node currently frozen by the pause fault, and
 	// pauseUntilStep the step at which it must be woken. Zero means none.
 	paused         *node
@@ -494,8 +606,23 @@ func New(cfg Config, dirs map[uint64]string) *Sim {
 	// LeaderPartitionSteps after it, so an injection past Steps-hold leaves
 	// the run ending mid-window. Keeping it early is what lets the sweeps be
 	// short enough to fit the package's test timeout.
-	if cfg.TargetStaleReads && cfg.Steps > 2 {
-		span := cfg.Steps / 4
+	s.windowPending = cfg.DriveWindow
+	if cfg.ReplayWindow != nil && cfg.ReplayWindow.Fired {
+		s.targetedPartitionStep = cfg.ReplayWindow.Step
+	} else if cfg.DriveWindow && cfg.Steps > 2 {
+		// The window must have room to CLOSE before the run ends, so the
+		// latest usable step is Steps minus however long it is held.
+		//
+		// The first version used Steps/4, which at seven steps is a span of
+		// ONE: every seed injected at step 2 and woke at step 5, so eight
+		// seeds were eight samples of a single timing rather than eight
+		// timings. The per-run diagnosis is what showed it — the step and
+		// wake columns were identical down the whole table.
+		hold := cfg.PauseSteps
+		if cfg.LeaderPartitionSteps > hold {
+			hold = cfg.LeaderPartitionSteps
+		}
+		span := cfg.Steps - hold - 1
 		if span < 1 {
 			span = 1
 		}
@@ -962,6 +1089,11 @@ func (s *Sim) pickLeaderClaimant(rng *rand.Rand) (*node, bool) {
 // property that survives is the one that matters, that a seed reproduces ITS
 // OWN schedule.
 func (s *Sim) applyFault(step int) {
+	// Protect the injected window, when the caller asked for that. The roll
+	// is still drawn so the fault sequence stays reproducible; only the
+	// destructive branches are skipped.
+	protect := s.cfg.DriveWindow && s.windowPending
+
 	switch roll := s.rng.Intn(100); {
 	case roll < 45:
 		// Quiet step. Let the cluster converge and do work.
@@ -970,6 +1102,9 @@ func (s *Sim) applyFault(step int) {
 	case roll < 58:
 		// Partition a minority. A minority CANNOT elect or commit, so this
 		// tests that the majority carries on and the minority rejoins.
+		if protect {
+			return
+		}
 		victim := s.pickNode()
 		if victim == 0 {
 			return
@@ -979,6 +1114,9 @@ func (s *Sim) applyFault(step int) {
 		s.logf("step %d: partition node %d", step, victim)
 
 	case roll < 70:
+		if protect {
+			return
+		}
 		// PARTITION THE LEADER, and hold it. This is the targeted adversary
 		// Day 9 needs, and the reason it had to be added: a random victim is
 		// the leader one time in three, and the first linearizability runs
@@ -1021,7 +1159,7 @@ func (s *Sim) applyFault(step int) {
 		// it here would narrow the adversary to make an invariant quieter,
 		// which is a selection effect, not a fix. The invariants are what
 		// know that no quorum means no progress is expected.
-		if len(s.liveIDs()) <= quorum(s.cfg.Nodes) {
+		if protect || len(s.liveIDs()) <= quorum(s.cfg.Nodes) {
 			return
 		}
 		victim := s.pickNode()
@@ -1073,15 +1211,29 @@ func (s *Sim) heal(step int) bool {
 // because a process that is merely descheduled has its packets buffered by
 // the kernel, and that queueing is what preserves the deposed-but-unaware
 // state the stale read needs.
+// replayTarget returns the node a replay plan names, if it is up.
+func (s *Sim) replayTarget() *node {
+	if s.cfg.ReplayWindow == nil || !s.cfg.ReplayWindow.Fired {
+		return nil
+	}
+	n, _ := s.nodeAt(s.cfg.ReplayWindow.NodeID)
+	return n
+}
+
 func (s *Sim) pauseLeader(step int) bool {
-	lead := s.leader()
+	lead := s.replayTarget()
 	if lead == nil {
+		lead = s.leader()
+	}
+	if lead == nil {
+		s.logf("step %d: pause deferred, no single leader", step)
 		return false
 	}
 	lead.clk.Pause()
 	s.net.Hold(lead.id)
 	s.paused = lead
 	s.pauseUntilStep = step + s.cfg.PauseSteps
+	s.result.Window = WindowPlan{Fired: true, Step: step, NodeID: lead.id, Paused: true}
 	s.result.Faults.Pauses++
 	s.logf("step %d: PAUSE leader node %d (ticker frozen, inbound held) until step %d",
 		step, lead.id, s.pauseUntilStep)
@@ -1110,9 +1262,32 @@ func (s *Sim) wakeIfDue(step int) {
 
 	// 2. Read from it while it is still unaware. One targeted read against
 	// the freshest job the majority committed during the pause.
-	if lead := s.majorityLeaderExcept(woken.id); lead != nil {
+	//
+	// Each way this can fall through is logged, because "the pause covered
+	// 4 of 8" is not a diagnosis.
+	lead := s.majorityLeaderExcept(woken.id)
+	s.result.Pause.Woke = step
+	s.result.Pause.MajorityElected = lead != nil
+	s.result.Pause.WokenStillLeader = woken.coord.IsLeader()
+
+	switch {
+	case lead == nil:
+		s.logf("step %d: MISS no majority leader at wake — the majority never elected during the pause", step)
+		for _, id := range s.liveIDs() {
+			if n, ok := s.nodeAt(id); ok {
+				st := n.coord.RaftStatus()
+				s.logf("    node %d: leader=%v term=%d raftState=%v lead=%d",
+					id, n.coord.IsLeader(), st.HardState.GetTerm(), st.RaftState, st.Lead)
+			}
+		}
+	case !woken.coord.IsLeader():
+		s.logf("step %d: MISS node %d no longer claims leadership at wake", step, woken.id)
+	default:
 		s.targetedReadAfterWake(woken, lead)
 	}
+
+	// The window is spent; the schedule may resume killing.
+	s.windowPending = false
 
 	// 3. Only now does it learn what happened.
 	s.net.Release(woken.id)
@@ -1200,7 +1375,10 @@ func (s *Sim) injectTargetedWindow(step int) {
 		return
 	}
 
-	lead := s.leader()
+	lead := s.replayTarget()
+	if lead == nil {
+		lead = s.leader()
+	}
 	if lead == nil {
 		// Mid-election. Try again next step rather than giving up on the
 		// run's only guaranteed window.
@@ -1209,6 +1387,8 @@ func (s *Sim) injectTargetedWindow(step int) {
 	}
 	s.net.Partition(lead.id)
 	s.holdHeal = s.cfg.LeaderPartitionSteps
+	s.windowPending = false
+	s.result.Window = WindowPlan{Fired: true, Step: step, NodeID: lead.id}
 	s.result.Faults.Partitions++
 	s.result.Faults.LeaderPartitions++
 	s.logf("step %d: TARGETED partition of LEADER node %d, held for %d steps",

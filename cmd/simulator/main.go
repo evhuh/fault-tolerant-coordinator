@@ -100,10 +100,13 @@ func main() {
 // passed" over a set where half the histories never reached a fault is a
 // number that overstates itself.
 type tally struct {
-	// Linearizability outcomes.
-	covered      int // reached a fault AND came back Ok
-	inconclusive int // could not have failed, or reached no verdict
-	illegal      int
+	// LINEARIZABILITY outcomes, and only those. The seed sweep's notion of a
+	// fully "checked" run — invariants and convergence — is a different
+	// claim with a different name, so that neither can be quoted as the
+	// other.
+	covered    int // contained a read that could have been stale, and was Ok
+	notCovered int // could not have failed, or reached no verdict
+	illegal    int
 	// violations counts real findings of any kind, which is what the exit
 	// code reflects. An inconclusive run is not a pass, but it is not a
 	// defect either, and exiting 1 on it would make a busy laptop look like
@@ -118,7 +121,7 @@ func (t *tally) add(res sim.Result, err error) {
 	case res.Lin.Checked && res.Lin.Covered && res.Lin.Verdict == porcupine.Ok:
 		t.covered++
 	case res.Lin.Checked:
-		t.inconclusive++
+		t.notCovered++
 	}
 	for _, v := range res.Violations {
 		if !v.Inconclusive {
@@ -137,11 +140,12 @@ func (t *tally) add(res sim.Result, err error) {
 }
 
 func (t *tally) report(runs int) {
-	fmt.Printf("\n%d runs: %d covered+linearizable, %d inconclusive, %d NOT LINEARIZABLE\n",
-		runs, t.covered, t.inconclusive, t.illegal)
-	if t.inconclusive > 0 {
-		fmt.Printf("  inconclusive runs proved nothing about linearizability — a history that never\n" +
-			"  reached a partitioned node or a split brain is green about a healthy cluster\n")
+	fmt.Printf("\n%d runs: %d covered+linearizable, %d not covered, %d NOT LINEARIZABLE\n",
+		runs, t.covered, t.notCovered, t.illegal)
+	if t.notCovered > 0 {
+		fmt.Printf("  not-covered runs proved nothing about linearizability — a history with no read\n" +
+			"  that could have been stale is green about a healthy cluster. Linearizability\n" +
+			"  evidence comes from the targeted sweeps (make sweeps), not from this number.\n")
 	}
 	if t.violations > 0 {
 		fmt.Printf("  %d runs had real violations\n", t.violations)

@@ -67,6 +67,8 @@ type targetedRun struct {
 	targetedReads   int
 	answered        int
 	ops             int
+	window          WindowPlan
+	pause           PauseDiag
 }
 
 // runTargeted sweeps seeds and reports what the targeted workload found.
@@ -76,6 +78,12 @@ func runTargeted(t *testing.T, seeds int64, mode readModeFn, steps int) []target
 	for seed := int64(1); seed <= seeds; seed++ {
 		cfg := quickConfig(seed, steps)
 		cfg.TargetStaleReads = true
+		// The validation sweeps DRIVE their window — inject it and protect
+		// it. The default sweep does neither: see Config.DriveWindow, both
+		// for why narrowing the adversary is a price only opt-in validation
+		// pays, and for why injecting a fault reactively costs schedule
+		// reproducibility.
+		cfg.DriveWindow = true
 		mode(&cfg)
 		res, _ := New(cfg, dirsFor(t, cfg.Nodes)).Run(context.Background())
 		out = append(out, targetedRun{
@@ -86,6 +94,8 @@ func runTargeted(t *testing.T, seeds int64, mode readModeFn, steps int) []target
 			targetedReads:   res.Lin.TargetedReads,
 			answered:        res.Lin.TargetedReadsAnswered,
 			ops:             res.Lin.Ops,
+			window:          res.Window,
+			pause:           res.Pause,
 		})
 	}
 	return out
@@ -238,6 +248,22 @@ func TestPauseDefeatsCheckQuorumUnderLocalReads(t *testing.T) {
 		c.PauseLeader = true // shipped config otherwise: CheckQuorum ON
 	}, targetedSteps)
 
+	// PER-RUN DIAGNOSIS, printed whether or not the test passes.
+	//
+	// "4 of 8 covered" is not a diagnosis, and trying to fix that number by
+	// adding seeds would have buried three real defects. These are the
+	// conditions the window depends on, in the order they must hold, so a
+	// miss names its own cause: the injection firing, the majority electing
+	// during the pause, its write being acknowledged, the woken node still
+	// believing it leads, and the read landing before the queue is released.
+	for _, r := range runs {
+		t.Logf("  pause seed %d: %s | woke@%d majorityElected=%v majorityCommitted=%v "+
+			"wokenStillLeader=%v readInGap=%v → targeted=%d answered=%d verdict=%s",
+			r.seed, r.window, r.pause.Woke, r.pause.MajorityElected, r.pause.MajorityCommitted,
+			r.pause.WokenStillLeader, r.pause.ReadLandedInGap, r.targetedReads, r.answered,
+			r.verdict)
+	}
+
 	_, covered := report(t, "shipped+pause/local", runs)
 	if ans := answeredRuns(runs); ans < pausedCoveredFloor {
 		t.Errorf("only %d of %d seeds got an ANSWER to a targeted read (floor %d; %d reached "+
@@ -345,13 +371,21 @@ func TestReadIndexFindsNoStaleReadUnderEitherAdversary(t *testing.T) {
 
 // pausedCoveredFloor is the covered floor for the pause adversary.
 //
-// CALIBRATED from its own measurement, never borrowed from the pinned one.
-// The pause reaches the window about half the time — 4 of 8 here, 7 and 5 of
-// 12 before the narrowing — because it needs the majority to elect DURING the
-// pause and the read to land in the gap before the queue drains. Borrowing
-// the pinned floor would fail this test for a reason it does not own.
+// SIX, the same as the pinned adversary, because the pause now reaches the
+// window as reliably: three consecutive samples measured 8 of 8. It used to
+// sit at 2 against an observed 3-4 of 8, and raising it was earned by fixing
+// three causes rather than by widening the sweep:
 //
-// Measured 4 of 8 and 3 of 8 at the shipped width. Two leaves margin while
-// still failing if the pause stops opening windows at all, which is the
-// regression that would matter.
-var pausedCoveredFloor = 2
+//   - the pause only queued INBOUND messages, so the paused node's goroutines
+//     kept proposing and its MsgApp kept resetting every follower's election
+//     timer. The majority never elected, so there was nothing newer for the
+//     woken leader to be stale about. Outbound is now suppressed: a
+//     descheduled process generates nothing.
+//   - the fault schedule killed a node mid-pause, leaving one reachable node
+//     that cannot elect.
+//   - on one seed the pause never fired at all, deferred past the end of the
+//     run because membership never recovered between kills.
+//
+// A floor that had been "calibrated" against the broken distribution would
+// have locked in the breakage as normal.
+var pausedCoveredFloor = 6

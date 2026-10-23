@@ -207,10 +207,13 @@ func TestSameSeedReproducesTheFaultSchedule(t *testing.T) {
 // something for the result to count.
 //
 // Recalibrated after Covered was tightened: see onlyLinearizabilityCoverage.
-// The counts below predate that change but the floor still holds, because
-// coverage-inconclusive runs no longer disqualify themselves here.
+// The counts below predate that change but the floor still holds, because a
+// coverage-only complaint no longer disqualifies a run here.
 //
-// CALIBRATED, not chosen. Measured conclusive counts over six sweeps of six
+// "CHECKED" throughout means invariants and convergence. The linearizability
+// word is "COVERED" and belongs to the targeted sweeps alone.
+//
+// CALIBRATED, not chosen. Measured CHECKED counts over six sweeps of six
 // 8-step seeds were 1, 4, 2, 2, 2, 4 — 15 of 36, a rate near 42%, with enough
 // variance that one sweep managed a single conclusive run. At six seeds no
 // floor above one is stable (a floor of two would fail roughly one sweep in
@@ -223,15 +226,25 @@ func TestSameSeedReproducesTheFaultSchedule(t *testing.T) {
 // often never rolls a leader partition at all. That is deferred to Day 10,
 // and until then this is a wide-and-shallow detector that says so.
 var (
-	seedSweepRuns          int64 = 16
-	seedSweepMinConclusive       = 3
+	seedSweepRuns       int64 = 16
+	seedSweepMinChecked       = 3
 )
 
 func TestSeedSweep(t *testing.T) {
 	if testing.Short() {
 		t.Skip("sweep is slow; -short runs the single-seed test only")
 	}
-	var conclusive, inconclusive, illegal int
+	// NAMED "CHECKED", NOT "CONCLUSIVE".
+	//
+	// This sweep's property is that the per-step invariants and the
+	// convergence check ran and found nothing. That is a different claim
+	// from the linearizability notion of COVERED — a history containing a
+	// read that could have been stale — and the two were briefly sharing one
+	// word, which is how a general fault sweep gets quoted as
+	// linearizability evidence. It is not, and under the shipped
+	// configuration it structurally cannot be: the window never opens by
+	// chance. Only the targeted sweeps speak to linearizability.
+	var checked, unchecked, illegal int
 	for seed := int64(1); seed <= seedSweepRuns; seed++ {
 		cfg := quickConfig(seed, 8)
 		res, err := New(cfg, dirsFor(t, cfg.Nodes)).Run(context.Background())
@@ -254,12 +267,12 @@ func TestSeedSweep(t *testing.T) {
 		// floors.
 		switch {
 		case onlyLinearizabilityCoverage(res):
-			// Conclusive about everything this test owns. The run checked
+			// CHECKED for everything this test owns. The run checked
 			// every invariant and converged; all it could not do was expose
 			// a stale read, which is another test's job.
-			conclusive++
+			checked++
 		case inconclusiveOnly(res):
-			inconclusive++
+			unchecked++
 			t.Logf("seed %d inconclusive, not a finding: %v", seed, res.Violations)
 		case err != nil:
 			t.Errorf("seed %d FAILED: %v  (reproduce: simulator -seed %d -steps 8 -v)",
@@ -267,7 +280,7 @@ func TestSeedSweep(t *testing.T) {
 		case len(res.Violations) > 0:
 			t.Errorf("seed %d: %v", seed, res.Violations)
 		default:
-			conclusive++
+			checked++
 		}
 	}
 
@@ -277,14 +290,16 @@ func TestSeedSweep(t *testing.T) {
 	// MinComparisons, and for the same reason: a sweep that managed a single
 	// conclusive run out of many has barely looked, and passing it reports
 	// evidence that does not exist.
-	if conclusive < seedSweepMinConclusive {
-		t.Errorf("sweep of %d seeds produced only %d conclusive runs (floor %d): "+
-			"%d conclusive, %d inconclusive, %d NOT LINEARIZABLE — "+
-			"too little of this sweep could have found anything for its result to mean much",
-			seedSweepRuns, conclusive, seedSweepMinConclusive, conclusive, inconclusive, illegal)
+	if checked < seedSweepMinChecked {
+		t.Errorf("sweep of %d seeds fully CHECKED only %d (floor %d): %d checked, "+
+			"%d unchecked, %d NOT LINEARIZABLE — too little of this sweep could have found "+
+			"anything for its result to mean much. NB: 'checked' here means invariants and "+
+			"convergence, never linearizability coverage",
+			seedSweepRuns, checked, seedSweepMinChecked, checked, unchecked, illegal)
 	}
-	t.Logf("sweep of %d seeds: %d conclusive, %d inconclusive, %d illegal",
-		seedSweepRuns, conclusive, inconclusive, illegal)
+	t.Logf("sweep of %d seeds (invariants + convergence): %d checked, %d unchecked, %d illegal — "+
+		"this is NOT linearizability evidence; see the targeted sweeps",
+		seedSweepRuns, checked, unchecked, illegal)
 }
 
 // The invariant checker has to be able to FAIL, or a green run means nothing.
