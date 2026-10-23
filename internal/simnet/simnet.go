@@ -89,6 +89,21 @@ type Network struct {
 	// partitioned node is running and will catch up; a down node is not
 	// there at all.
 	down map[uint64]bool
+	// held holds nodes that are PAUSED, and queued is what arrived for them
+	// while they were.
+	//
+	// A pause is neither of the other two, which is the whole reason it
+	// needs its own state. A partitioned node's messages are DROPPED; a
+	// paused node's are QUEUED, because the kernel buffers packets for a
+	// process that is not scheduled and delivers them when it resumes.
+	//
+	// That difference is the fault's entire point. Dropping would let the
+	// paused node simply miss the new leader's higher-term heartbeat and
+	// carry on believing it leads — which is the same end state by accident
+	// — while queueing preserves the real sequence: it stays convinced it
+	// leads, and finds out it was deposed only once it drains the queue.
+	held   map[uint64]bool
+	queued map[uint64][]*raftpb.Message
 
 	closed bool
 	wg     sync.WaitGroup
@@ -111,7 +126,13 @@ type Network struct {
 	// Stepped. The second is the Byzantine case and must be zero in any run
 	// whose results are being claimed.
 	corruptRejectedByDecoder int
-	corruptReachedStep       int
+	// heldCount and releasedCount report the pause fault's effect: how many
+	// messages were queued for a paused node, and how many were handed over
+	// when it resumed. They must agree by the end of a run; a gap means
+	// messages were queued for a node that never came back.
+	heldCount          int
+	releasedCount      int
+	corruptReachedStep int
 }
 
 func New(seed int64, f Faults) *Network {
@@ -121,6 +142,8 @@ func New(seed int64, f Faults) *Network {
 		recv:        map[uint64]func(context.Context, *raftpb.Message) error{},
 		partitioned: map[uint64]bool{},
 		down:        map[uint64]bool{},
+		held:        map[uint64]bool{},
+		queued:      map[uint64][]*raftpb.Message{},
 	}
 }
 
@@ -147,6 +170,49 @@ func (n *Network) Partition(ids ...uint64) {
 
 // Heal removes every partition.
 func (n *Network) Heal() { n.Partition() }
+
+// Hold pauses delivery to a node, queueing what arrives instead of dropping
+// it. Models a process that is not being scheduled.
+func (n *Network) Hold(id uint64) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.held[id] = true
+}
+
+// Release delivers everything that queued while the node was held, in
+// arrival order, and resumes normal delivery.
+//
+// Order matters: these are raft messages, and replaying an append out of
+// order would be a fault raft does not promise to survive. The queue is a
+// FIFO for the same reason the kernel's is.
+func (n *Network) Release(id uint64) {
+	n.mu.Lock()
+	if !n.held[id] {
+		n.mu.Unlock()
+		return
+	}
+	delete(n.held, id)
+	pending := n.queued[id]
+	delete(n.queued, id)
+	step := n.recv[id]
+	n.releasedCount += len(pending)
+	n.delivered += len(pending)
+	n.mu.Unlock()
+
+	if step == nil {
+		return
+	}
+	for _, msg := range pending {
+		_ = step(context.Background(), msg)
+	}
+}
+
+// IsHeld reports whether this node is currently paused.
+func (n *Network) IsHeld(id uint64) bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.held[id]
+}
 
 // IsPartitioned reports whether this node is currently cut off.
 //
@@ -339,6 +405,20 @@ func (t *transport) Send(m *raftpb.Message) {
 		}
 		if r := n.dropReason(t.id, m.GetTo()); r != reasonNone {
 			n.countDrop(r)
+			n.mu.Unlock()
+			return
+		}
+		// HELD, not dropped: queue it for a paused process.
+		if n.held[m.GetTo()] {
+			msg := &raftpb.Message{}
+			if proto.Unmarshal(b, msg) == nil {
+				n.queued[m.GetTo()] = append(n.queued[m.GetTo()], msg)
+				n.heldCount++
+			} else {
+				// Corrupt frames never queue; the rule is the same whether
+				// the destination is running or paused.
+				n.corruptRejectedByDecoder++
+			}
 			n.mu.Unlock()
 			return
 		}

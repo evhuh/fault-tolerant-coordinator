@@ -55,8 +55,34 @@ type history struct {
 	// actually produce a violation.
 	partitioned int
 	splitBrain  int
-	dropped     int // operations not recorded because the cap was reached
-	rejected    int // definitive InvalidArgument: a malformed request we never sent
+	// splitBrainReads counts reads served by a node that believed it led
+	// while another node also did.
+	splitBrainReads int
+	// TWO counters, because "covered" means different things to the two read
+	// modes and collapsing them is wrong in both directions.
+	//
+	// targetedReads is the OPPORTUNITY: a read from the cut-off node, of a
+	// job the majority committed during that same partition, was issued at
+	// all. This is the right notion for the barrier, where the CORRECT
+	// outcome is a refusal — demand an answer there and correct behaviour
+	// becomes indistinguishable from never reaching the window. Measured:
+	// under ReadIndexBarrier every targeted read is refused, so an
+	// answered-only definition reported 0 of 8 covered on a working system.
+	//
+	// targetedAnswered is the narrower COULD-HAVE-FAILED: the read came back
+	// found or not-found rather than refused. This is the right notion for
+	// validating the DETECTOR under local reads, where a refusal constrains
+	// nothing and must not count — the pause adversary read 3 covered
+	// against 2 Illegal until this was separated out.
+	//
+	// A split-brain read of a PRE-partition job is excluded from both: both
+	// sides hold that job, so finding it is correct and proves nothing.
+	// Counting those was the first version of this counter, and it let a run
+	// bank coverage on reads that could never have been stale.
+	targetedReads    int
+	targetedAnswered int
+	dropped          int // operations not recorded because the cap was reached
+	rejected         int // definitive InvalidArgument: a malformed request we never sent
 }
 
 func newHistory(maxOps int) *history {
@@ -78,6 +104,9 @@ type linOp struct {
 	// anything the client could not observe.
 	partitioned bool
 	splitBrain  bool
+	// targeted marks a read issued by the targeted workload against the
+	// cut-off node, for a job the majority committed during the partition.
+	targeted bool
 }
 
 // begin stamps an invocation. It does NOT take the history lock — the whole
@@ -89,6 +118,13 @@ func (h *history) begin(client int, in linInput, partitioned, splitBrain bool) l
 		h: h, client: client, in: in, call: h.now(),
 		partitioned: partitioned, splitBrain: splitBrain,
 	}
+}
+
+// beginTargeted stamps a targeted read: the one shape that can be stale.
+func (h *history) beginTargeted(client int, in linInput, partitioned bool) linOp {
+	op := h.begin(client, in, partitioned, true)
+	op.targeted = true
+	return op
 }
 
 // done stamps the response and files the operation.
@@ -113,6 +149,15 @@ func (op linOp) done(out linOutput) {
 	}
 	if op.splitBrain {
 		h.splitBrain++
+		if op.in.Kind == opGet {
+			h.splitBrainReads++
+			if op.targeted {
+				h.targetedReads++
+				if !out.Unknown {
+					h.targetedAnswered++
+				}
+			}
+		}
 	}
 	h.ops = append(h.ops, porcupine.Operation{
 		ClientId: op.client,
@@ -159,9 +204,21 @@ type LinResult struct {
 	// linearizable, which needs no checker to establish.
 	Partitioned int
 	SplitBrain  int
-	// Covered reports whether any operation reached a fault state that could
-	// have produced a violation. False means the verdict is about a healthy
-	// cluster and proves nothing.
+	// SplitBrainReads is how many reads were served while two nodes claimed
+	// leadership, including reads of jobs that predate the partition.
+	SplitBrainReads int
+	// TargetedReads is how many reads of a job the majority committed DURING
+	// the partition were ISSUED against the cut-off node. The opportunity,
+	// and what Covered rests on — under the barrier a refusal is the right
+	// answer, so reaching the window is the most that can be asked.
+	TargetedReads int
+	// TargetedReadsAnswered is how many of those came back with a value
+	// rather than a refusal: the reads that COULD have exposed staleness,
+	// and what the detector validation measures.
+	TargetedReadsAnswered int
+	// Covered reports whether the history contained an operation that could
+	// actually have exposed a stale read. False means the verdict proves
+	// nothing about linearizability.
 	Covered bool
 	// Rejected counts definitive InvalidArgument responses. This workload
 	// only ever sends valid requests, so a nonzero count is itself a finding.
@@ -184,13 +241,16 @@ func (h *history) check(timeout time.Duration, vizDir string) LinResult {
 	ops := h.snapshot()
 	h.mu.Lock()
 	res := LinResult{
-		Checked:     true,
-		Ops:         len(ops),
-		Ambiguous:   h.ambiguous,
-		Dropped:     h.dropped,
-		Rejected:    h.rejected,
-		Partitioned: h.partitioned,
-		SplitBrain:  h.splitBrain,
+		Checked:               true,
+		Ops:                   len(ops),
+		Ambiguous:             h.ambiguous,
+		Dropped:               h.dropped,
+		Rejected:              h.rejected,
+		Partitioned:           h.partitioned,
+		SplitBrain:            h.splitBrain,
+		SplitBrainReads:       h.splitBrainReads,
+		TargetedReads:         h.targetedReads,
+		TargetedReadsAnswered: h.targetedAnswered,
 	}
 	h.mu.Unlock()
 	for _, o := range ops {

@@ -118,7 +118,20 @@ func (s *Sim) checkInvariants(step int) []Violation {
 	// attempt at this stopped the adversary from creating that state, which
 	// narrowed the fault space to keep an invariant quiet. Below quorum is a
 	// real fault state; the invariant is what had to learn about it.
+	// A PAUSED node is exempt, and the exemption is BOUNDED.
+	//
+	// An injected pause freezes the ticker, so the clock stops by
+	// construction and this invariant would fire on a fault doing exactly
+	// what it was told to. But an unbounded exemption would be the
+	// below-quorum guard in a different costume — an invariant quieted
+	// rather than taught — so the exemption lasts only while the schedule
+	// says the node is paused. Once it has been woken, the ordinary rules
+	// apply again and a clock that stays frozen FAILS, which is an
+	// assertion this harness could not previously make at all.
 	switch nowMs := s.stateClock(lead); {
+	case s.pausedNode(lead.id):
+		s.clockFrozenSteps = 0
+		s.lastClock = nowMs
 	case !s.hasQuorum(), s.net.IsPartitioned(lead.id):
 		s.clockFrozenSteps = 0
 		s.lastClock = nowMs

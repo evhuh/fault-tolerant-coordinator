@@ -31,6 +31,7 @@ import (
 
 	"github.com/anishathalye/porcupine"
 
+	"github.com/evazheng/fault-tolerant-coordinator/internal/clock"
 	"github.com/evazheng/fault-tolerant-coordinator/internal/raftnode"
 	"github.com/evazheng/fault-tolerant-coordinator/internal/server"
 	"github.com/evazheng/fault-tolerant-coordinator/internal/simnet"
@@ -114,6 +115,14 @@ type Config struct {
 	// handful they buy a history the checker cannot finish, which reports
 	// Unknown and is worth nothing.
 	LinClients int
+	// TargetStaleReads aims the clients at the split-brain window instead of
+	// sampling for it: whenever a cut-off leader and a majority leader both
+	// exist, write through the majority and read through the minority.
+	//
+	// On by default. Sampling was shown not to reach the window at all under
+	// the shipped configuration — a 24-seed sweep recorded zero split-brain
+	// operations — so a workload that only samples cannot support the claim.
+	TargetStaleReads bool
 	// LinOpsPerStep is how many operations each client issues per FAULT
 	// STEP. Pacing by step rather than by clock is what makes the history
 	// span the whole schedule instead of its first few seconds; see
@@ -153,6 +162,17 @@ type Config struct {
 	// committed state. It must be shorter than BaseBackoffMs, or live retry
 	// backoffs are observed only by luck.
 	CoverageSampleInterval time.Duration
+	// PauseLeader injects a PROCESS PAUSE of the leader in targeted mode:
+	// tickers frozen, inbound raft messages queued rather than dropped.
+	//
+	// This is the adversary that defeats CheckQuorum, which is driven by
+	// ticks a paused process does not run. Off by default; the targeted
+	// validation turns it on.
+	PauseLeader bool
+	// PauseSteps is how long a pause lasts. It must exceed an election
+	// timeout, or the majority never elects a successor and there is
+	// nothing newer for the woken leader to be stale about.
+	PauseSteps int
 	// LeaderPartitionSteps is how many steps a leader partition is held
 	// against healing. It must span an election timeout plus enough time
 	// for the new leader to commit, or the window closes before a read of
@@ -210,6 +230,7 @@ func DefaultConfig() Config {
 		// election timeout, so a one-step hold can end before the majority
 		// has even elected a successor.
 		LeaderPartitionSteps: 3,
+		PauseSteps:           3,
 	}
 }
 
@@ -252,8 +273,10 @@ type FaultCounts struct {
 	// LeaderPartitions is how many of those cut off the node that was
 	// leading, which is the only kind that can produce a stale read.
 	LeaderPartitions int
-	Heals            int
-	Net              simnet.Stats
+	// Pauses is how many times a leader's process was frozen.
+	Pauses int
+	Heals  int
+	Net    simnet.Stats
 }
 
 // ViolationKind says WHICH check failed.
@@ -372,6 +395,9 @@ type node struct {
 	svc   *server.Service
 	dir   string
 	down  bool
+	// clk is this node's pausable clock, so the fault schedule can freeze
+	// its tickers without touching any other node's.
+	clk *clock.Pausable
 }
 
 // Sim is a running simulation.
@@ -408,6 +434,15 @@ type Sim struct {
 	// holdHeal counts down the steps during which healing is refused, so a
 	// deliberately-held partition is not undone by the next quiet step.
 	holdHeal int
+	// targetedPartitionStep is the step at which targeted mode INJECTS a
+	// held leader partition, drawn once from the run's seed.
+	targetedPartitionStep int
+	// paused is the node currently frozen by the pause fault, and
+	// pauseUntilStep the step at which it must be woken. Zero means none.
+	paused         *node
+	pauseUntilStep int
+	// wakeSeq numbers the post-wake targeted reads.
+	wakeSeq int
 
 	mu     sync.Mutex
 	result Result
@@ -444,6 +479,28 @@ func New(cfg Config, dirs map[uint64]string) *Sim {
 		history: newHistory(cfg.LinMaxOps),
 	}
 	s.result.Seed = cfg.Seed
+
+	// Draw the injected window once, here, so it is reproducible from the
+	// seed and costs the fault sequence exactly one draw at a fixed point.
+	// (Rule 3 forbids workload draws from the fault RNG because a
+	// TIMING-DEPENDENT number of them destroys reproducibility; a single
+	// draw at construction is deterministic and does not.)
+	//
+	// Placed EARLY — in the first quarter — and never at step 1, where the
+	// cluster may still be electing its first leader.
+	//
+	// The first version spread it over the first half, which looked more
+	// varied and truncated the window on late draws: the hold needs
+	// LeaderPartitionSteps after it, so an injection past Steps-hold leaves
+	// the run ending mid-window. Keeping it early is what lets the sweeps be
+	// short enough to fit the package's test timeout.
+	if cfg.TargetStaleReads && cfg.Steps > 2 {
+		span := cfg.Steps / 4
+		if span < 1 {
+			span = 1
+		}
+		s.targetedPartitionStep = 2 + s.rng.Intn(span)
+	}
 	for i := 1; i <= cfg.Nodes; i++ {
 		// Addresses are labels only: simnet routes by node id, so nothing
 		// binds a port and a long run cannot exhaust them.
@@ -483,6 +540,10 @@ func (s *Sim) start(id uint64) error {
 	// mints are reproducible without every node drawing from one shared
 	// sequence whose order depends on goroutine scheduling.
 	cfg.Rand = &seededReader{rng: rand.New(rand.NewSource(s.cfg.Seed + int64(id)))}
+	// One pausable clock per node, shared by the coordinator's drivers and
+	// the raft ticker, so a pause freezes both.
+	pclk := clock.NewPausable(nil)
+	cfg.Clock = pclk
 
 	coord := server.New(cfg)
 	rcfg := raftnode.DefaultConfig()
@@ -501,12 +562,13 @@ func (s *Sim) start(id uint64) error {
 	// here so the simulator inherits the same "strictly below the election
 	// timeout" rule the production default uses.
 	rcfg.Transport = s.net.Transport(id)
+	rcfg.Clock = pclk
 
 	if err := coord.StartRaft(rcfg); err != nil {
 		return fmt.Errorf("start node %d: %w", id, err)
 	}
 	s.net.SetDown(id, false)
-	s.nodes[id] = &node{id: id, coord: coord, svc: server.NewService(coord), dir: s.dirs[id]}
+	s.nodes[id] = &node{id: id, coord: coord, svc: server.NewService(coord), dir: s.dirs[id], clk: pclk}
 	return nil
 }
 
@@ -612,6 +674,10 @@ func (s *Sim) Run(ctx context.Context) (Result, error) {
 
 		s.stepNo.Store(int64(step))
 		s.applyFault(step)
+		// AFTER applyFault, so a quiet step's heal cannot undo it in the
+		// same breath.
+		s.injectTargetedWindow(step)
+		s.wakeIfDue(step)
 		s.offerWork(step)
 		s.drainSomeWork()
 		// Sample IMMEDIATELY after the reports land. A retry backoff is
@@ -711,19 +777,30 @@ func (s *Sim) checkLinearizable() LinResult {
 
 	res := s.history.check(s.cfg.LinCheckTimeout, s.cfg.LinVizDir)
 
-	// COVERAGE FIRST. A verdict over a history that never touched a
-	// partitioned node or a split-brain window is a verdict about a healthy
-	// cluster. Reported before the verdict is examined, because an Ok from
-	// such a run is not evidence and must not be counted as one.
-	res.Covered = res.Partitioned > 0 || res.SplitBrain > 0
+	// COVERAGE FIRST, and coverage means a SPLIT-BRAIN READ.
+	//
+	// This used to accept `partitioned || splitBrain`, which overstated
+	// itself the moment CheckQuorum landed. An operation sent to a node that
+	// has already stepped down comes back NOT_LEADER: it constrains nothing,
+	// it cannot expose a stale answer, and counting it marked runs covered
+	// that had no chance of failing. The first sweep under the shipped
+	// configuration recorded 205 operations on partitioned nodes and ZERO
+	// split-brain operations, and was reported as 20 covered runs.
+	//
+	// Only one shape can expose the bug: a READ answered by a node that
+	// believed it led while another node also did. A run without one is a
+	// partition test — worth having under its own name, and not evidence
+	// about linearizability.
+	res.Covered = res.TargetedReads > 0
 	if res.Ops > 0 && !res.Covered {
 		s.result.Violations = append(s.result.Violations, Violation{
 			Seed: s.cfg.Seed, Step: s.result.Steps,
 			Kind: KindLinearizabilityCoverage, Inconclusive: true,
 			What: fmt.Sprintf(
-				"history of %d operations never reached a fault that could produce a violation "+
-					"(0 ops on a partitioned node, 0 under split brain) — a healthy cluster is "+
-					"trivially linearizable, so this run cannot count toward a claim", res.Ops),
+				"history of %d operations contained no read that could have been stale "+
+					"(%d ops on a partitioned node, %d under split brain, %d split-brain reads, "+
+					"%d of them targeted) — this run cannot count toward a linearizability claim",
+				res.Ops, res.Partitioned, res.SplitBrain, res.SplitBrainReads, res.TargetedReads),
 		})
 		return res
 	}
@@ -828,6 +905,36 @@ func (s *Sim) nodeAt(id uint64) (*node, bool) {
 // It also returns whether more than one node claimed leadership at the
 // moment of the choice, which is the coverage number that decides whether an
 // Ok verdict is worth anything.
+// splitBrainPair returns the two nodes a stale read needs: a claimant the
+// network has CUT OFF, and a claimant it has not.
+//
+// Random claimant selection is the right default and the wrong tool for
+// aiming. During a split brain it lands on the stale leader about half the
+// time, and it has no way to write through the majority and read through the
+// minority IN THAT ORDER — which is the only sequence that produces a
+// provably stale answer rather than a possibly stale one.
+//
+// Returns nils unless both exist, which is most of the time.
+func (s *Sim) splitBrainPair() (majority, cutOff *node) {
+	s.nodesMu.RLock()
+	defer s.nodesMu.RUnlock()
+	for _, id := range s.liveIDsLocked() {
+		n := s.nodes[id]
+		if !n.coord.IsLeader() {
+			continue
+		}
+		if s.net.IsPartitioned(id) {
+			cutOff = n
+		} else {
+			majority = n
+		}
+	}
+	if majority == nil || cutOff == nil {
+		return nil, nil
+	}
+	return majority, cutOff
+}
+
 func (s *Sim) pickLeaderClaimant(rng *rand.Rand) (*node, bool) {
 	s.nodesMu.RLock()
 	var claimants []*node
@@ -954,6 +1061,158 @@ func (s *Sim) heal(step int) bool {
 	}
 	s.net.Heal()
 	return true
+}
+
+// pauseLeader freezes the leader: its tickers stop and its inbound raft
+// messages queue instead of arriving.
+//
+// This is the fault that defeats CheckQuorum, and it defeats it for a reason
+// worth stating: CheckQuorum is driven by TICKS, so a leader that is not
+// running never performs the check and is still convinced it leads when it
+// wakes. Nothing here is a partition — the messages are held, not dropped —
+// because a process that is merely descheduled has its packets buffered by
+// the kernel, and that queueing is what preserves the deposed-but-unaware
+// state the stale read needs.
+func (s *Sim) pauseLeader(step int) bool {
+	lead := s.leader()
+	if lead == nil {
+		return false
+	}
+	lead.clk.Pause()
+	s.net.Hold(lead.id)
+	s.paused = lead
+	s.pauseUntilStep = step + s.cfg.PauseSteps
+	s.result.Faults.Pauses++
+	s.logf("step %d: PAUSE leader node %d (ticker frozen, inbound held) until step %d",
+		step, lead.id, s.pauseUntilStep)
+	return true
+}
+
+// wakeIfDue resumes a paused node once its scheduled pause has elapsed.
+//
+// THE ORDER IS THE EXPERIMENT. The ticker is unfrozen and the targeted read
+// is issued BEFORE the queued raft messages are released, because that gap is
+// the GC-pause window: the process is running again, has not yet drained the
+// queue that would tell it a newer leader exists, and answers from state it
+// still believes current. Releasing first would hand it the higher term, step
+// it down, and close the window before the read.
+func (s *Sim) wakeIfDue(step int) {
+	if s.paused == nil || step < s.pauseUntilStep {
+		return
+	}
+	woken := s.paused
+	s.paused = nil
+	s.pauseUntilStep = 0
+
+	// 1. The process is scheduled again.
+	woken.clk.Resume()
+	s.logf("step %d: WAKE node %d — reading before its queued messages are released", step, woken.id)
+
+	// 2. Read from it while it is still unaware. One targeted read against
+	// the freshest job the majority committed during the pause.
+	if lead := s.majorityLeaderExcept(woken.id); lead != nil {
+		s.targetedReadAfterWake(woken, lead)
+	}
+
+	// 3. Only now does it learn what happened.
+	s.net.Release(woken.id)
+	s.logf("step %d: released node %d's queued messages", step, woken.id)
+}
+
+// pausedNode reports whether this node is inside its scheduled pause.
+//
+// Scoped to the SCHEDULED pause, not to "has a frozen clock". That is what
+// bounds the invariant's exemption: a node whose clock is frozen without the
+// schedule having paused it is still a violation.
+func (s *Sim) pausedNode(id uint64) bool {
+	return s.paused != nil && s.paused.id == id
+}
+
+// majorityLeaderExcept finds a leader other than the given node.
+func (s *Sim) majorityLeaderExcept(except uint64) *node {
+	s.nodesMu.RLock()
+	defer s.nodesMu.RUnlock()
+	for _, id := range s.liveIDsLocked() {
+		if id == except {
+			continue
+		}
+		if n := s.nodes[id]; n.coord.IsLeader() {
+			return n
+		}
+	}
+	return nil
+}
+
+// injectTargetedWindow opens the split-brain window on purpose.
+//
+// A targeted workload that waits for the schedule to roll a leader partition
+// is not targeted. Measured: against the pinned adversary the workload caught
+// the bug in every run that reached the window and in none that did not — six
+// of twelve seeds, the other six never having opened a window at all. The
+// detector was perfect and the OPPORTUNITY was the limit, so the opportunity
+// is what gets fixed, here rather than by hoping longer runs stumble into it.
+//
+// Held for the same count as a scheduled leader partition, which must span an
+// election timeout plus enough time for the new leader to commit — otherwise
+// there is nothing committed on the majority side for a stale read to miss.
+func (s *Sim) injectTargetedWindow(step int) {
+	if s.targetedPartitionStep == 0 || step != s.targetedPartitionStep {
+		return
+	}
+
+	// THE MAJORITY SIDE MUST BE ABLE TO ELECT, or there is no window.
+	//
+	// Cutting the leader off only produces two claimants if what remains
+	// can form a quorum and choose a successor. With three nodes that needs
+	// all three up: the schedule kills one often enough that this was the
+	// whole difference between a run that covered the window and one that
+	// did not. Seeds 2, 5 and 6 each killed a node first, so partitioning
+	// the leader left ONE reachable node, which can never elect — and the
+	// run recorded zero targeted reads while looking like the injection had
+	// worked.
+	//
+	// So targeted mode restores full membership first and opens the window
+	// on the step after. This overrides the fault schedule's kill, which is
+	// the point: the injected window is the run's one guaranteed
+	// opportunity, and a schedule that happens to have killed a node must
+	// not silently consume it.
+	if len(s.liveIDs()) < s.cfg.Nodes {
+		for id := uint64(1); id <= uint64(s.cfg.Nodes); id++ {
+			if _, up := s.nodeAt(id); !up {
+				if err := s.start(id); err == nil {
+					s.result.Faults.NodeRestarts++
+					s.logf("step %d: targeted mode restarting node %d to make a window possible", step, id)
+				}
+			}
+		}
+		s.net.Heal()
+		s.targetedPartitionStep = step + 1
+		return
+	}
+
+	// A PAUSE instead of a partition, when asked for. The pause is the
+	// adversary that works against the shipped configuration, because
+	// CheckQuorum cannot step down a process that is not running its ticks.
+	if s.cfg.PauseLeader {
+		if !s.pauseLeader(step) {
+			s.targetedPartitionStep = step + 1
+		}
+		return
+	}
+
+	lead := s.leader()
+	if lead == nil {
+		// Mid-election. Try again next step rather than giving up on the
+		// run's only guaranteed window.
+		s.targetedPartitionStep = step + 1
+		return
+	}
+	s.net.Partition(lead.id)
+	s.holdHeal = s.cfg.LeaderPartitionSteps
+	s.result.Faults.Partitions++
+	s.result.Faults.LeaderPartitions++
+	s.logf("step %d: TARGETED partition of LEADER node %d, held for %d steps",
+		step, lead.id, s.holdHeal)
 }
 
 func quorum(n int) int { return n/2 + 1 }

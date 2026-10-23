@@ -122,6 +122,12 @@ func (s *Sim) linClient(ctx context.Context, client int) {
 			return
 		}
 
+		// TARGETED FIRST. Whenever the window is open, aim at it rather
+		// than sampling and hoping.
+		if s.cfg.TargetStaleReads && s.targetStaleRead(ctx, client, &seq) {
+			continue
+		}
+
 		n, split := s.pickLeaderClaimant(rng)
 		if n == nil {
 			// Mid-election: nobody will answer, so nothing happened and
@@ -247,6 +253,87 @@ func (s *Sim) linGet(ctx context.Context, n *node, client int, rng *rand.Rand, w
 	}
 	in := linInput{Kind: opGet, JobID: jobID}
 	op := s.history.begin(client, in, w.partitioned, w.splitBrain)
+	_, err := n.svc.GetJob(ctx, &schedulerpb.GetJobRequest{JobId: jobID})
+	op.done(s.classifyGet(err))
+}
+
+// targetStaleRead drives the one sequence that can prove a read was stale,
+// and reports whether it ran.
+//
+// WRITE THROUGH THE MAJORITY, READ THROUGH THE MINORITY, IN THAT ORDER. The
+// write returns before the read begins, so the job is committed and
+// acknowledged by the time the cut-off leader is asked about it; no
+// reordering of the history can make a NOT_FOUND legal. Sampling cannot
+// establish that — a read concurrent with its write may legally miss it,
+// which is exactly the case the model accepts.
+//
+// This is the deterministic scenario from Day 9, driven continuously under
+// the seeded schedule instead of once by hand.
+func (s *Sim) targetStaleRead(ctx context.Context, client int, seq *int) bool {
+	majority, cutOff := s.splitBrainPair()
+	if majority == nil || cutOff == nil {
+		return false // the window is not open
+	}
+
+	// 1. Commit through the majority, and wait for the acknowledgement.
+	*seq++
+	key := fmt.Sprintf("tgt-%d/%d", client, *seq)
+	in := linInput{Kind: opSubmit, Key: key}
+	op := s.history.begin(client, in, s.net.IsPartitioned(majority.id), true)
+	resp, err := majority.svc.SubmitJob(ctx, &schedulerpb.SubmitJobRequest{
+		ClientId:  fmt.Sprintf("tgt-%d", client),
+		RequestId: fmt.Sprintf("%d", *seq),
+		Tasks:     []*schedulerpb.TaskSpec{{Command: "/bin/true", MaxAttempts: 1}},
+	})
+	out := s.classifySubmit(resp, err)
+	op.done(out)
+	if out.Unknown {
+		// Never acknowledged, so nothing is proven by reading it back.
+		return true
+	}
+	s.knownJobs.add(out.JobID)
+
+	// 2. Read it from the cut-off leader, which cannot have it.
+	s.recordTargetedRead(ctx, cutOff, client, out.JobID)
+	return true
+}
+
+// targetedReadAfterWake is the pause fault's payload: commit through the
+// majority, then read that job from the just-woken node before it drains its
+// queue.
+//
+// Run from the fault schedule's goroutine rather than a client's, because the
+// ordering is the experiment and it must not race a client's own pacing. The
+// write is acknowledged before the read begins, so no reordering of the
+// history can make a NOT_FOUND legal.
+func (s *Sim) targetedReadAfterWake(woken, majority *node) {
+	ctx := context.Background()
+	s.wakeSeq++
+	key := fmt.Sprintf("wake-%d", s.wakeSeq)
+
+	in := linInput{Kind: opSubmit, Key: key}
+	op := s.history.begin(0, in, false, true)
+	resp, err := majority.svc.SubmitJob(ctx, &schedulerpb.SubmitJobRequest{
+		ClientId:  "wake",
+		RequestId: fmt.Sprintf("%d", s.wakeSeq),
+		Tasks:     []*schedulerpb.TaskSpec{{Command: "/bin/true", MaxAttempts: 1}},
+	})
+	out := s.classifySubmit(resp, err)
+	op.done(out)
+	if out.Unknown {
+		return // never acknowledged; reading it back proves nothing
+	}
+	s.knownJobs.add(out.JobID)
+
+	// The woken node must not be able to answer this correctly.
+	s.recordTargetedRead(ctx, woken, 0, out.JobID)
+}
+
+// recordTargetedRead files a read against a specific node, marked as the
+// split-brain read it is.
+func (s *Sim) recordTargetedRead(ctx context.Context, n *node, client int, jobID string) {
+	in := linInput{Kind: opGet, JobID: jobID}
+	op := s.history.beginTargeted(client, in, s.net.IsPartitioned(n.id))
 	_, err := n.svc.GetJob(ctx, &schedulerpb.GetJobRequest{JobId: jobID})
 	op.done(s.classifyGet(err))
 }
