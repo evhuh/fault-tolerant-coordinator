@@ -7,7 +7,9 @@
 package client
 
 import (
+	"context"
 	"fmt"
+	"net"
 	"strings"
 	"sync"
 
@@ -52,17 +54,41 @@ type Pool struct {
 	conns   map[string]*grpc.ClientConn
 	current string
 	seeds   []string
+	// dial, when set, replaces the TCP dialer. The simulator supplies an
+	// in-memory one so a worker exercises THIS pool — real redirects, real
+	// proto marshaling — rather than a stand-in for it.
+	dial Dialer
+}
+
+// Dialer opens a connection to a coordinator address.
+type Dialer func(ctx context.Context, addr string) (net.Conn, error)
+
+// Option configures a Pool.
+type Option func(*Pool)
+
+// WithDialer replaces the network dialer.
+//
+// The addresses stay the ones the cluster hands out in its NOT_LEADER
+// redirects, so swapping the dialer swaps the transport and nothing else: a
+// caller still finds the leader the same way, and a dialer that returns an
+// error is indistinguishable from a refused connection.
+func WithDialer(d Dialer) Option {
+	return func(p *Pool) { p.dial = d }
 }
 
 // NewPool takes one or more coordinator gRPC addresses. Any one will do: a
 // non-leader answers NOT_LEADER with the leader's address, so a single seed
 // is enough to find the cluster.
-func NewPool(seeds ...string) *Pool {
+func NewPool(seeds []string, opts ...Option) *Pool {
 	norm := make([]string, 0, len(seeds))
 	for _, s := range seeds {
 		norm = append(norm, normalize(s))
 	}
-	return &Pool{conns: map[string]*grpc.ClientConn{}, seeds: norm, current: norm[0]}
+	p := &Pool{conns: map[string]*grpc.ClientConn{}, seeds: norm, current: norm[0]}
+	for _, o := range opts {
+		o(p)
+	}
+	return p
 }
 
 // Client returns a client for the address believed to be the leader.
@@ -102,7 +128,16 @@ func (p *Pool) connTo(addr string) (*grpc.ClientConn, error) {
 	if c, ok := p.conns[addr]; ok {
 		return c, nil
 	}
-	c, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	target := addr
+	opts := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
+	if p.dial != nil {
+		// passthrough:/// because grpc.NewClient resolves a bare target
+		// through DNS, and an injected dialer's addresses are names only —
+		// the simulator's "sim-api-1" has nothing to resolve.
+		target = "passthrough:///" + addr
+		opts = append(opts, grpc.WithContextDialer(p.dial))
+	}
+	c, err := grpc.NewClient(target, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("dial %s: %w", addr, err)
 	}

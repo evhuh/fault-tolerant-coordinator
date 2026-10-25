@@ -1150,3 +1150,69 @@ func TestRetryBackoffGrowsAcrossAttempts(t *testing.T) {
 	}
 	t.Logf("backoff per attempt (ms): %v", delays)
 }
+
+// A RUNNING task whose worker stopped running it must not be stranded.
+//
+// FOUND BY THE EFFECT LEDGER'S LIVENESS ASSERTION, and reduced to this
+// deterministic scenario before being treated as real: a 40-step real-worker
+// run finished quiescence with one task sitting at
+// `RUNNING attempt=3/5 worker=w-3(ALIVE, lease +312ms)` — healed cluster, idle
+// workers, nothing errored, and the task never reached a terminal state.
+//
+// Two mechanisms close the trap on it:
+//
+//   - Renewal extends the lease of EVERY task the worker holds, claimed or
+//     not, so a heartbeating worker keeps a task it is not executing alive
+//     forever and Tick never reclaims it.
+//   - RequestTask only re-offers ASSIGNED tasks, so a RUNNING one is never
+//     handed back — not even to the worker that holds it.
+//
+// Together: permanently RUNNING, invisible, and fatal to "every submitted
+// task reaches a terminal state".
+//
+// The scenario is a worker RESTART, which is the shortest path to it and a
+// perfectly ordinary event: the worker claims the task, reports itself
+// running, then loses its in-memory claim and comes back heartbeating with an
+// empty running set. A lost ReportResult reaches the same state.
+func TestRunningTaskIsReclaimedWhenItsWorkerStopsClaimingIt(t *testing.T) {
+	s, clk := newTestService(t)
+	register(t, s, "w-1")
+	submit(t, s, "req-1", 1)
+	task := awaitTask(t, s, "w-1")
+
+	// The worker reports itself executing, which promotes ASSIGNED -> RUNNING.
+	heartbeat(t, s, "w-1", task.GetTaskId())
+	var before state.Task
+	s.c.read(func(st *state.StateStore) { before, _ = st.Task(task.GetTaskId()) })
+	if before.State != state.TaskRunning {
+		t.Fatalf("state = %s, want RUNNING — the claim did not take effect", before.State)
+	}
+
+	// The worker restarts: still alive, still heartbeating, but its in-memory
+	// claim is gone, so it no longer names the task.
+	register(t, s, "w-1")
+	for i := 0; i < 4; i++ {
+		clk.advance(DefaultConfig().LeaseTTL.Milliseconds() / 2)
+		heartbeat(t, s, "w-1")
+		tick(t, s)
+	}
+
+	var after state.Task
+	s.c.read(func(st *state.StateStore) { after, _ = st.Task(task.GetTaskId()) })
+	if after.State == state.TaskRunning {
+		t.Fatalf("task is still RUNNING on a worker that stopped claiming it, two lease TTLs later: "+
+			"attempt %d, lease %+dms — a heartbeat is the worker's acknowledgement, "+
+			"so renewal must not cover a RUNNING task the worker no longer claims",
+			after.Attempt, after.LeaseExpiryMs-s.c.nowMs())
+	}
+
+	// Reclaimed, and reclaimable: the next attempt must be dispatchable.
+	heartbeat(t, s, "w-1")
+	again := awaitTask(t, s, "w-1")
+	if again.GetTaskId() != task.GetTaskId() {
+		t.Errorf("re-offered %q, want %q", again.GetTaskId(), task.GetTaskId())
+	}
+	if again.GetAttempt() <= task.GetAttempt() {
+		t.Errorf("attempt = %d, want > %d — a reclaim is a new attempt", again.GetAttempt(), task.GetAttempt())
+	}
+}

@@ -63,7 +63,7 @@ func TestIsNotLeaderRecognizesRedirects(t *testing.T) {
 // The raft peer set holds transport URLs; gRPC dials host:port. The redirect
 // crosses those two address spaces, so the scheme has to come off.
 func TestRedirectNormalizesAddresses(t *testing.T) {
-	p := NewPool("127.0.0.1:1", "127.0.0.1:2")
+	p := NewPool([]string{"127.0.0.1:1", "127.0.0.1:2"})
 	for _, in := range []string{
 		"http://127.0.0.1:9090",
 		"https://127.0.0.1:9090",
@@ -80,7 +80,7 @@ func TestRedirectNormalizesAddresses(t *testing.T) {
 // An empty address means "this node knows of no leader". Rotating beats
 // hammering the node that just said it cannot help.
 func TestRedirectWithNoLeaderRotatesSeeds(t *testing.T) {
-	p := NewPool("a:1", "b:2", "c:3")
+	p := NewPool([]string{"a:1", "b:2", "c:3"})
 	if got := p.Current(); got != "a:1" {
 		t.Fatalf("initial = %q, want a:1", got)
 	}
@@ -96,7 +96,7 @@ func TestRedirectWithNoLeaderRotatesSeeds(t *testing.T) {
 // Do must give up rather than chase a redirect loop forever — a cluster
 // mid-election can bounce a caller indefinitely.
 func TestDoBoundsTheRedirectChase(t *testing.T) {
-	p := NewPool("127.0.0.1:1", "127.0.0.1:2")
+	p := NewPool([]string{"127.0.0.1:1", "127.0.0.1:2"})
 	calls := 0
 	err := p.Do(func(schedulerpb.SchedulerClient) error {
 		calls++
@@ -112,7 +112,7 @@ func TestDoBoundsTheRedirectChase(t *testing.T) {
 
 // A real error must come straight back, not be retried as a redirect.
 func TestDoDoesNotRetryOrdinaryErrors(t *testing.T) {
-	p := NewPool("127.0.0.1:1")
+	p := NewPool([]string{"127.0.0.1:1"})
 	calls := 0
 	want := status.Error(codes.InvalidArgument, "job has no tasks")
 	err := p.Do(func(schedulerpb.SchedulerClient) error {
@@ -128,7 +128,7 @@ func TestDoDoesNotRetryOrdinaryErrors(t *testing.T) {
 }
 
 func TestDoReturnsNilOnSuccess(t *testing.T) {
-	p := NewPool("127.0.0.1:1")
+	p := NewPool([]string{"127.0.0.1:1"})
 	calls := 0
 	if err := p.Do(func(schedulerpb.SchedulerClient) error {
 		calls++
@@ -148,7 +148,7 @@ func TestDoReturnsNilOnSuccess(t *testing.T) {
 // coordinator failover would take out every worker even though the cluster
 // recovered fine.
 func TestDoRotatesOffAnUnreachableNode(t *testing.T) {
-	p := NewPool("a:1", "b:2", "c:3")
+	p := NewPool([]string{"a:1", "b:2", "c:3"})
 	var seen []string
 	err := p.Do(func(schedulerpb.SchedulerClient) error {
 		seen = append(seen, p.Current())
@@ -176,7 +176,7 @@ func TestDoRotatesOffAnUnreachableNode(t *testing.T) {
 // with an even number of seeds the rotation can land back where it started,
 // which would make a final-position check silently vacuous.
 func TestDoRotatesOnTimeout(t *testing.T) {
-	p := NewPool("a:1", "b:2")
+	p := NewPool([]string{"a:1", "b:2"})
 	var seen []string
 	_ = p.Do(func(schedulerpb.SchedulerClient) error {
 		seen = append(seen, p.Current())

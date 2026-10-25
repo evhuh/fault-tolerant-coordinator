@@ -38,7 +38,7 @@ func main() {
 		usage()
 	}
 
-	pool := client.NewPool(strings.Split(*addr, ",")...)
+	pool := client.NewPool(strings.Split(*addr, ","))
 	defer pool.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

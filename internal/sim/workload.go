@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"hash/fnv"
+	"time"
 
 	schedulerpb "github.com/evazheng/fault-tolerant-coordinator/proto/schedulerpb"
 )
@@ -40,16 +41,21 @@ func (s *Sim) offerWork(step int) {
 		return // no leader right now; that is a normal state mid-chaos
 	}
 
-	for i := 1; i <= s.cfg.WorkerCount; i++ {
-		_, _ = lead.svc.Heartbeat(context.Background(), &schedulerpb.HeartbeatRequest{
-			WorkerId: fmt.Sprintf("w-%d", i),
-		})
+	// Real workers heartbeat for themselves, on their own frozen-or-not
+	// clocks. Renewing their leases from here would hide exactly the lease
+	// expiry a paused worker is supposed to suffer.
+	if !s.cfg.RealWorkers {
+		for i := 1; i <= s.cfg.WorkerCount; i++ {
+			_, _ = lead.svc.Heartbeat(context.Background(), &schedulerpb.HeartbeatRequest{
+				WorkerId: fmt.Sprintf("w-%d", i),
+			})
+		}
 	}
 
 	for j := 0; j < s.cfg.JobsPerStep; j++ {
 		specs := make([]*schedulerpb.TaskSpec, 0, s.cfg.TasksPerJob)
 		for t := 0; t < s.cfg.TasksPerJob; t++ {
-			specs = append(specs, &schedulerpb.TaskSpec{Command: "/bin/true", MaxAttempts: 5})
+			specs = append(specs, s.specFor(step, j, t))
 		}
 		// A stable request id per (step, index) so a retry across a failover
 		// dedups rather than creating a second job — which is also what makes
@@ -97,6 +103,130 @@ func (s *Sim) drainSomeWork() {
 		}
 	}
 }
+
+// specFor builds one task's spec.
+//
+// With the simulated pool it is a command string nobody runs. With real
+// workers it is a SHELL SCRIPT that appends to a shared log, because the
+// ledger needs to see the executions themselves:
+//
+//	START <taskID> <attempt>
+//	END <taskID> <attempt>
+//
+// Two lines rather than one, and that is what makes OVERLAP visible at all. A
+// single line per execution shows that two attempts ran; it cannot show they
+// ran AT THE SAME TIME, which is what at-least-once permits and what
+// idempotency exists to survive. With a start and an end, overlap is the
+// log's own order: a START for a task that already has an open attempt.
+//
+// ORDER, NOT TIMESTAMPS, deliberately. BSD date has no %N, so a portable
+// shell cannot stamp sub-second time, and a one-second resolution is useless
+// against a 300ms lease. The log file is itself a serialization of the
+// events, which is all overlap needs.
+//
+// The task learns its own identity from the environment the executor now
+// passes, so the script is identical for every task and the log is keyed by
+// what actually ran rather than by what the simulator believed it submitted.
+//
+// Appends are O_APPEND writes of well under PIPE_BUF from separate processes,
+// which do not interleave on a local filesystem.
+func (s *Sim) specFor(step, job, task int) *schedulerpb.TaskSpec {
+	cmd := s.commandFor(step, job, task)
+	spec := &schedulerpb.TaskSpec{Command: cmd, MaxAttempts: 5}
+	if !s.cfg.RealWorkers || s.overlapLog == "" {
+		return spec
+	}
+	if cmd == cmdCannotStart {
+		// NOT WRAPPED, on purpose. This task's whole point is that the
+		// command cannot be started, which is the executor's non-retryable
+		// branch; wrapping it in a shell would make the shell start fine and
+		// exit 127, turning a terminal failure into a retryable one and
+		// taking that branch out of the run's coverage. It also has no
+		// execution to log — nothing ever runs.
+		return spec
+	}
+
+	// SOME TASKS ARE SLOW, and they have to be, or overlap stays at zero: a
+	// task that finishes inside its lease is never reclaimed mid-execution,
+	// so the only attempt that exists is the one that completed. A slow task
+	// outlives its lease, is reclaimed, and keeps running — exactly the
+	// at-least-once case this ledger exists to measure.
+	//
+	// Hashed, like every other workload decision, so the slow set is the same
+	// on a replay and the fault RNG is untouched.
+	sleep := ""
+	id := fmt.Sprintf("step-%d-%d-%d", step, job, task)
+	if s.hashUnit(id, 0, "slow") < s.cfg.SlowTaskFraction {
+		// SIX LEASES, measured rather than guessed. 2.5 was the first value
+		// and it produced a reclaim with no overlap: the lease takes a full
+		// TTL to lapse after the worker freezes, the planner then has to
+		// redispatch, and by the time the second attempt starts a 2.5-lease
+		// sleep has long since written its END line. The window the first
+		// attempt has to still be running spans "pause lands" plus "lease
+		// lapses" plus "redispatch", so the sleep has to cover all three
+		// with room, not just the lease.
+		sleep = fmt.Sprintf("sleep %.3f; ", slowTaskLeases*s.cfg.LeaseTTL.Seconds())
+	}
+
+	// Every piece substituted here is a path or an env var name this process
+	// chose; nothing from the cluster reaches the script.
+	script := fmt.Sprintf(
+		`printf 'START %%s %%s
+' "$FTC_TASK_ID" "$FTC_ATTEMPT" >> %[1]s; `+
+			`%[2]s%[3]s; rc=$?; `+
+			`printf 'END %%s %%s
+' "$FTC_TASK_ID" "$FTC_ATTEMPT" >> %[1]s; `+
+			`exit $rc`,
+		s.overlapLog, sleep, cmd)
+
+	spec.Command = s.cmdShell
+	spec.Args = []string{"-c", script}
+	// The timeout must outlast the sleep, or the executor kills the task
+	// before it can write its END line and every slow attempt looks like a
+	// crash. Zero would mean the executor's own one-minute default.
+	spec.TimeoutMs = int64(10*s.cfg.LeaseTTL/time.Millisecond) + 5000
+	return spec
+}
+
+// commandFor picks the command a task will run.
+//
+// With the simulated worker pool the outcome is decided by hashing at REPORT
+// time, which can vary by attempt — a retry of a failed task may succeed. A
+// real worker has no such freedom: the outcome is whatever the command does,
+// so the choice moves to SUBMIT time and a failing task fails on every
+// attempt until it exhausts its budget.
+//
+// The two failure kinds have to be separate binaries because they are
+// separate branches in the executor and the state machine. /bin/false RAN and
+// returned nonzero — the program's own verdict, retryable, so the task goes
+// back to PENDING with a backoff deadline. A command that does not exist
+// never starts, which no number of attempts fixes, so it is terminal. A
+// workload that only produced one of them would say nothing about the other.
+//
+// Hashed on (seed, step, job, task) and never drawn from the fault RNG, per
+// the Day 8 rule: a timing-dependent number of draws would destroy schedule
+// reproducibility.
+func (s *Sim) commandFor(step, job, task int) string {
+	if !s.cfg.RealWorkers || s.cfg.FailureRate <= 0 {
+		return s.cmdOK
+	}
+	id := fmt.Sprintf("step-%d-%d-%d", step, job, task)
+	if s.hashUnit(id, 0, "fail") >= s.cfg.FailureRate {
+		return s.cmdOK
+	}
+	if s.hashUnit(id, 0, "kind") < s.cfg.RetryableFraction {
+		return s.cmdFail
+	}
+	return cmdCannotStart
+}
+
+// slowTaskLeases is how many lease TTLs a slow task's payload sleeps for.
+const slowTaskLeases = 6
+
+// cmdCannotStart is a path that does not exist, which is the executor's
+// non-retryable branch: a command that never starts is not made startable by
+// another attempt.
+const cmdCannotStart = "/sim/no-such-command"
 
 // outcomeFor decides whether this execution succeeded, by HASHING
 // (seed, taskID, attempt) rather than drawing from the run's RNG.

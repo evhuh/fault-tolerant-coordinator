@@ -66,6 +66,22 @@ func (e *Executor) Run(ctx context.Context, taskID string, attempt int32, comman
 	cmd := exec.CommandContext(runCtx, command, args...)
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
+	// THE TASK IS TOLD WHO IT IS. (taskID, attempt) is the idempotency key the
+	// whole delivery contract rests on, and a payload that cannot see it
+	// cannot participate: it has no way to dedup its own writes, and no way
+	// to record which attempt produced an effect. Passing it in the
+	// environment is the conventional shape, and it is also what lets a
+	// verifier watch the attempts themselves rather than only the
+	// coordinator's view of them.
+	//
+	// FTC_RESULT_DIR comes along because the directory IS the per-attempt
+	// ledger entry; a payload that wants to write beside its stdout should
+	// not have to reconstruct the path.
+	cmd.Env = append(os.Environ(),
+		"FTC_TASK_ID="+taskID,
+		fmt.Sprintf("FTC_ATTEMPT=%d", attempt),
+		"FTC_RESULT_DIR="+dir,
+	)
 	runErr := cmd.Run()
 
 	res := Result{ResultRef: dir}

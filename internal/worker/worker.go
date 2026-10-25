@@ -33,6 +33,22 @@ type Config struct {
 	// Clock reads wall time. Nil means the real one; the simulator supplies
 	// its own so a run can be compressed.
 	Clock clock.Clock
+	// ReportTimeout bounds the ReportResult call, which runs on a context
+	// that deliberately outlives cancellation. Zero means DefaultReportTimeout.
+	//
+	// Settable because it is WALL-CLOCK time and the only deadline here that
+	// is: an injected clock compresses the heartbeat and poll loops, but a
+	// context deadline does not compress with it. The simulator's
+	// descheduled-worker case depends on a held report surviving the pause —
+	// if the pause outlasts this deadline the call is cancelled on wake, the
+	// late report never reaches the coordinator, and the stale-report path
+	// the whole effectively-once claim rests on silently never runs.
+	ReportTimeout time.Duration
+	// Logf receives the transient-failure notices below. Nil means the
+	// standard logger. The simulator routes them into its own output: mid
+	// chaos every one of these is the EXPECTED outcome, and thousands of them
+	// on stderr bury whatever the run was actually there to show.
+	Logf func(format string, args ...any)
 }
 
 func DefaultConfig(workerID, dataDir string) Config {
@@ -53,6 +69,7 @@ type Worker struct {
 	// would strand the whole worker pool even though the cluster recovered.
 	pool *client.Pool
 	exec *Executor
+	logf func(format string, args ...any)
 
 	// running tracks what this worker is currently executing, and is what the
 	// heartbeat carries up as running_task_ids. That claim is what promotes
@@ -66,8 +83,13 @@ func New(cfg Config, pool *client.Pool) *Worker {
 	if cfg.Concurrency < 1 {
 		cfg.Concurrency = 1
 	}
+	logf := cfg.Logf
+	if logf == nil {
+		logf = log.Printf
+	}
 	return &Worker{
 		cfg:     cfg,
+		logf:    logf,
 		clk:     clock.OrReal(cfg.Clock),
 		pool:    pool,
 		exec:    &Executor{DataDir: cfg.DataDir},
@@ -132,10 +154,21 @@ func (w *Worker) heartbeatLoop(ctx context.Context) {
 				return err
 			})
 			if err != nil && ctx.Err() == nil {
-				log.Printf("worker %s: heartbeat: %v", w.cfg.WorkerID, err)
+				w.logf("worker %s: heartbeat: %v", w.cfg.WorkerID, err)
 			}
 		}
 	}
+}
+
+// DefaultReportTimeout is how long a result report may take before the
+// worker gives up and lets the lease expire instead.
+const DefaultReportTimeout = 5 * time.Second
+
+func (w *Worker) reportTimeout() time.Duration {
+	if w.cfg.ReportTimeout > 0 {
+		return w.cfg.ReportTimeout
+	}
+	return DefaultReportTimeout
 }
 
 func (w *Worker) runningIDs() []string {
@@ -166,7 +199,7 @@ func (w *Worker) pollLoop(ctx context.Context) {
 			// A coordinator restart, a lapsed lease, or an exhausted redirect
 			// chase all surface here. Re-register and back off; the pool has
 			// already moved on to another node if it was told to.
-			log.Printf("worker %s: request task: %v", w.cfg.WorkerID, err)
+			w.logf("worker %s: request task: %v", w.cfg.WorkerID, err)
 			w.clk.Sleep(w.cfg.HeartbeatInterval)
 			_ = w.register(ctx)
 			continue
@@ -245,7 +278,7 @@ func (w *Worker) execute(ctx context.Context, task *schedulerpb.Task) {
 	// Report on a context that outlives cancellation: if we are shutting down
 	// mid-task, a delivered result is strictly better than a lease timeout.
 	// Delivery is at-least-once, so retrying here is safe by construction.
-	reportCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	reportCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), w.reportTimeout())
 	defer cancel()
 	err := w.pool.Do(func(c schedulerpb.SchedulerClient) error {
 		_, e := c.ReportResult(reportCtx, req)
@@ -255,7 +288,7 @@ func (w *Worker) execute(ctx context.Context, task *schedulerpb.Task) {
 		// Dropping the report is survivable: the lease expires and the task
 		// is redispatched. That is the failure mode the whole lease design
 		// exists to absorb.
-		log.Printf("worker %s: report %s attempt %d: %v",
+		w.logf("worker %s: report %s attempt %d: %v",
 			w.cfg.WorkerID, task.GetTaskId(), task.GetAttempt(), err)
 	}
 }

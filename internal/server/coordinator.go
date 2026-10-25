@@ -75,6 +75,20 @@ type Config struct {
 	// a redirected client needs host:8080 to dial gRPC. Handing a client the
 	// raft address would point it at a port that does not serve its API.
 	APIAddrs map[uint64]string
+	// OnApply observes every command this node applied, with the Result the
+	// state machine computed. Nil is the normal case.
+	//
+	// It exists for the VERIFIER, not for the product: several of the state
+	// machine's most important decisions are silent no-ops — a stale report
+	// being ignored above all — and a no-op cannot be sampled out of state
+	// afterwards, because by then it looks exactly like nothing having
+	// happened. Observation has to be at the apply site or not at all.
+	//
+	// Called on EVERY replica that applies the entry, which is deliberate: a
+	// hook that only fired on the leader would miss entries applied across a
+	// leadership change. An observer that needs one count per command dedups
+	// on the command's own identity.
+	OnApply func(cmd *commandpb.Command, res state.Result)
 }
 
 func DefaultConfig() Config {

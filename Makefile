@@ -53,7 +53,7 @@ race:
 # test failing, which is the least informative failure Go can produce.
 sweeps:
 	FTC_SWEEPS=1 go test -timeout 30m -v ./internal/sim/ \
-		-run 'TestTargetedWorkload|TestPauseDefeats|TestShippedConfigWithoutPause|TestReadIndexFindsNoStale'
+		-run 'TestTargetedWorkload|TestPauseDefeats|TestShippedConfigWithoutPause|TestReadIndexFindsNoStale|TestEffectLedger'
 
 # Everything a tag asserts: the default suite, the race detector, and the
 # sweeps whose numbers the claim rests on.

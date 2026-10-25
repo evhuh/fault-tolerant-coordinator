@@ -25,6 +25,9 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -205,6 +208,54 @@ type Config struct {
 	// timeout, or the majority never elects a successor and there is
 	// nothing newer for the woken leader to be stale about.
 	PauseSteps int
+	// RealWorkers runs the REAL worker binary's code in process — the
+	// executor, the heartbeat loop, the local claim dedup — against the real
+	// client.Pool over bufconn, instead of the simulator playing the worker
+	// pool by calling the service directly.
+	//
+	// Off by default, for cost rather than doubt: every attempt is a
+	// fork/exec, which is wall-clock time that clock compression cannot
+	// remove. It is what Day 10's effect ledger needs, because a ledger
+	// written by a simulated worker is evidence about the simulator.
+	RealWorkers bool
+	// PauseWorker injects a PROCESS PAUSE of a worker that is currently
+	// executing a task: its clock freezes and its outbound RPCs are held.
+	//
+	// WITHOUT IT OVERLAP IS UNREACHABLE, and the first ledger run proved it
+	// — 62 executions, zero overlaps, max concurrency 1. A slow task alone
+	// is not enough, because a LIVE worker heartbeats: heartbeat is
+	// re-registration, it republishes the running claim, and it renews the
+	// lease every quarter TTL for as long as the process is up. A task whose
+	// worker is still running is never reclaimed however long it takes.
+	//
+	// So the condition the ledger exists to measure needs the worker to stop
+	// renewing while its CHILD PROCESS keeps running — which is exactly a GC
+	// pause, and exactly what a frozen clock plus held RPCs produces. The
+	// subprocess is a real OS process and is not frozen with it, so it keeps
+	// executing after the lease is reclaimed. That is the overlap.
+	//
+	// Only read when RealWorkers is set, so it cannot alter an ordinary run.
+	PauseWorker bool
+	// SlowTaskFraction is the share of tasks whose payload sleeps past its
+	// lease, so the coordinator reclaims the task while it is still running.
+	//
+	// It exists because overlap is otherwise unreachable: a task that
+	// finishes inside its lease is never redispatched mid-execution, so the
+	// run measures zero overlapping executions and the effectively-once
+	// claim stays inconclusive no matter how long the run is.
+	SlowTaskFraction float64
+	// DrainBound is how long quiescence waits for the queue to empty after
+	// every fault is healed. Zero means a default derived from the run.
+	DrainBound time.Duration
+	// WorkerDir roots the real workers' result trees: one subdirectory per
+	// worker, which is where the executor writes <taskID>/<attempt>/.
+	//
+	// When it is empty the simulator makes a temporary root and removes it on
+	// shutdown. When it is set, the tree SURVIVES the run — which is what the
+	// effect ledger has to read, since the ledger is that tree plus what the
+	// coordinator committed, and a checker cannot read a directory the run
+	// deleted on its way out.
+	WorkerDir string
 	// LeaderPartitionSteps is how many steps a leader partition is held
 	// against healing. It must span an election timeout plus enough time
 	// for the new leader to commit, or the window closes before a read of
@@ -212,6 +263,16 @@ type Config struct {
 	LeaderPartitionSteps int
 
 	Out io.Writer
+	// WorkerOut receives the real workers' transient-failure notices, which
+	// mid-chaos are the EXPECTED outcome and arrive in the thousands.
+	//
+	// A SEPARATE writer from Out, and that separation is load-bearing: Out
+	// carries the fault schedule, which the Day 8 checkpoint compares byte
+	// for byte across two runs of one seed. Worker chatter is timing
+	// dependent by nature, so mixing it into that log would make the
+	// reproducibility claim fail for a reason that has nothing to do with
+	// reproducibility. Nil discards it.
+	WorkerOut io.Writer
 }
 
 func DefaultConfig() Config {
@@ -263,6 +324,12 @@ func DefaultConfig() Config {
 		// has even elected a successor.
 		LeaderPartitionSteps: 3,
 		PauseSteps:           3,
+		// A third of tasks outlive their lease, so the coordinator reclaims
+		// them mid-execution. High enough that a short run reaches overlap
+		// at all, low enough that the run is not mostly sleeping. Read only
+		// when RealWorkers is set.
+		SlowTaskFraction: 0.34,
+		PauseWorker:      true,
 	}
 }
 
@@ -341,6 +408,11 @@ type Result struct {
 	Window WindowPlan
 	// Pause explains the pause sequence when one was injected.
 	Pause PauseDiag
+	// Ledger is what the effect ledger observed, reported whether or not it
+	// found anything.
+	Ledger Ledger
+	// WorkerPause explains the worker pause when one was injected.
+	WorkerPause WorkerPauseDiag
 }
 
 // Coverage is which code paths a run actually reached.
@@ -360,6 +432,18 @@ type Coverage struct {
 	TasksBackedOff    int // distinct tasks seen holding a live NotBeforeMs
 	TasksTerminalFail int // distinct tasks that reached FAILED
 	SessionsExpired   int // the Tick TTL sweep actually removed something
+
+	// Observed AT THE APPLY SITE, because these are silent no-ops that
+	// cannot be sampled afterwards: once the entry has been applied, a report
+	// that was ignored looks exactly like a report that never arrived.
+	//
+	// StaleReportsRejected is the one the effectively-once claim rests on: a
+	// report that REACHED a coordinator naming an attempt that was no longer
+	// live, and was discarded. ZERO MEANS THE SCENARIO DID NOT HAPPEN, which
+	// makes the claim inconclusive for that run rather than confirmed — the
+	// same rule as zero overlap and zero split-brain reads.
+	StaleReportsRejected    int
+	DuplicateReportsIgnored int // the live attempt reported twice
 }
 
 // FaultCounts is the chaos actually induced, not the chaos configured.
@@ -421,6 +505,24 @@ const (
 	// checker, so counting it toward "N histories, zero violations" inflates
 	// the claim with runs that could not have failed.
 	KindLinearizabilityCoverage ViolationKind = "linearizability-coverage"
+	// KindEffectLedger is an effect-ledger violation: more than one committed
+	// effect for a task, a committed effect that does not match the attempt
+	// the coordinator recorded, or a task that never reached a terminal state
+	// over a cluster that had drained.
+	KindEffectLedger ViolationKind = "effect-ledger"
+	// KindDidNotDrain means the quiescence phase ran out of budget with
+	// tasks still in flight.
+	//
+	// DELIBERATELY NOT a lost task, and deliberately not an effect-ledger
+	// violation. A task still retrying has not been lost; what failed is a
+	// liveness bound this harness chose, so it is inconclusive. Conflating
+	// the two turns a slow host into a correctness claim.
+	KindDidNotDrain ViolationKind = "did-not-drain"
+	// KindLedgerCoverage means the ledger ran but the run never reached the
+	// situation it exists to check: no two executions overlapped, or no late
+	// report arrived. Inconclusive, on the same rule as linearizability
+	// coverage — a zero there means the path did not run, not that it worked.
+	KindLedgerCoverage ViolationKind = "ledger-coverage"
 )
 
 // IsEnvironment reports whether this kind says the HOST or the harness could
@@ -433,6 +535,15 @@ const (
 // tests red and every one of them names the wrong cause.
 func (k ViolationKind) IsEnvironment() bool {
 	return k == KindHostIO || k == KindFaultModel
+}
+
+// IsLedger reports whether this kind comes from the effect ledger. Tests
+// that are about something else use it to ignore exactly those, the same way
+// they ignore the linearizability kinds.
+func (k ViolationKind) IsLedger() bool {
+	return k == KindEffectLedger ||
+		k == KindDidNotDrain ||
+		k == KindLedgerCoverage
 }
 
 // IsLinearizability reports whether this kind is one of the two the
@@ -504,6 +615,16 @@ type Sim struct {
 	net   *simnet.Network
 	dirs  map[uint64]string
 	peers map[uint64]string
+	// apiAddrs are the CLIENT-facing addresses, a different address space
+	// from peers: peers are the URLs raft speaks between nodes, and a client
+	// dialing one would reach a port that does not serve the scheduler API.
+	// They are what NOT_LEADER redirects carry.
+	apiAddrs map[uint64]string
+	// api serves the scheduler API over bufconn when RealWorkers is set, and
+	// is nil otherwise.
+	api *apiNet
+	// rw is the in-process worker pool, nil unless RealWorkers is set.
+	rw *realWorkerPool
 
 	// nodesMu guards nodes.
 	//
@@ -560,10 +681,43 @@ type Sim struct {
 	result Result
 
 	// Coverage bookkeeping, sampled between steps on the Run goroutine.
-	seenBackoff  map[string]bool
-	seenRetried  map[string]bool
-	seenFailed   map[string]bool
-	lastSessions int
+	seenBackoff map[string]bool
+	seenRetried map[string]bool
+	// seenStaleReport, seenDuplicateReport and seenAccepted dedup the
+	// apply-site observations across replicas, keyed (taskID, attempt).
+	seenStaleReport     map[string]bool
+	seenDuplicateReport map[string]bool
+	seenAccepted        map[string]bool
+	// ledger accumulates the effect ledger during the run.
+	ledger Ledger
+	// overlapLog is the shared append-only file the task payloads write, and
+	// is empty unless real workers are running.
+	overlapLog string
+	// cmdShell is this host's /bin/sh, resolved like the other commands.
+	cmdShell string
+	// overlapLogTemp is set when the simulator had to make its own directory
+	// for the log, and is removed on shutdown.
+	overlapLogTemp string
+	// The worker pause: the step it may fire on, who is frozen, and when to
+	// wake them.
+	workerPauseStep int
+	workerPaused    string
+	workerResumeAt  int
+	seenFailed      map[string]bool
+	lastSessions    int
+	// cmdOK and cmdFail are the task commands, resolved against THIS HOST's
+	// PATH rather than hardcoded.
+	//
+	// The workload shipped "/bin/true" from Day 3, and nothing ever ran it:
+	// the simulator played the worker pool and decided outcomes by hashing,
+	// so the command string was inert. The first real worker reported
+	// "fork/exec /bin/true: no such file or directory" on every task —
+	// /bin/true does not exist on this machine, only /usr/bin/true. Three
+	// days of runs had been submitting a command the host cannot execute,
+	// which is exactly the class of gap "the simulator does not run the
+	// worker" was always going to be hiding.
+	cmdOK   string
+	cmdFail string
 	// lastClock is the leader's state-machine clock at the previous check,
 	// and clockFrozenSteps how many checks it has failed to move.
 	lastClock        int64
@@ -582,6 +736,12 @@ func New(cfg Config, dirs map[uint64]string) *Sim {
 		nodes: map[uint64]*node{},
 		dirs:  dirs,
 		peers: map[uint64]string{},
+
+		apiAddrs: map[uint64]string{},
+
+		seenStaleReport:     map[string]bool{},
+		seenDuplicateReport: map[string]bool{},
+		seenAccepted:        map[string]bool{},
 
 		seenBackoff:  map[string]bool{},
 		seenRetried:  map[string]bool{},
@@ -628,12 +788,39 @@ func New(cfg Config, dirs map[uint64]string) *Sim {
 		}
 		s.targetedPartitionStep = 2 + s.rng.Intn(span)
 	}
+	// Drawn at construction for the same reason the injected window is: one
+	// draw at a fixed point is reproducible from the seed, while a
+	// timing-dependent number of draws is not. Gated on RealWorkers so an
+	// ordinary run's fault sequence is untouched.
+	if cfg.RealWorkers && cfg.PauseWorker && cfg.Steps > 3 {
+		s.workerPauseStep = 2 + s.rng.Intn(maxInt(1, cfg.Steps/2))
+	}
 	for i := 1; i <= cfg.Nodes; i++ {
 		// Addresses are labels only: simnet routes by node id, so nothing
 		// binds a port and a long run cannot exhaust them.
 		s.peers[uint64(i)] = fmt.Sprintf("sim://node-%d", i)
+		// Client-facing names, resolved by the bufconn dialer rather than by
+		// DNS. Labels here too: nothing binds a port, so parallel runs cannot
+		// collide and a long one cannot exhaust anything.
+		s.apiAddrs[uint64(i)] = fmt.Sprintf("sim-api-%d", i)
+	}
+	s.cmdOK = lookCommand("true")
+	s.cmdFail = lookCommand("false")
+	s.cmdShell = lookCommand("sh")
+	if cfg.RealWorkers {
+		s.api = newAPINet(s.observeReport)
 	}
 	return s
+}
+
+// lookCommand resolves a coreutils-style command to an absolute path on this
+// host. The fallback is the conventional location, which at least fails with
+// a legible path rather than an empty one.
+func lookCommand(name string) string {
+	if p, err := exec.LookPath(name); err == nil {
+		return p
+	}
+	return "/usr/bin/" + name
 }
 
 // seededReader turns the run's RNG into the id source, so a reproduced run
@@ -663,6 +850,24 @@ func (s *Sim) start(id uint64) error {
 	cfg.ReadTimeout = s.cfg.ReadTimeout
 	// IDENTICAL on every node, which is the contract Policy carries.
 	cfg.StatePolicy = s.cfg.StatePolicy
+	// So NOT_LEADER carries an address the caller can actually dial, which is
+	// what production does: cmd/coordinator takes -api-peers and sets this
+	// map, and without it every redirect says "no leader elected" and a
+	// client rotates seeds blindly.
+	//
+	// Set on EVERY run, not just the real-worker ones. The simulator's
+	// default configuration is supposed to be the shipped configuration, and
+	// two address-space behaviours would mean the ordinary runs were
+	// verifying something production does not do.
+	//
+	// It does not change how ambiguity is recorded. Knowing a leader's
+	// address changes a redirect's code from Unavailable to
+	// FailedPrecondition, and classifySubmit puts BOTH in the Unknown bucket
+	// — only nil and InvalidArgument are definitive, precisely because
+	// NOT_LEADER can be returned after an entry was already proposed.
+	cfg.APIAddrs = s.apiAddrs
+	// Observe the apply site, so the silent no-ops are countable.
+	cfg.OnApply = s.observeApply
 	// Each node gets its own stream off the run's seed, so the ids a node
 	// mints are reproducible without every node drawing from one shared
 	// sequence whose order depends on goroutine scheduling.
@@ -695,7 +900,11 @@ func (s *Sim) start(id uint64) error {
 		return fmt.Errorf("start node %d: %w", id, err)
 	}
 	s.net.SetDown(id, false)
-	s.nodes[id] = &node{id: id, coord: coord, svc: server.NewService(coord), dir: s.dirs[id], clk: pclk}
+	svc := server.NewService(coord)
+	s.nodes[id] = &node{id: id, coord: coord, svc: svc, dir: s.dirs[id], clk: pclk}
+	if s.api != nil {
+		s.api.serve(s.apiAddrs[id], svc)
+	}
 	return nil
 }
 
@@ -711,6 +920,12 @@ func (s *Sim) stop(id uint64) {
 	// receiving messages, or its peers see a half-dead node rather than a
 	// cleanly absent one.
 	s.net.SetDown(id, true)
+	// The API goes down with it. A killed coordinator must not answer
+	// NOT_LEADER — it must not answer at all, which is the case that strands
+	// a pool that only handles redirects.
+	if s.api != nil {
+		s.api.shut(s.apiAddrs[id])
+	}
 	n.coord.StopRaft()
 	n.coord.StopScheduling()
 	delete(s.nodes, id)
@@ -767,7 +982,21 @@ func (s *Sim) Run(ctx context.Context) (Result, error) {
 	if s.awaitLeader(10*time.Second) == nil {
 		return s.result, fmt.Errorf("seed %d: no leader within 10s of bringing the cluster up", s.cfg.Seed)
 	}
-	s.registerWorkers()
+	if s.cfg.RealWorkers {
+		// The shared append-only log the task payloads write. It lives beside
+		// the worker result trees, so a caller that named WorkerDir keeps it
+		// and one that did not has it cleaned up with the rest.
+		if err := s.openOverlapLog(); err != nil {
+			return s.result, err
+		}
+		rw, err := s.startRealWorkers(ctx)
+		if err != nil {
+			return s.result, err
+		}
+		s.rw = rw
+	} else {
+		s.registerWorkers()
+	}
 
 	// The recorded clients run for the whole fault schedule, concurrently
 	// with it. They are stopped by collect(), on EVERY return path, so a run
@@ -801,12 +1030,21 @@ func (s *Sim) Run(ctx context.Context) (Result, error) {
 
 		s.stepNo.Store(int64(step))
 		s.applyFault(step)
+		// The worker pause rides along with the fault step but is its own
+		// injection: it aims at a worker that is executing right now, which
+		// is a condition only the live cluster can report.
+		s.injectWorkerPause(step)
 		// AFTER applyFault, so a quiet step's heal cannot undo it in the
 		// same breath.
 		s.injectTargetedWindow(step)
 		s.wakeIfDue(step)
 		s.offerWork(step)
-		s.drainSomeWork()
+		// With real workers the pool polls, executes and reports on its own
+		// goroutines; the simulator only submits. Driving both would have two
+		// claimants for one worker id.
+		if !s.cfg.RealWorkers {
+			s.drainSomeWork()
+		}
 		// Sample IMMEDIATELY after the reports land. A retry backoff is
 		// deliberately shorter than a step, so a once-per-step sampler
 		// watches it elapse between looks and concludes it never happened —
@@ -820,6 +1058,19 @@ func (s *Sim) Run(ctx context.Context) (Result, error) {
 			s.result.Violations = append(s.result.Violations, vs...)
 			return s.finish()
 		}
+	}
+
+	// QUIESCENCE, for a run with an effect ledger. Heal everything, wake
+	// everyone, stop injecting, and wait for the queue to drain within a
+	// bound — because "every submitted task reaches a terminal state" is
+	// false by design mid-chaos and can only be asserted over an idle
+	// cluster. Exceeding the bound is DID-NOT-DRAIN, not a lost task.
+	if s.cfg.RealWorkers {
+		// The config's override, which is normally zero: quiesce derives its
+		// own bound from the BACKLOG it finds, which a caller here cannot
+		// know. Passing drainBound() made the derivation dead code and
+		// reported DID-NOT-DRAIN on every seed against a fixed 6s.
+		s.quiesce(s.cfg.DrainBound)
 	}
 
 	// Heal everything and give the cluster a chance to settle, so the final
@@ -868,7 +1119,55 @@ func (s *Sim) finish() (Result, error) {
 	return res, nil
 }
 
+// stopBackground halts the recorded clients and the coverage sampler, once.
+//
+// Everything that reads s.result off the Run goroutine depends on this having
+// happened: those goroutines write to it under s.mu for the whole run, and
+// the final read is not taken under that lock.
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+// openOverlapLog creates the shared log the task payloads append to.
+func (s *Sim) openOverlapLog() error {
+	dir := s.cfg.WorkerDir
+	if dir == "" {
+		var err error
+		if dir, err = os.MkdirTemp("", "sim-overlap-"); err != nil {
+			return fmt.Errorf("overlap log dir: %w", err)
+		}
+		s.overlapLogTemp = dir
+	}
+	s.overlapLog = filepath.Join(dir, "executions.log")
+	f, err := os.Create(s.overlapLog)
+	if err != nil {
+		return fmt.Errorf("overlap log: %w", err)
+	}
+	return f.Close()
+}
+
+func (s *Sim) stopBackground() {
+	s.linOnce.Do(func() {
+		if s.stopLin != nil {
+			s.stopLin()
+		}
+	})
+}
+
 func (s *Sim) collect() Result {
+	// STOP THE BACKGROUND WORK FIRST, unconditionally.
+	//
+	// This used to happen only inside checkLinearizable, which returns early
+	// when LinClients is zero — so a run with the recorded clients switched
+	// off read s.result here while the coverage sampler was still writing to
+	// it. The race detector found it the moment a test configured
+	// LinClients=0, and it had been latent since the sampler was added: the
+	// linearizability path was stopping the sampler as a side effect.
+	s.stopBackground()
+
 	s.result.Faults.Net = s.net.Stats()
 	if n := s.anyNode(); n != nil {
 		n.coord.ReadState(func(st *state.StateStore) {
@@ -877,6 +1176,10 @@ func (s *Sim) collect() Result {
 		})
 	}
 	s.result.Lin = s.checkLinearizable()
+	// The ledger LAST: it reads committed state and the worker result trees,
+	// both of which need the clients stopped and the cluster settled.
+	s.result.Violations = append(s.result.Violations, s.checkLedger()...)
+	s.result.Ledger = s.ledger
 	return s.result
 }
 
@@ -896,11 +1199,7 @@ func (s *Sim) checkLinearizable() LinResult {
 	if s.cfg.LinClients <= 0 {
 		return LinResult{}
 	}
-	s.linOnce.Do(func() {
-		if s.stopLin != nil {
-			s.stopLin()
-		}
-	})
+	s.stopBackground()
 
 	res := s.history.check(s.cfg.LinCheckTimeout, s.cfg.LinVizDir)
 
@@ -957,8 +1256,19 @@ func (s *Sim) checkLinearizable() LinResult {
 }
 
 func (s *Sim) shutdown() {
+	// Workers first: they hold RPCs against coordinators that are about to
+	// stop answering.
+	if s.rw != nil {
+		s.rw.stop()
+	}
 	for _, id := range s.liveIDs() {
 		s.stop(id)
+	}
+	if s.api != nil {
+		s.api.close()
+	}
+	if s.overlapLogTemp != "" {
+		_ = os.RemoveAll(s.overlapLogTemp)
 	}
 	s.net.Close()
 }

@@ -220,6 +220,15 @@ func runOne(ctx context.Context, seed int64, steps, nodes int, dropRate, corrupt
 		c.ReportedOK, c.ReportedRetryable, c.ReportedTerminal)
 	fmt.Printf("    exercised: redispatched=%d backed-off=%d reached-FAILED=%d sessions-expired=%d\n",
 		c.TasksRedispatched, c.TasksBackedOff, c.TasksTerminalFail, c.SessionsExpired)
+	// The stale-report line carries its own INCONCLUSIVE verdict: a zero
+	// there means the late-report path never ran, so this run says nothing
+	// about effectively-once effects, however green it looks.
+	stale := "INCONCLUSIVE for effectively-once: no late report arrived"
+	if c.StaleReportsRejected > 0 {
+		stale = "the late-report path ran"
+	}
+	fmt.Printf("    reports:  stale-rejected=%d duplicate-ignored=%d  (%s)\n",
+		c.StaleReportsRejected, c.DuplicateReportsIgnored, stale)
 	fmt.Printf("    state:    jobs=%d tasks=%d\n", res.Jobs, res.Tasks)
 	reportLin(res)
 	return res, nil

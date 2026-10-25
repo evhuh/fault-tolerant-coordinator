@@ -466,7 +466,7 @@ func TestClientPoolFollowsRedirectFromFollower(t *testing.T) {
 	// know who that is first, which lags the election by a beat.
 	c.awaitKnowsLeader(fol, 10*time.Second)
 
-	pool := client.NewPool(c.apiAddrs[fol.id])
+	pool := client.NewPool([]string{c.apiAddrs[fol.id]})
 	defer pool.Close()
 
 	var jobID string
@@ -515,7 +515,7 @@ func TestClientPoolRecoversFromLeaderFailure(t *testing.T) {
 	for _, a := range c.apiAddrs {
 		seeds = append(seeds, a)
 	}
-	pool := client.NewPool(seeds...)
+	pool := client.NewPool(seeds)
 	defer pool.Close()
 
 	submit := func(reqID string) (string, error) {
@@ -585,7 +585,7 @@ func TestRedirectedRetryStillDedups(t *testing.T) {
 	// redirect — which means it must already know where to redirect to.
 	c.awaitKnowsLeader(fol, 10*time.Second)
 
-	pool := client.NewPool(c.apiAddrs[fol.id])
+	pool := client.NewPool([]string{c.apiAddrs[fol.id]})
 	defer pool.Close()
 
 	ids := map[string]bool{}

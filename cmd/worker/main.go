@@ -38,7 +38,7 @@ func main() {
 	// A pool, not a connection: the coordinator answers NOT_LEADER with the
 	// leader's address, and the worker has to actually follow it or a
 	// failover strands it against a deposed node.
-	pool := client.NewPool(strings.Split(*coordAddr, ",")...)
+	pool := client.NewPool(strings.Split(*coordAddr, ","))
 	defer pool.Close()
 
 	cfg := worker.DefaultConfig(*id, dir)

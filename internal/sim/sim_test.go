@@ -53,8 +53,15 @@ func ownViolations(res Result, ignore func(ViolationKind) bool) []Violation {
 // notLinearizability is the usual filter: this test is about something else.
 // Environment kinds are dropped alongside, since "the host's disk stalled"
 // and "the run left the fault model" are nobody's property.
+//
+// LEDGER kinds too, since real workers landed. TestEffectLedger owns them,
+// and without this the transport tests went red on
+// "no overlapping executions" — a finding about a property they do not make a
+// claim about, reported against a test that cannot act on it. That is the
+// exact failure mode the each-test-asserts-only-its-own-property rule exists
+// to prevent, arriving from a new direction.
 func notLinearizability(k ViolationKind) bool {
-	return k.IsLinearizability() || k.IsEnvironment()
+	return k.IsLinearizability() || k.IsEnvironment() || k.IsLedger()
 }
 
 // onlyLinearizabilityCoverage reports whether the sole complaint was that the
@@ -77,7 +84,7 @@ func notMine(err error) bool {
 	if !errors.As(err, &v) {
 		return false
 	}
-	return v.Kind.IsLinearizability() || v.Kind.IsEnvironment()
+	return v.Kind.IsLinearizability() || v.Kind.IsEnvironment() || v.Kind.IsLedger()
 }
 
 // inconclusiveOnly reports whether every violation recorded was an

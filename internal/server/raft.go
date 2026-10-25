@@ -126,6 +126,18 @@ func (p *raftProposer) fulfill(id string, out proposalOutcome) {
 // failAll releases every pending waiter. Called on leadership loss: those
 // proposals may or may not commit under the new leader, and a caller blocked
 // forever is worse than one told to retry.
+//
+// WHAT IT PASSES MATTERS AS MUCH AS THAT IT RUNS. These entries were already
+// PROPOSED — some of them replicated — so whether they commit is unknown, and
+// the error has to say so. It used to pass ErrNotLeader, which the gRPC layer
+// maps to NOT_LEADER, whose documented meaning is "re-aim at the real leader"
+// — a definitive "this did not happen". A client that believes that and then
+// reads the committed entry has been lied to.
+//
+// ErrProposalLost is the error that means "abandoned, may still commit, safe
+// to retry because every command is idempotent", which is exactly this
+// situation and exactly what rule 6 requires an ambiguous outcome to be
+// recorded as.
 func (p *raftProposer) failAll(err error) {
 	p.mu.Lock()
 	pending := p.waiters
@@ -240,6 +252,14 @@ func (c *Coordinator) applyCommitted(index uint64, data []byte) {
 		return
 	}
 
+	// Observed before the leader-only reactions and regardless of whether
+	// this node leads: the hook's subject is what the STATE MACHINE decided,
+	// which every replica decides identically. Only applies that SUCCEEDED
+	// are observed; a rejected entry has no Result to report.
+	if c.cfg.OnApply != nil {
+		c.cfg.OnApply(cmd, res)
+	}
+
 	// LEADER-ONLY reactions. Followers compute the identical Result and
 	// discard it — that is why the state machine returns EvalTriggers rather
 	// than acting on them.
@@ -283,8 +303,16 @@ func (c *Coordinator) proposeRaft(cmd *commandpb.Command) (state.Result, error) 
 			return state.Result{}, ErrProposalLost
 		}
 		if errors.Is(err, raft.ErrStopped) {
-			// The node is shutting down; it will never lead again.
-			return state.Result{}, ErrNotLeader
+			// The node is shutting down. ErrProposalLost rather than
+			// ErrNotLeader for the same reason as failAll: Propose has
+			// already been called, and a proposal the run loop picked up
+			// immediately before stopping may have been appended and
+			// replicated. Unlikely is not the same as impossible, and the
+			// only honest answer about an entry that may commit is that it
+			// may commit. Both errors move the client off this node anyway —
+			// Unavailable makes the pool rotate — so the ambiguity costs no
+			// liveness.
+			return state.Result{}, ErrProposalLost
 		}
 		return state.Result{}, fmt.Errorf("propose: %w", err)
 	}
@@ -364,7 +392,7 @@ func (c *Coordinator) onLeadershipChanged(isLeader bool) {
 	// seconds on every leadership change — long enough to trigger the next
 	// election and do it all again.
 	if c.proposer != nil {
-		c.proposer.failAll(ErrNotLeader)
+		c.proposer.failAll(ErrProposalLost)
 	}
 	if c.leaderCancel != nil {
 		c.leaderCancel()

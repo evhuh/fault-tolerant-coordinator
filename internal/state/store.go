@@ -230,6 +230,24 @@ type Result struct {
 	// command. Deterministically computed on every replica; only the leader
 	// acts on them.
 	EvalTriggers []EvalTrigger
+	// StaleReport is true when a CompleteTask or FailTask named an attempt
+	// that is no longer the live one, so it was ignored.
+	//
+	// This is the no-op that makes at-least-once delivery into
+	// effectively-once effects, and until now it was INVISIBLE: the branch
+	// returns an empty Result and no error, which is correct behaviour and
+	// also indistinguishable from a report that changed something. A verifier
+	// cannot report "the late-report path was exercised" without it, and a
+	// claim about a path that never ran is worth nothing.
+	//
+	// Computed identically on every replica, like everything else here; only
+	// an observer meters it.
+	StaleReport bool
+	// DuplicateReport is true when the attempt WAS the live one but the task
+	// had already reached a terminal state — a redelivery of the report that
+	// won, rather than a loser arriving late. A different case, and lumping
+	// the two together would overstate how often the stale path ran.
+	DuplicateReport bool
 }
 
 type WorkerState uint8
@@ -512,6 +530,11 @@ func specFromProto(p *schedulerpb.TaskSpec) TaskSpec {
 	Renewal also extends the leases of that worker's live tasks. Otherwise Tick
 	would reclaim work out from under a perfectly healthy worker.
 
+	For a RUNNING task that extension is CONDITIONAL on the worker still
+	naming it in running_task_ids: the heartbeat is the acknowledgement, so a
+	worker that has stopped claiming a task has stopped executing it, and
+	renewing anyway strands the task forever. See the scan below.
+
 	It is ALSO the worker's acknowledgement. running_task_ids names the tasks
 	the worker reports itself actively executing, and that is what promotes
 	ASSIGNED -> RUNNING. There is deliberately no eighth command and no ack
@@ -522,8 +545,8 @@ func specFromProto(p *schedulerpb.TaskSpec) TaskSpec {
 
 	(1) Validate
 	(2) Create or revive the worker, set its lease
-	(3) Extend leases on its ASSIGNED/RUNNING tasks, and promote the ones it
-	    claims to be running (sorted scan)
+	(3) Extend leases on its ASSIGNED tasks, and on the RUNNING ones it still
+	    claims; promote the ASSIGNED ones it claims to RUNNING (sorted scan)
 */
 func (s *StateStore) applyRegisterWorker(c *commandpb.RegisterWorker) (Result, error) {
 	if c == nil {
@@ -569,9 +592,40 @@ func (s *StateStore) applyRegisterWorker(c *commandpb.RegisterWorker) (Result, e
 		if t.State != TaskAssigned && t.State != TaskRunning {
 			continue
 		}
-		t.LeaseExpiryMs = c.GetLeaseExpiryMs()
-		if t.State == TaskAssigned && claimed[t.ID] {
-			t.State = TaskRunning
+		// RENEWAL FOLLOWS THE CLAIM for a RUNNING task, and this is the
+		// difference between a lease that means something and one that means
+		// "the worker process is up".
+		//
+		// A heartbeat IS the worker's acknowledgement — that is why
+		// running_task_ids promotes ASSIGNED to RUNNING and why there is no
+		// separate ack RPC. So a worker that is heartbeating and NOT naming
+		// a task it holds is telling us it is not executing it, and renewing
+		// that task's lease anyway strands it: Tick never reclaims it,
+		// RequestTask only ever re-offers ASSIGNED tasks so it is never
+		// handed back, and it sits RUNNING forever. The effect ledger found
+		// exactly that — one task at attempt 3 of 5, RUNNING, on an ALIVE
+		// worker, over a healed and idle cluster — and
+		// TestRunningTaskIsReclaimedWhenItsWorkerStopsClaimingIt is the
+		// deterministic form of it. A worker restart is enough to reach it.
+		//
+		// ASSIGNED is renewed unconditionally, because there the worker has
+		// not started yet: the dispatch is fresh, the worker may not have
+		// polled for it, and expiring it would reclaim work out from under a
+		// perfectly healthy worker on its first heartbeat.
+		//
+		// Not renewing is not the same as expiring. The lease still has its
+		// full remaining TTL, which is four heartbeats wide, so a single
+		// heartbeat that races the worker's own claim bookkeeping costs
+		// nothing and the next one restores it.
+		if t.State == TaskAssigned {
+			t.LeaseExpiryMs = c.GetLeaseExpiryMs()
+			if claimed[t.ID] {
+				t.State = TaskRunning
+			}
+			continue
+		}
+		if claimed[t.ID] {
+			t.LeaseExpiryMs = c.GetLeaseExpiryMs()
 		}
 	}
 	return Result{WorkerID: w.ID, WorkerAdmitted: admitted}, nil
@@ -818,6 +872,19 @@ func staleReport(t *Task, attempt int32) bool {
 	return attempt != t.Attempt
 }
 
+// reportDisposition splits the two reasons a report is ignored.
+//
+// Stale takes precedence: a report naming a dead attempt is a loser arriving
+// late whether or not the task has since finished, and that is the case the
+// effectively-once claim rests on. Only a report naming the LIVE attempt of
+// an already-terminal task is a duplicate delivery.
+func reportDisposition(t *Task, attempt int32) (stale, duplicate bool) {
+	if staleReport(t, attempt) {
+		return true, false
+	}
+	return false, terminal(t.State)
+}
+
 // terminal reports whether a task can no longer change state
 func terminal(st TaskState) bool { return st == TaskComplete || st == TaskFailed }
 
@@ -867,8 +934,8 @@ func (s *StateStore) applyCompleteTask(c *commandpb.CompleteTask) (Result, error
 	if !ok {
 		return Result{}, fmt.Errorf("complete task: unknown task %q", c.GetTaskId())
 	}
-	if staleReport(t, c.GetAttempt()) || terminal(t.State) {
-		return Result{}, nil
+	if stale, dup := reportDisposition(t, c.GetAttempt()); stale || dup {
+		return Result{StaleReport: stale, DuplicateReport: dup}, nil
 	}
 
 	t.State = TaskComplete
@@ -904,8 +971,8 @@ func (s *StateStore) applyFailTask(c *commandpb.FailTask) (Result, error) {
 	if !ok {
 		return Result{}, fmt.Errorf("fail task: unknown task %q", c.GetTaskId())
 	}
-	if staleReport(t, c.GetAttempt()) || terminal(t.State) {
-		return Result{}, nil
+	if stale, dup := reportDisposition(t, c.GetAttempt()); stale || dup {
+		return Result{StaleReport: stale, DuplicateReport: dup}, nil
 	}
 
 	res := Result{JobID: t.JobID}
