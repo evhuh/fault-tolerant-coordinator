@@ -2,6 +2,7 @@ package state
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -29,7 +30,7 @@ func submitJobCmd(jobID, clientID, requestID string, taskIDs ...string) *command
 		})
 	}
 	return &commandpb.Command{
-		Version: CommandVersionPartialPlan,
+		Version: CommandVersionClaimedRenewal,
 		Kind: &commandpb.Command_SubmitJob{
 			SubmitJob: &commandpb.SubmitJob{
 				ClientId:  clientID,
@@ -45,7 +46,7 @@ func submitJobCmd(jobID, clientID, requestID string, taskIDs ...string) *command
 
 func registerWorkerCmd(workerID string, registeredMs, leaseExpiryMs int64) *commandpb.Command {
 	return &commandpb.Command{
-		Version: CommandVersionPartialPlan,
+		Version: CommandVersionClaimedRenewal,
 		Kind: &commandpb.Command_RegisterWorker{
 			RegisterWorker: &commandpb.RegisterWorker{
 				WorkerId:      workerID,
@@ -66,7 +67,7 @@ func heartbeatCmd(workerID string, leaseExpiryMs int64, runningTaskIDs ...string
 
 func tickCmd(nowMs int64) *commandpb.Command {
 	return &commandpb.Command{
-		Version: CommandVersionPartialPlan,
+		Version: CommandVersionClaimedRenewal,
 		Kind:    &commandpb.Command_Tick{Tick: &commandpb.Tick{NowMs: nowMs}},
 	}
 }
@@ -93,7 +94,7 @@ func applyPlanCmd(evalID string, assigns []assign, stops ...string) *commandpb.C
 		ss = append(ss, &commandpb.Stop{TaskId: id, Reason: "stopped by plan"})
 	}
 	return &commandpb.Command{
-		Version: CommandVersionPartialPlan,
+		Version: CommandVersionClaimedRenewal,
 		Kind: &commandpb.Command_ApplyPlan{
 			ApplyPlan: &commandpb.ApplyPlan{EvalId: evalID, Assignments: as, Stops: ss},
 		},
@@ -102,7 +103,7 @@ func applyPlanCmd(evalID string, assigns []assign, stops ...string) *commandpb.C
 
 func completeTaskCmd(taskID, workerID string, attempt int32, resultRef string) *commandpb.Command {
 	return &commandpb.Command{
-		Version: CommandVersionPartialPlan,
+		Version: CommandVersionClaimedRenewal,
 		Kind: &commandpb.Command_CompleteTask{
 			CompleteTask: &commandpb.CompleteTask{
 				TaskId: taskID, WorkerId: workerID, Attempt: attempt,
@@ -114,7 +115,7 @@ func completeTaskCmd(taskID, workerID string, attempt int32, resultRef string) *
 
 func failTaskCmd(taskID, workerID string, attempt int32, retryable bool) *commandpb.Command {
 	return &commandpb.Command{
-		Version: CommandVersionPartialPlan,
+		Version: CommandVersionClaimedRenewal,
 		Kind: &commandpb.Command_FailTask{
 			FailTask: &commandpb.FailTask{
 				TaskId: taskID, WorkerId: workerID, Attempt: attempt,
@@ -126,7 +127,7 @@ func failTaskCmd(taskID, workerID string, attempt int32, retryable bool) *comman
 
 func createEvalCmd(evalID, jobID string, trigger commandpb.EvalTrigger) *commandpb.Command {
 	return &commandpb.Command{
-		Version: CommandVersionPartialPlan,
+		Version: CommandVersionClaimedRenewal,
 		Kind: &commandpb.Command_CreateEval{
 			CreateEval: &commandpb.CreateEval{
 				EvalId: evalID, JobId: jobID, Priority: 50,
@@ -134,6 +135,16 @@ func createEvalCmd(evalID, jobID string, trigger commandpb.EvalTrigger) *command
 			},
 		},
 	}
+}
+
+// heartbeatCmdV2 stamps the renewal semantics that preceded
+// CommandVersionClaimedRenewal: a heartbeat renewed EVERY task the worker
+// held, claimed or not. The way an entry written by the previous build would
+// have been.
+func heartbeatCmdV2(workerID string, leaseExpiryMs int64, runningTaskIDs ...string) *commandpb.Command {
+	cmd := heartbeatCmd(workerID, leaseExpiryMs, runningTaskIDs...)
+	cmd.Version = CommandVersionPartialPlan
+	return cmd
 }
 
 // applyPlanCmdV1 stamps the ORIGINAL all-or-nothing semantics, the way an
@@ -360,7 +371,7 @@ func TestSubmitJobRejectsDuplicateJobID(t *testing.T) {
 func TestSubmitJobDefaultsMaxAttempts(t *testing.T) {
 	s := New()
 	cmd := &commandpb.Command{
-		Version: CommandVersionPartialPlan,
+		Version: CommandVersionClaimedRenewal,
 		Kind: &commandpb.Command_SubmitJob{
 			SubmitJob: &commandpb.SubmitJob{
 				ClientId:  "client-a",
@@ -1743,4 +1754,182 @@ func TestDifferentPoliciesDivergeOnTheSameLog(t *testing.T) {
 		t.Errorf("long-TTL replica kept %d sessions, want 1", long.SessionCount())
 	}
 	// Exactly the divergence the one-policy-per-cluster contract prevents.
+}
+
+// A log written before CommandVersionClaimedRenewal must replay under the
+// rule it was written with.
+//
+// The renewal change took NO proto field — running_task_ids has been there
+// since Day 3 — so nothing about the wire format moved. What moved is what an
+// entry MEANS, which is the harder kind of schema change and the one Day 7's
+// version field exists for: a node replaying its own log has to reach the
+// state the cluster actually had, and under the old rule that state includes
+// a task left RUNNING on a worker that stopped claiming it.
+//
+// Reaching "the state the cluster actually had" cannot be tested by running
+// the old binary, so it is tested three ways: the old-stamped log produces the
+// old outcome, the same log stamped current produces the new one, and the
+// old-stamped log replays deterministically into byte-identical state.
+func TestPreClaimedRenewalLogReplaysUnderItsOwnRule(t *testing.T) {
+	// One log, applied under whichever version its entries carry. A worker
+	// takes a task, claims it, then keeps heartbeating WITHOUT claiming it —
+	// the worker-restart case — and time passes.
+	replay := func(hb func(string, int64, ...string) *commandpb.Command) *StateStore {
+		s := New()
+		mustApply(t, s, tickCmd(1000))
+		mustApply(t, s, submitJobCmd("job-1", "client-a", "req-1", "task-1"))
+		mustApply(t, s, registerWorkerCmd("w-1", 1000, 3000))
+		mustApply(t, s, createEvalCmd("eval-1", "job-1", commandpb.EvalTrigger_EVAL_TRIGGER_JOB_SUBMITTED))
+		mustApply(t, s, applyPlanCmd("eval-1", []assign{{taskID: "task-1", workerID: "w-1", attempt: 1, leaseMs: 3000}}))
+		// The claim promotes ASSIGNED -> RUNNING.
+		mustApply(t, s, hb("w-1", 3000, "task-1"))
+		// Then the worker stops naming it, while staying alive, across two
+		// lease widths.
+		for _, now := range []int64{2000, 3500, 5000, 6500} {
+			mustApply(t, s, hb("w-1", now+2000))
+			mustApply(t, s, tickCmd(now))
+		}
+		return s
+	}
+
+	// OLD RULE: renewal followed liveness, so the task is still RUNNING with
+	// a lease that keeps moving out. This is the stranded state, and
+	// reproducing it is the point — a replay that "fixed" it would be a
+	// replay that invented history.
+	before := replay(heartbeatCmdV2)
+	old, _ := before.Task("task-1")
+	if old.State != TaskRunning {
+		t.Errorf("replaying a pre-fix log: task is %s, want RUNNING — the old rule's state was not reproduced", old.State)
+	}
+	if old.LeaseExpiryMs <= before.NowMs() {
+		t.Errorf("replaying a pre-fix log: lease %d is not ahead of now %d; under the old rule every heartbeat renewed it",
+			old.LeaseExpiryMs, before.NowMs())
+	}
+
+	// CURRENT RULE, same log: the claim is gone, so the lease is not renewed
+	// and Tick reclaims the task.
+	after := replay(heartbeatCmd)
+	now, _ := after.Task("task-1")
+	if now.State == TaskRunning {
+		t.Errorf("under the current rule the task is still RUNNING; a worker that stopped claiming it has stopped executing it")
+	}
+
+	// And the old replay is DETERMINISTIC, not merely old: two stores fed the
+	// same pre-fix log must agree byte for byte, which is the property every
+	// replica depends on.
+	if a, b := dump(before), dump(replay(heartbeatCmdV2)); a != b {
+		t.Errorf("two replays of one pre-fix log diverged\n--- first ---\n%s\n--- second ---\n%s", a, b)
+	}
+}
+
+// An entry from a NEWER build is refused, not guessed at.
+//
+// This is the piece the renewal change had to ship without, and shipping it
+// now is what makes the next semantic change rollable out in any order: the
+// build before this one has no case for a version above the one it knows, so
+// it applies its own rule and diverges silently. A build that refuses cannot.
+//
+// The refusal is checked here, before any mutation, so every path into the
+// state machine gets it — the apply loop, a replay, a test — and so a
+// half-applied entry is impossible.
+func TestApplyRefusesACommandFromANewerBuild(t *testing.T) {
+	s := New()
+	mustApply(t, s, tickCmd(1000))
+	mustApply(t, s, submitJobCmd("job-1", "client-a", "req-1", "task-1"))
+	before := dump(s)
+
+	cmd := submitJobCmd("job-2", "client-a", "req-2", "task-2")
+	cmd.Version = CommandVersionCurrent + 1
+
+	res, err := s.Apply(cmd)
+	if !errors.Is(err, ErrCommandVersionTooNew) {
+		t.Fatalf("Apply(version %d) error = %v, want ErrCommandVersionTooNew — a build that guesses at an "+
+			"entry it does not understand diverges from every replica that does", cmd.Version, err)
+	}
+	// NOT malformed: the entry is well formed and committed, and this build
+	// is the thing that is out of date. The distinction matters because
+	// callers treat ErrMalformedCommand as "rejected identically everywhere,
+	// forever" — the Tick proposer panics on it.
+	if errors.Is(err, ErrMalformedCommand) {
+		t.Errorf("refusal reported as malformed: %v", err)
+	}
+	if res.JobID != "" || len(res.EvalTriggers) != 0 {
+		t.Errorf("Result = %+v, want nothing: a refused entry must report no consequences", res)
+	}
+	if after := dump(s); after != before {
+		t.Errorf("the refused entry changed state\n--- before ---\n%s\n--- after ---\n%s", before, after)
+	}
+
+	// And the store still works: a refusal is not a poisoning.
+	mustApply(t, s, submitJobCmd("job-3", "client-a", "req-3", "task-3"))
+	if _, ok := s.Job("job-3"); !ok {
+		t.Error("the store stopped accepting valid commands after refusing one")
+	}
+}
+
+// Tick reports the tasks it takes terminal on their attempt budget.
+//
+// This is the one terminal path with NO report behind it: the lease lapses,
+// the budget is already spent, and the task goes FAILED without any attempt
+// ever having reported a result. Day 10's effect ledger asserted "exactly one
+// committed effect per task" and went red on precisely this, twice, over a
+// task that failed the way the attempt budget says it should — so the state
+// machine has to say when it did it, or a checker cannot tell a MISSING
+// effect from a correctly ABSENT one.
+//
+// Deterministic on purpose. The sweeps that exercise the ledger measured zero
+// of these across 24 runs, which is exactly why this cannot be left to them:
+// a branch only a rare schedule reaches is a branch the sweeps do not guard.
+func TestTickReportsTasksItFailsOnTheAttemptBudget(t *testing.T) {
+	s := New()
+	mustApply(t, s, tickCmd(1000))
+	mustApply(t, s, submitJobCmd("job-1", "client-a", "req-1", "task-1"))
+	mustApply(t, s, registerWorkerCmd("w-1", 1000, 3000))
+
+	// Spend the budget: submitJobCmd's spec allows 3 attempts, so dispatch
+	// the third and let its lease lapse.
+	mustApply(t, s, createEvalCmd("eval-1", "job-1", commandpb.EvalTrigger_EVAL_TRIGGER_JOB_SUBMITTED))
+	for attempt := int32(1); attempt <= 3; attempt++ {
+		mustApply(t, s, applyPlanCmd("eval-1", []assign{
+			{taskID: "task-1", workerID: "w-1", attempt: attempt, leaseMs: 3000},
+		}))
+		if attempt < 3 {
+			// A retryable report sends it back to PENDING without touching
+			// the attempt counter, which ApplyPlan then increments.
+			mustApply(t, s, failTaskCmd("task-1", "w-1", attempt, true))
+			mustApply(t, s, tickCmd(1000+int64(attempt)*500))
+		}
+	}
+
+	task, _ := s.Task("task-1")
+	if task.Attempt != 3 {
+		t.Fatalf("attempt = %d, want 3 — the budget was not spent, so this tests nothing", task.Attempt)
+	}
+
+	// Now the worker goes away on the last attempt. No report ever arrives.
+	res := mustApply(t, s, tickCmd(10_000))
+
+	if task, _ := s.Task("task-1"); task.State != TaskFailed {
+		t.Fatalf("state = %s, want FAILED: the lease lapsed with the budget spent", task.State)
+	}
+	if len(res.FailedByBudget) != 1 || res.FailedByBudget[0] != "task-1" {
+		t.Errorf("Result.FailedByBudget = %v, want [task-1]: a terminal transition with no report behind it "+
+			"has to be reported, or a ledger checker fires on correct behaviour", res.FailedByBudget)
+	}
+
+	// And an ordinary reclaim — budget left — is NOT reported this way.
+	mustApply(t, s, submitJobCmd("job-2", "client-b", "req-2", "task-2"))
+	mustApply(t, s, registerWorkerCmd("w-2", 10_000, 20_000))
+	mustApply(t, s, createEvalCmd("eval-2", "job-2", commandpb.EvalTrigger_EVAL_TRIGGER_JOB_SUBMITTED))
+	mustApply(t, s, applyPlanCmd("eval-2", []assign{
+		{taskID: "task-2", workerID: "w-2", attempt: 1, leaseMs: 20_000},
+	}))
+	res = mustApply(t, s, tickCmd(30_000))
+	if len(res.FailedByBudget) != 0 {
+		t.Errorf("Result.FailedByBudget = %v over a task with attempts left; that is a reclaim, not a terminal failure",
+			res.FailedByBudget)
+	}
+	if task, _ := s.Task("task-2"); task.State != TaskPending {
+		t.Errorf("task-2 state = %s, want PENDING", task.State)
+	}
 }

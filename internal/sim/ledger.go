@@ -86,16 +86,33 @@ type Ledger struct {
 	// DuplicateIgnored is redeliveries of the LIVE attempt of a task that had
 	// already finished.
 	DuplicateIgnored int
+	// FailedByBudget is the tasks a Tick took terminal FAILED with the
+	// attempt budget spent and no report behind them — the one terminal path
+	// that legitimately has NO committed effect.
+	FailedByBudget map[string]bool
 	// StaleByTask is which attempts' reports were rejected as stale, per
 	// task — the other half of "exactly one committed effect": the losers
 	// have to be refused by NAME, not merely absent.
 	StaleByTask map[string][]int32
+	// NoEffectByBudget counts the terminal tasks whose zero effects are the
+	// attempt budget working, MEASURED rather than asserted on. A sweep where
+	// this dominates is a sweep about lease expiry, not about effects.
+	NoEffectByBudget int
 	// Executions is how many attempts actually ran, from the payload's own
 	// log, and Overlaps how many pairs of them ran at the same time.
 	Executions int
 	Overlaps   int
 	// MaxConcurrent is the most simultaneous executions of a single task.
 	MaxConcurrent int
+	// Quiesced is whether the quiescence phase RAN at all.
+	//
+	// It has to be separate from Drained, because a run that ends early —
+	// an invariant violation, a cancelled context — never reaches
+	// quiescence, and reporting that as DID-NOT-DRAIN is a lie in a
+	// confusing direction. One sweep produced exactly that: "DID-NOT-DRAIN,
+	// 0 tasks still non-terminal after 0s of a 0s budget", which is three
+	// zeros saying "this did not happen" and one word saying it did.
+	Quiesced bool
 	// Drained is whether every submitted task reached a terminal state within
 	// the quiescence bound, and Undrained how many had not.
 	Drained   bool
@@ -116,6 +133,9 @@ type Ledger struct {
 // the entry and computes the identical Result, so three nodes would otherwise
 // turn one effect into three — and "exactly one committed effect per taskID"
 // would fail on a healthy cluster.
+//
+// Under obs.mu, not s.mu: this runs on the Ready loop's goroutine. See
+// observations.
 func (s *Sim) recordAccepted(cmd *commandpb.Command, res state.Result) {
 	var e effect
 	switch {
@@ -140,20 +160,49 @@ func (s *Sim) recordAccepted(cmd *commandpb.Command, res state.Result) {
 		return
 	}
 	key := fmt.Sprintf("%s/%d", e.TaskID, e.Attempt)
+	e.Step = int(s.stepNo.Load())
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.seenAccepted[key] {
+	s.obs.mu.Lock()
+	defer s.obs.mu.Unlock()
+	if s.obs.seenAccepted[key] {
 		return
 	}
-	s.seenAccepted[key] = true
-	e.Step = int(s.stepNo.Load())
-	if s.ledger.Accepted == nil {
-		s.ledger.Accepted = map[string][]effect{}
-	}
-	s.ledger.Accepted[e.TaskID] = append(s.ledger.Accepted[e.TaskID], e)
+	s.obs.seenAccepted[key] = true
+	s.obs.accepted[e.TaskID] = append(s.obs.accepted[e.TaskID], e)
 	if e.Terminal {
-		s.ledger.CommittedEffects++
+		s.obs.committedEffects++
+	}
+}
+
+// foldObservations copies what the apply site recorded into the Result.
+//
+// Called on the Run goroutine once the recorded clients are stopped, and it
+// DEEP-COPIES the maps: the apply loops are still running at collect time —
+// the nodes stop in shutdown, after this — so handing the checker a reference
+// to a map an apply goroutine still writes would be a race, and the race
+// detector would be right to say so.
+func (s *Sim) foldObservations() {
+	s.obs.mu.Lock()
+	defer s.obs.mu.Unlock()
+
+	s.result.Coverage.ReportedOK += s.obs.reportedOK
+	s.result.Coverage.ReportedRetryable += s.obs.reportedRetryable
+	s.result.Coverage.ReportedTerminal += s.obs.reportedTerminal
+	s.result.Coverage.StaleReportsRejected = s.obs.staleRejected
+	s.result.Coverage.DuplicateReportsIgnored = s.obs.duplicateIgnored
+
+	s.ledger.CommittedEffects = s.obs.committedEffects
+	s.ledger.Accepted = make(map[string][]effect, len(s.obs.accepted))
+	for id, es := range s.obs.accepted {
+		s.ledger.Accepted[id] = append([]effect(nil), es...)
+	}
+	s.ledger.StaleByTask = make(map[string][]int32, len(s.obs.staleByTask))
+	for id, as := range s.obs.staleByTask {
+		s.ledger.StaleByTask[id] = append([]int32(nil), as...)
+	}
+	s.ledger.FailedByBudget = make(map[string]bool, len(s.obs.failedByBudget))
+	for id := range s.obs.failedByBudget {
+		s.ledger.FailedByBudget[id] = true
 	}
 }
 
@@ -176,6 +225,7 @@ const maxAttempts = 5
 // disappeared" would turn a slow host into a correctness claim.
 func (s *Sim) quiesce(override time.Duration) {
 	started := time.Now()
+	s.ledger.Quiesced = true
 
 	// Everything healed and everyone back, so nothing is still being
 	// prevented from finishing.
@@ -348,6 +398,11 @@ func (s *Sim) checkLedger() []Violation {
 		}
 	}
 
+	// Everything below that says "after the cluster drained" needs the phase
+	// to have run, and s.ledger.Drained already carries that — it stays
+	// false when quiescence was skipped, so a run that ended early makes no
+	// terminal-state claims.
+
 	// ASSERTION 1 and 2, which are one walk: one committed effect per task,
 	// and it is the attempt the coordinator recorded.
 	for _, taskID := range sortedKeys(s.ledger.Accepted) {
@@ -364,7 +419,33 @@ func (s *Sim) checkLedger() []Violation {
 			continue
 		}
 		if len(terminals) == 0 {
-			continue // still in flight, or retrying; liveness is asserted elsewhere
+			// EXACTLY one, not at most one — but only for a task that
+			// finished by REPORTING.
+			//
+			// There is one terminal path with no effect behind it and it is
+			// correct: a task whose lease lapsed with its attempt budget
+			// already spent is taken FAILED by Tick, and no attempt ever
+			// reported anything that was accepted. Zero effects there is the
+			// design, not a loss.
+			//
+			// This assertion fired on exactly that twice before the state
+			// machine started reporting it — "committed as FAILED (attempt 5)
+			// with no accepted report behind it" over a task that failed the
+			// way the attempt budget says it should. A checker that cannot
+			// tell a missing effect from an absent one is a checker that goes
+			// red on correct behaviour, which is the warning the roadmap
+			// carries for this item.
+			switch {
+			case !s.ledger.Drained:
+				// Still in flight, and DID-NOT-DRAIN already says so.
+			case s.ledger.FailedByBudget[taskID]:
+				s.ledger.NoEffectByBudget++
+			default:
+				add(KindEffectLedger, false,
+					"task %s has NO committed effect after the cluster drained, and no Tick took it terminal on its attempt budget: %s",
+					taskID, describeAccepted(s.ledger.Accepted[taskID]))
+			}
+			continue
 		}
 
 		e := terminals[0]
@@ -405,9 +486,41 @@ func (s *Sim) checkLedger() []Violation {
 		}
 	}
 
+	// The other direction of "exactly one": every task that COMMITTED a
+	// terminal state must have a committed effect in the ledger. The walk
+	// above covers tasks the ledger saw reports for; this covers a task the
+	// ledger never saw at all, which is the same defect arriving as silence.
+	if s.ledger.Drained {
+		for _, taskID := range sortedStrings(final) {
+			c := final[taskID]
+			if c.state != state.TaskComplete && c.state != state.TaskFailed {
+				continue
+			}
+			if len(s.ledger.Accepted[taskID]) > 0 {
+				continue
+			}
+			// The budget path again, from the other side: a task can reach
+			// FAILED without any report at all.
+			if s.ledger.FailedByBudget[taskID] {
+				s.ledger.NoEffectByBudget++
+				continue
+			}
+			add(KindEffectLedger, false,
+				"task %s is committed as %s (attempt %d) with no accepted report and no budget exhaustion behind it: the state machine took it terminal without an effect",
+				taskID, c.state, c.attempt)
+		}
+	}
+
 	// ASSERTION 3: every submitted task reaches a terminal state — but only
 	// over a cluster that drained. DID-NOT-DRAIN is its own outcome.
 	switch {
+	case !s.ledger.Quiesced:
+		// The run ended before the heal-and-drain phase, so liveness was
+		// never put to the question. Distinct from DID-NOT-DRAIN, which
+		// means the phase ran and the budget expired.
+		add(KindLedgerCoverage, true,
+			"the run ended before quiescence, so no liveness claim was tested: %s",
+			describeViolations(s.result.Violations))
 	case !s.ledger.Drained && s.ledger.Undrained < 0:
 		add(KindDidNotDrain, true, "quiescence could not read committed state: no node was up")
 	case !s.ledger.Drained:
@@ -500,6 +613,50 @@ func attemptsOf(es []effect) string {
 		out = append(out, fmt.Sprintf("%d(worker %s)", e.Attempt, e.WorkerID))
 	}
 	return strings.Join(out, ", ")
+}
+
+// describeAccepted renders what the ledger DID see for a task, so a missing
+// effect is reported with its context rather than as a bare absence.
+func describeAccepted(es []effect) string {
+	if len(es) == 0 {
+		return "no reports were accepted for it at all"
+	}
+	parts := make([]string, 0, len(es))
+	for _, e := range es {
+		parts = append(parts, fmt.Sprintf("attempt %d accepted (non-terminal)", e.Attempt))
+	}
+	return strings.Join(parts, ", ")
+}
+
+// sortedStrings is the key order for the committed-state map. Sorted, never a
+// map range: a report whose order depends on Go's map iteration is a report
+// two runs of one seed cannot be diffed.
+// describeViolations names what ended the run, so "ended before quiescence"
+// carries its cause rather than sending the reader to another log.
+func describeViolations(vs []Violation) string {
+	if len(vs) == 0 {
+		return "no violation was recorded, so it was cancelled or timed out"
+	}
+	parts := make([]string, 0, len(vs))
+	for _, v := range vs {
+		if v.Kind.IsLedger() {
+			continue // the ledger's own complaints are not what ended it
+		}
+		parts = append(parts, string(v.Kind))
+	}
+	if len(parts) == 0 {
+		return "no non-ledger violation was recorded, so it was cancelled or timed out"
+	}
+	return "ended on " + strings.Join(parts, ", ")
+}
+
+func sortedStrings[V any](m map[string]V) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func sortedKeys(m map[string][]effect) []string {

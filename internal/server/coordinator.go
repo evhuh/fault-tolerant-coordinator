@@ -95,7 +95,7 @@ func DefaultConfig() Config {
 	return Config{
 		LeaseTTL:       2000 * time.Millisecond, // 4 missed heartbeats at H=500ms
 		TickPeriod:     200 * time.Millisecond,
-		CommandVersion: state.CommandVersionPartialPlan,
+		CommandVersion: state.CommandVersionClaimedRenewal,
 		Sched:          sched.DefaultConfig(),
 		ReadMode:       ReadIndexBarrier,
 		ReadTimeout:    2 * time.Second,

@@ -45,6 +45,14 @@ func ownViolations(res Result, ignore func(ViolationKind) bool) []Violation {
 		if ignore(v.Kind) {
 			continue
 		}
+		// A stall DOWNGRADED to inconclusive is the host's doing, not the
+		// system's: the same run waited on its disk past its own election
+		// timeout, so the duration this stall is measured against was never
+		// valid. See downgradeStallsOnBrokenPremise. A stall that is still a
+		// VIOLATION is kept, because that is the case worth catching.
+		if v.Inconclusive && v.Kind.IsStall() {
+			continue
+		}
 		out = append(out, v)
 	}
 	return out
@@ -83,6 +91,9 @@ func notMine(err error) bool {
 	var v Violation
 	if !errors.As(err, &v) {
 		return false
+	}
+	if v.Inconclusive && v.Kind.IsStall() {
+		return true // the host broke the premise; see ownViolations
 	}
 	return v.Kind.IsLinearizability() || v.Kind.IsEnvironment() || v.Kind.IsLedger()
 }
@@ -159,8 +170,9 @@ func TestShortRunCompletes(t *testing.T) {
 // same adversary back in front of is investigable; one you cannot is an
 // anecdote.
 func TestSameSeedReproducesTheFaultSchedule(t *testing.T) {
+	const steps = 14
 	run := func(seed int64) (string, FaultCounts) {
-		cfg := quickConfig(seed, 14)
+		cfg := quickConfig(seed, steps)
 		var log bytes.Buffer
 		cfg.Out = &log
 		res, err := New(cfg, dirsFor(t, cfg.Nodes)).Run(context.Background())
@@ -170,6 +182,24 @@ func TestSameSeedReproducesTheFaultSchedule(t *testing.T) {
 		// over an entirely unrelated finding.
 		if err != nil && !notMine(err) {
 			t.Fatalf("seed %d: %v", seed, err)
+		}
+		// A RUN THAT ENDED EARLY LOGS A PREFIX, and comparing a prefix
+		// against a complete log is not a reproducibility failure — it is a
+		// different question entirely, reported as the wrong answer.
+		//
+		// This test did exactly that under load: the first run of seed 1234
+		// stopped at step 5 on an INCONCLUSIVE host-io stall (the host's
+		// fsync blew past the run's compressed timings), the second reached
+		// step 9, and the output read "seed 1234 produced different fault
+		// schedules" — which would send the next reader hunting for
+		// nondeterminism in the fault RNG that is not there.
+		//
+		// notMine already keeps the environment kinds from failing the test;
+		// what was missing is that a notMine violation can still TRUNCATE
+		// the run, and the comparison has to know that.
+		if res.Steps < steps {
+			t.Skipf("seed %d ended at step %d of %d, so its schedule log is a prefix and the "+
+				"checkpoint cannot be evaluated: %v", seed, res.Steps, steps, err)
 		}
 		return log.String(), res.Faults
 	}
@@ -467,4 +497,55 @@ func TestRunExercisesTheFailurePaths(t *testing.T) {
 		}
 	}
 	t.Logf("TOTAL across 4 seeds: %+v", agg)
+}
+
+// A blocking-call stall is not attributable in a run whose disk already
+// broke the premise.
+//
+// Both judgements measure TIME against a compressed election timeout. A
+// host-io stall says that timescale was not valid in this run, so a
+// "stalled 2m43s in send" from the same run cannot be charged to the system
+// — it is the pileup behind the disk. Day 10 measured exactly that pair: a
+// schedule checkpoint failing on a 2m43s send-phase stall during a sweep
+// whose other runs were recording 13-minute fsyncs.
+//
+// A deterministic unit test over the classifier rather than an attempt to
+// reproduce a 13-minute fsync, which is not a thing a test can ask for.
+func TestStallIsNotAttributableWhenTheHostBrokeThePremise(t *testing.T) {
+	stall := Violation{Seed: 1, Step: 12, Kind: KindReadyLoopStall,
+		What: "node 1 Ready loop stalled 2m43s in send (blocking call)"}
+	hostIO := Violation{Seed: 1, Step: 3, Kind: KindHostIO, Inconclusive: true,
+		What: "node 3 Ready loop waited 13m21s in persist (host I/O)"}
+
+	// On its own it stays a violation: this is the case worth catching, and
+	// the Day 8 leadership-revocation deadlock presented exactly this way.
+	only := downgradeStallsOnBrokenPremise([]Violation{stall})
+	if len(only) != 1 || only[0].Inconclusive {
+		t.Errorf("a stall in a healthy-disk run must stay a VIOLATION, got %+v", only)
+	}
+
+	// Alongside a host-io stall it is not attributable.
+	both := downgradeStallsOnBrokenPremise([]Violation{stall, hostIO})
+	if len(both) != 2 {
+		t.Fatalf("downgrade changed the violation count: %+v", both)
+	}
+	if !both[0].Inconclusive {
+		t.Errorf("the stall is still reported as a defect over a run whose disk broke its own timings: %+v", both[0])
+	}
+	if !strings.Contains(both[0].What, "not attributable") {
+		t.Errorf("the downgrade must say WHY, or the next reader re-investigates it: %q", both[0].What)
+	}
+	// The host-io finding itself is untouched — it is the evidence, not the
+	// thing being excused.
+	if both[1].Kind != KindHostIO || !both[1].Inconclusive {
+		t.Errorf("host-io violation altered: %+v", both[1])
+	}
+
+	// Other kinds are never touched. An invariant failure is not a timing
+	// judgement and a slow disk is no excuse for it.
+	inv := Violation{Seed: 1, Step: 4, Kind: KindInvariant, What: "task x is RUNNING with no worker"}
+	kept := downgradeStallsOnBrokenPremise([]Violation{inv, hostIO})
+	if kept[0].Inconclusive {
+		t.Errorf("a state invariant was downgraded by a slow disk: %+v", kept[0])
+	}
 }

@@ -1,10 +1,12 @@
 package sim
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -220,6 +222,60 @@ func (s *Sim) workerLogf(format string, args ...any) {
 	fmt.Fprintf(s.cfg.WorkerOut, format+"\n", args...)
 }
 
+// THE APPLY SITE IS NOT A PLACE TO TAKE A SHARED LOCK.
+//
+// These observers run on the Ready loop's own goroutine (observeApply, via
+// Config.OnApply) and on gRPC handler goroutines (observeReport). The first
+// version of them took s.mu — the run-level mutex the coverage sampler holds
+// every 5ms while reading committed state through the coordinator's lock.
+//
+// Without the race detector that contention is microseconds and invisible.
+// Under -race it stretched to SECONDS, and the Ready-loop stall invariant
+// caught it exactly as designed: "node 3 Ready loop stalled 18.33s in apply
+// (blocking call) — a blocking call on the loop's own goroutine". Three
+// different tests went red on it across eight race runs, and the invariant was
+// right every time: instrumentation had put a blocking call on the apply path.
+//
+// So the observers own their state behind their own mutex, held only across a
+// map insert or a counter bump, never while logging and never while holding
+// anything else. The Run goroutine folds it into the Result at collect time.
+type observations struct {
+	mu sync.Mutex
+
+	// Counted where the report ARRIVES, since a real worker decides its own
+	// outcome and the simulator no longer knows what any execution returned.
+	reportedOK        int
+	reportedRetryable int
+	reportedTerminal  int
+
+	// The state machine's silent no-ops, deduped by (taskID, attempt)
+	// because every replica applies the entry and computes the identical
+	// Result — three nodes would otherwise report one late report as three.
+	seenStale        map[string]bool
+	seenDuplicate    map[string]bool
+	staleRejected    int
+	duplicateIgnored int
+	staleByTask      map[string][]int32
+
+	// The ledger proper: accepted reports per task, and the tasks a Tick
+	// took terminal on their attempt budget with no report behind them.
+	seenAccepted     map[string]bool
+	accepted         map[string][]effect
+	committedEffects int
+	failedByBudget   map[string]bool
+}
+
+func newObservations() *observations {
+	return &observations{
+		seenStale:      map[string]bool{},
+		seenDuplicate:  map[string]bool{},
+		staleByTask:    map[string][]int32{},
+		seenAccepted:   map[string]bool{},
+		accepted:       map[string][]effect{},
+		failedByBudget: map[string]bool{},
+	}
+}
+
 // observeReport keeps the failure-path coverage counters honest once the
 // simulator has stopped deciding outcomes.
 //
@@ -228,34 +284,51 @@ func (s *Sim) workerLogf(format string, args ...any) {
 // ARRIVES — and only when the coordinator accepted it, because a report that
 // failed mid-partition exercised nothing on the state machine.
 func (s *Sim) observeReport(req *schedulerpb.ReportResultRequest, err error) {
-	// Logged whether or not it was accepted. A rejected report is the
-	// interesting one — it is where a late attempt's effect is supposed to be
-	// discarded — and the ledger checker will assert on exactly this
-	// sequence, so being able to read it off a verbose run is worth the line.
+	// Logged OUTSIDE the lock, and logged whether or not it was accepted. A
+	// rejected report is the interesting one — it is where a late attempt's
+	// effect is supposed to be discarded.
 	s.workerLogf("REPORT %s attempt=%d exit=%d retryable=%v err=%q rpc=%v",
 		req.GetTaskId(), req.GetAttempt(), req.GetExitCode(), req.GetRetryable(), req.GetError(), err)
 	if err != nil {
 		return
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.obs.mu.Lock()
+	defer s.obs.mu.Unlock()
 	switch {
 	case req.GetExitCode() == 0:
-		s.result.Coverage.ReportedOK++
+		s.obs.reportedOK++
 	case req.GetRetryable():
-		s.result.Coverage.ReportedRetryable++
+		s.obs.reportedRetryable++
 	default:
-		s.result.Coverage.ReportedTerminal++
+		s.obs.reportedTerminal++
 	}
 }
 
-// observeApply counts the state machine's SILENT no-ops.
+// observeApply records what the state machine decided, from the apply site.
 //
-// Dedup by (taskID, attempt) because every replica applies the entry and
-// computes the identical Result — three nodes would otherwise report one late
-// report as three. The dedup is also why this is keyed on the report's own
-// identity rather than counted per call.
+// It runs on the Ready loop's goroutine, so everything here is a map insert
+// or a counter bump under obs.mu and nothing else. Logging happens after the
+// lock is released.
 func (s *Sim) observeApply(cmd *commandpb.Command, res state.Result) {
+	var budgetFailed []string
+
+	// A terminal transition with no report behind it: the attempt budget ran
+	// out while the lease was lapsing. Recorded so the ledger can tell it
+	// from a MISSING effect, which looks identical in committed state.
+	if len(res.FailedByBudget) > 0 {
+		s.obs.mu.Lock()
+		for _, id := range res.FailedByBudget {
+			if !s.obs.failedByBudget[id] {
+				s.obs.failedByBudget[id] = true
+				budgetFailed = append(budgetFailed, id)
+			}
+		}
+		s.obs.mu.Unlock()
+	}
+	for _, id := range budgetFailed {
+		s.workerLogf("  FAILED BY BUDGET %s (no attempt ever reported)", id)
+	}
+
 	if !res.StaleReport && !res.DuplicateReport {
 		// Accepted. Only the ledger wants these, and only a real-worker run
 		// has a ledger.
@@ -270,28 +343,29 @@ func (s *Sim) observeApply(cmd *commandpb.Command, res state.Result) {
 	}
 	key := fmt.Sprintf("%s/%d", taskID, attempt)
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if res.StaleReport {
-		if s.seenStaleReport[key] {
-			return
+	s.obs.mu.Lock()
+	logStale := false
+	switch {
+	case res.StaleReport:
+		if !s.obs.seenStale[key] {
+			s.obs.seenStale[key] = true
+			s.obs.staleRejected++
+			// Kept per task as well as counted, so the ledger can say WHICH
+			// attempt was refused rather than only how many were.
+			s.obs.staleByTask[taskID] = append(s.obs.staleByTask[taskID], attempt)
+			logStale = true
 		}
-		s.seenStaleReport[key] = true
-		s.result.Coverage.StaleReportsRejected++
-		// Kept per task as well as counted, so the ledger can say WHICH
-		// attempt was refused rather than only how many were.
-		if s.ledger.StaleByTask == nil {
-			s.ledger.StaleByTask = map[string][]int32{}
+	default:
+		if !s.obs.seenDuplicate[key] {
+			s.obs.seenDuplicate[key] = true
+			s.obs.duplicateIgnored++
 		}
-		s.ledger.StaleByTask[taskID] = append(s.ledger.StaleByTask[taskID], attempt)
+	}
+	s.obs.mu.Unlock()
+
+	if logStale {
 		s.workerLogf("  STALE REJECTED %s attempt %d", taskID, attempt)
-		return
 	}
-	if s.seenDuplicateReport[key] {
-		return
-	}
-	s.seenDuplicateReport[key] = true
-	s.result.Coverage.DuplicateReportsIgnored++
 }
 
 // reportedTask pulls the (taskID, attempt) out of whichever report this is.
@@ -359,7 +433,23 @@ func (s *Sim) injectWorkerPause(step int) {
 		return
 	}
 
-	victim, taskID, attempt := s.busyWorker()
+	// REPLAY forces the victim and the step, the same way ReplayWindow does
+	// for the leader pause: the worker pause is reactive, so a seed
+	// reproduces its INTENT and only a recorded realization reproduces its
+	// aim. A replayed pause is the same adversary, not the same execution.
+	if r := s.cfg.ReplayWorkerPause; r != nil && r.Fired {
+		s.rw.pause(r.Worker)
+		s.workerPaused = r.Worker
+		s.workerResumeAt = step + stepsFor(2*s.cfg.LeaseTTL, s.cfg.StepTime) + 1
+		s.result.WorkerPause = WorkerPauseDiag{
+			Fired: true, Step: step, Worker: r.Worker,
+			Task: r.Task, Attempt: r.Attempt,
+		}
+		s.workerLogf("step %d: PAUSE worker %s (replayed)", step, r.Worker)
+		return
+	}
+
+	victim, taskID, attempt := s.executingWorker()
 	if victim == "" {
 		return // nobody is executing; try again next step
 	}
@@ -389,29 +479,103 @@ func (s *Sim) injectWorkerPause(step int) {
 		step, victim, taskID, attempt, s.workerResumeAt)
 }
 
-// busyWorker finds a worker that is executing a task right now, and what it
-// is executing.
-func (s *Sim) busyWorker() (workerID, taskID string, attempt int32) {
+// executingWorker finds a worker whose ATTEMPT IS RUNNING RIGHT NOW, from the
+// payload's own log, and reports who holds it.
+//
+// GROUND TRUTH, not committed state, and the difference is the whole
+// coverage problem. The first version read committed state and paused the
+// worker holding the first ASSIGNED or RUNNING task it found. Committed state
+// LAGS: the attempt it names may have finished seconds ago, so the freeze
+// landed on a worker that was executing nothing, nothing was reclaimed under
+// it, and the run measured zero overlap. Three seeds in a row reported
+// `Reclaimed:false` that way.
+//
+// The log says what is actually running: a START with no matching END is an
+// attempt in flight, written by the process itself. Committed state is still
+// needed for WHO — the log records the task and attempt, not the worker — but
+// only after the attempt is known to be live, and only when the committed
+// attempt agrees with it. A disagreement means the reclaim already happened
+// and this attempt is the stale one, which is not the victim we want.
+func (s *Sim) executingWorker() (workerID, taskID string, attempt int32) {
+	open := s.openExecutions()
+	if len(open) == 0 {
+		return "", "", 0
+	}
 	n := s.leader()
 	if n == nil {
 		return "", "", 0
 	}
 	n.coord.ReadState(func(st *state.StateStore) {
-		// Sorted ids, never a map range: a choice made over Go's map
-		// iteration order is a choice the seed does not determine.
-		for _, id := range st.TaskIDs() {
-			t, _ := st.Task(id)
-			if t.WorkerID == "" {
+		for _, e := range open {
+			t, ok := st.Task(e.taskID)
+			if !ok || t.WorkerID == "" || t.Attempt != e.attempt {
 				continue
 			}
 			if t.State != state.TaskRunning && t.State != state.TaskAssigned {
 				continue
 			}
-			workerID, taskID, attempt = t.WorkerID, id, t.Attempt
+			workerID, taskID, attempt = t.WorkerID, e.taskID, e.attempt
 			return
 		}
 	})
 	return workerID, taskID, attempt
+}
+
+// liveExecution is one attempt the payload log shows as started and not
+// finished.
+type liveExecution struct {
+	taskID  string
+	attempt int32
+}
+
+// openExecutions replays the payload log and returns the attempts still in
+// flight, oldest first — so the pause aims at the one with the most sleep
+// already spent, which is the one most likely to still be running when the
+// lease lapses.
+func (s *Sim) openExecutions() []liveExecution {
+	if s.overlapLog == "" {
+		return nil
+	}
+	f, err := os.Open(s.overlapLog)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+
+	// Insertion order preserved deliberately: the log IS the order, and a
+	// map range here would make the victim depend on Go's iteration order
+	// rather than on the run.
+	var order []liveExecution
+	live := map[liveExecution]bool{}
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		fields := strings.Fields(sc.Text())
+		if len(fields) != 3 {
+			continue
+		}
+		var attempt int32
+		if _, err := fmt.Sscanf(fields[2], "%d", &attempt); err != nil {
+			continue
+		}
+		e := liveExecution{taskID: fields[1], attempt: attempt}
+		switch fields[0] {
+		case "START":
+			if !live[e] {
+				live[e] = true
+				order = append(order, e)
+			}
+		case "END":
+			delete(live, e)
+		}
+	}
+
+	out := make([]liveExecution, 0, len(live))
+	for _, e := range order {
+		if live[e] {
+			out = append(out, e)
+		}
+	}
+	return out
 }
 
 // attemptOf reads a task's current attempt from committed state.

@@ -69,8 +69,12 @@ func (s *Sim) checkInvariants(step int) []Violation {
 				})
 				continue
 			}
-			add("node %d Ready loop stalled %s — a blocking call on the loop's own goroutine",
-				id, st)
+			vs = append(vs, Violation{
+				Seed: s.cfg.Seed, Step: step, Kind: KindReadyLoopStall,
+				What: fmt.Sprintf(
+					"node %d Ready loop stalled %s — a blocking call on the loop's own goroutine",
+					id, st),
+			})
 		}
 	}
 

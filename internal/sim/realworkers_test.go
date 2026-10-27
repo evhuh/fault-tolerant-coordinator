@@ -105,8 +105,9 @@ func TestRealWorkersExecuteThroughTheRealPool(t *testing.T) {
 // would not be reproducible, and the effect ledger's findings would be
 // anecdotes.
 func TestSameSeedReproducesTheFaultScheduleWithRealWorkers(t *testing.T) {
+	const steps = 10
 	run := func(seed int64) (string, FaultCounts) {
-		cfg := quickConfig(seed, 10)
+		cfg := quickConfig(seed, steps)
 		cfg.RealWorkers = true
 		cfg.LinClients = 0
 		var log bytes.Buffer
@@ -114,6 +115,13 @@ func TestSameSeedReproducesTheFaultScheduleWithRealWorkers(t *testing.T) {
 		res, err := New(cfg, dirsFor(t, cfg.Nodes)).Run(context.Background())
 		if err != nil && !notMine(err) {
 			t.Fatalf("seed %d: %v", seed, err)
+		}
+		// Same prefix hazard as the ordinary checkpoint: a run cut short by
+		// an inconclusive stall logs fewer steps, and comparing that against
+		// a complete log reports nondeterminism that is not there.
+		if res.Steps < steps {
+			t.Skipf("seed %d ended at step %d of %d, so its schedule log is a prefix and the "+
+				"checkpoint cannot be evaluated: %v", seed, res.Steps, steps, err)
 		}
 		return log.String(), res.Faults
 	}

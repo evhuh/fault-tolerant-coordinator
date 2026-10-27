@@ -232,6 +232,27 @@ func (c *Coordinator) applyCommitted(index uint64, data []byte) {
 	if c.FatalErr() != nil {
 		return // already halted; do not apply further entries
 	}
+	// AN ENTRY FROM A NEWER BUILD HALTS THIS NODE, before it is applied and
+	// before the applied index moves.
+	//
+	// Same treatment as an undecodable entry, for the same reason: this
+	// replica cannot know what the entry means, every up-to-date replica
+	// does, and the two alternatives are both silent. Skipping it leaves
+	// this replica missing a mutation the others made; applying it under an
+	// older build's rules produces a different state while reporting
+	// success. Divergence is the one failure this system has no recovery
+	// from, and it is only ever noticed when something reads from the odd
+	// replica.
+	//
+	// Halting alone is also what frees the ROLLOUT ORDER. A build that stops
+	// on a version it does not know can be upgraded in any order, because
+	// the worst case is a node that refuses to continue — loud, local, and
+	// recoverable by upgrading it. See architecture.md.
+	if v := cmd.GetVersion(); v > state.CommandVersionCurrent {
+		c.fatal(fmt.Errorf("committed entry at command version %d, this build understands %d: "+
+			"halting rather than guessing at its meaning", v, state.CommandVersionCurrent))
+		return
+	}
 
 	c.mu.Lock()
 	res, err := c.store.Apply(cmd)

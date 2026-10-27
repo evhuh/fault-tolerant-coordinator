@@ -1,4 +1,4 @@
-.PHONY: proto test race vet build sweeps release-check
+.PHONY: proto test race vet build sweeps repro release-check
 
 # Regenerate both schemas. Run from proto/ so `source:` in the generated headers stays stable; --go_opt=module strips the package prefix so files land in proto/commandpb and proto/schedulerpb rather than a nested tree
 PROTO_MODULE := github.com/evazheng/fault-tolerant-coordinator/proto
@@ -55,9 +55,42 @@ sweeps:
 	FTC_SWEEPS=1 go test -timeout 30m -v ./internal/sim/ \
 		-run 'TestTargetedWorkload|TestPauseDefeats|TestShippedConfigWithoutPause|TestReadIndexFindsNoStale|TestEffectLedger'
 
-# Everything a tag asserts: the default suite, the race detector, and the
-# sweeps whose numbers the claim rests on.
-release-check: vet test race sweeps
+# The reproducibility checkpoints, REPEATED, with a skip budget.
+#
+# Repetition is the point. These are timing-sensitive, and a single green pass
+# is not evidence about them: one clean `go test -race` pass was reported as
+# "race clean" during Day 10, and eight runs then put the real failure rate
+# near 2 in 8. One pass is a sample.
+#
+# The skip budget is the other half. A checkpoint skips when it could not be
+# evaluated — a run cut short by a host fsync logs only a prefix of its
+# schedule — and `go test` exits 0 for a skip exactly as it does for a pass.
+# Without counting them, a checkpoint can quietly stop checking anything and
+# still look green twenty-five times in a row.
+#
+# The budgets are TRIPWIRES, not calibrated floors, and the two measurements
+# behind them say why. On a QUIET disk (fsync mean 3.1ms, worst 9ms) the skip
+# rate is 0 of 25 for both schedule checkpoints and 0 of 10 for both replay
+# tests. On a disk being hammered by back-to-back race suites and sweeps —
+# fsyncs of 1 to 13 MINUTES in persist — the same checkpoint measured 20 of 25
+# skipped, because a run that stops early on a host-io stall logs only a
+# prefix of its schedule and cannot be compared.
+#
+# So the skip rate is a property of the HOST, not of the code, and the budget
+# is there to say "this machine cannot evaluate this right now" rather than to
+# be raised until it passes. If it trips, measure the disk (scripts have no
+# probe; a 40-iteration write+fsync loop is enough) before touching the
+# number.
+repro:
+	scripts/loop-test.sh ./internal/sim/ 'TestSameSeedReproducesTheFaultSchedule$$' 25 10
+	scripts/loop-test.sh ./internal/sim/ 'TestSameSeedReproducesTheFaultScheduleWithRealWorkers' 25 10
+	scripts/loop-test.sh ./internal/sim/ 'TestReplayWindowReproducesTheRealizedWindow' 10 20
+	FTC_SWEEPS=1 scripts/loop-test.sh ./internal/sim/ 'TestReplayWorkerPauseReproducesTheRealizedPause' 10 20
+
+# Everything a tag asserts: the default suite, the race detector, the
+# reproducibility checkpoints under repetition, and the sweeps whose numbers
+# the claim rests on.
+release-check: vet test race repro sweeps
 
 vet:
 	go vet ./...

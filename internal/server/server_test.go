@@ -19,6 +19,7 @@ import (
 	"github.com/evazheng/fault-tolerant-coordinator/internal/sched"
 	"github.com/evazheng/fault-tolerant-coordinator/internal/state"
 	schedulerpb "github.com/evazheng/fault-tolerant-coordinator/proto/schedulerpb"
+	"google.golang.org/protobuf/proto"
 )
 
 // testClock replaces the coordinator's only wall-clock read, so tests advance
@@ -1214,5 +1215,60 @@ func TestRunningTaskIsReclaimedWhenItsWorkerStopsClaimingIt(t *testing.T) {
 	}
 	if again.GetAttempt() <= task.GetAttempt() {
 		t.Errorf("attempt = %d, want > %d — a reclaim is a new attempt", again.GetAttempt(), task.GetAttempt())
+	}
+}
+
+// A committed entry from a NEWER build halts this node instead of being
+// applied or skipped.
+//
+// The refusal is the thing that frees the rollout order for every future
+// semantic change. Both alternatives to halting are silent: skipping leaves
+// this replica missing a mutation every up-to-date replica made, and applying
+// it under an older build's rules produces different state while reporting
+// success. Divergence is the one failure with no recovery here, and it
+// surfaces only when something happens to read from the odd replica.
+//
+// Driven through applyCommitted directly, which is where a committed entry
+// actually arrives — there is no way to make this build PROPOSE a version it
+// does not know, and that is the point.
+func TestCommittedEntryFromANewerBuildHaltsTheNode(t *testing.T) {
+	s, _ := newTestService(t)
+	submit(t, s, "req-1", 1)
+
+	var before int
+	s.c.read(func(st *state.StateStore) { before = st.JobCount() })
+
+	cmd := &commandpb.Command{
+		Version: state.CommandVersionCurrent + 1,
+		Kind: &commandpb.Command_SubmitJob{
+			SubmitJob: &commandpb.SubmitJob{
+				JobId: "job-from-the-future", ClientId: "client-a", RequestId: "req-2",
+			},
+		},
+	}
+	data, err := proto.Marshal(cmd)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	s.c.applyCommitted(99, data)
+
+	if s.c.FatalErr() == nil {
+		t.Fatal("the node applied or skipped an entry written by a newer build; both are silent divergence")
+	}
+	if !strings.Contains(s.c.FatalErr().Error(), "command version") {
+		t.Errorf("halted for the wrong reason: %v", s.c.FatalErr())
+	}
+
+	// Neither applied nor half-applied.
+	var after int
+	s.c.read(func(st *state.StateStore) { after = st.JobCount() })
+	if after != before {
+		t.Errorf("job count went %d -> %d; the refused entry was applied anyway", before, after)
+	}
+	// And the applied index did not move past it, so a restarted node meets
+	// the same entry rather than silently skipping it.
+	if idx := s.c.AppliedIndex(); idx == 99 {
+		t.Errorf("applied index advanced to %d over an entry this build refused", idx)
 	}
 }

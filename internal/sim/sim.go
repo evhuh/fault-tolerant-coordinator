@@ -218,6 +218,13 @@ type Config struct {
 	// remove. It is what Day 10's effect ledger needs, because a ledger
 	// written by a simulated worker is evidence about the simulator.
 	RealWorkers bool
+	// ReplayWorkerPause forces the worker pause onto a recorded victim at a
+	// recorded step, instead of aiming at whoever is executing.
+	//
+	// Same reason ReplayWindow exists: the injection is reactive, so the seed
+	// reproduces the adversary's intent and the realization has to be fed
+	// back for the aim to be the same.
+	ReplayWorkerPause *WorkerPauseDiag
 	// PauseWorker injects a PROCESS PAUSE of a worker that is currently
 	// executing a task: its clock freezes and its outbound RPCs are held.
 	//
@@ -505,6 +512,16 @@ const (
 	// checker, so counting it toward "N histories, zero violations" inflates
 	// the claim with runs that could not have failed.
 	KindLinearizabilityCoverage ViolationKind = "linearizability-coverage"
+	// KindReadyLoopStall is a Ready loop that blocked on something other
+	// than the disk — a blocking call on the goroutine that serves it.
+	//
+	// Its own kind rather than a plain invariant because it shares a PREMISE
+	// with KindHostIO: both are judgements about time, measured against a
+	// compressed election timeout. When the host breaks that premise, every
+	// timing judgement in the run has to be downgraded with it, and
+	// downgrading by kind is the only way to do that without matching on
+	// message text. See downgradeStallsOnBrokenPremise.
+	KindReadyLoopStall ViolationKind = "ready-loop-stall"
 	// KindEffectLedger is an effect-ledger violation: more than one committed
 	// effect for a task, a committed effect that does not match the attempt
 	// the coordinator recorded, or a task that never reached a terminal state
@@ -535,6 +552,12 @@ const (
 // tests red and every one of them names the wrong cause.
 func (k ViolationKind) IsEnvironment() bool {
 	return k == KindHostIO || k == KindFaultModel
+}
+
+// IsStall reports whether this kind is a Ready-loop timing judgement. Tests
+// that own neither the stall nor the host's disk ignore both.
+func (k ViolationKind) IsStall() bool {
+	return k == KindReadyLoopStall || k == KindHostIO
 }
 
 // IsLedger reports whether this kind comes from the effect ledger. Tests
@@ -683,11 +706,10 @@ type Sim struct {
 	// Coverage bookkeeping, sampled between steps on the Run goroutine.
 	seenBackoff map[string]bool
 	seenRetried map[string]bool
-	// seenStaleReport, seenDuplicateReport and seenAccepted dedup the
-	// apply-site observations across replicas, keyed (taskID, attempt).
-	seenStaleReport     map[string]bool
-	seenDuplicateReport map[string]bool
-	seenAccepted        map[string]bool
+	// obs is everything recorded from the apply site and from the gRPC
+	// handlers, behind its OWN mutex. It is not guarded by s.mu on purpose —
+	// see the observations type.
+	obs *observations
 	// ledger accumulates the effect ledger during the run.
 	ledger Ledger
 	// overlapLog is the shared append-only file the task payloads write, and
@@ -739,9 +761,7 @@ func New(cfg Config, dirs map[uint64]string) *Sim {
 
 		apiAddrs: map[uint64]string{},
 
-		seenStaleReport:     map[string]bool{},
-		seenDuplicateReport: map[string]bool{},
-		seenAccepted:        map[string]bool{},
+		obs: newObservations(),
 
 		seenBackoff:  map[string]bool{},
 		seenRetried:  map[string]bool{},
@@ -794,6 +814,9 @@ func New(cfg Config, dirs map[uint64]string) *Sim {
 	// ordinary run's fault sequence is untouched.
 	if cfg.RealWorkers && cfg.PauseWorker && cfg.Steps > 3 {
 		s.workerPauseStep = 2 + s.rng.Intn(maxInt(1, cfg.Steps/2))
+	}
+	if r := cfg.ReplayWorkerPause; r != nil && r.Fired {
+		s.workerPauseStep = r.Step
 	}
 	for i := 1; i <= cfg.Nodes; i++ {
 		// Addresses are labels only: simnet routes by node id, so nothing
@@ -1094,6 +1117,48 @@ func (s *Sim) Run(ctx context.Context) (Result, error) {
 	return s.finish()
 }
 
+// downgradeStallsOnBrokenPremise turns blocking-call stalls INCONCLUSIVE when
+// the same run also saw the host's disk blow past its compressed timings.
+//
+// The two share one premise. "This loop blocked for 2m43s" is only evidence
+// about the system if 2m43s was ever a meaningful duration in this run, and a
+// host-io stall says it was not: at a 250ms election timeout, an fsync of
+// minutes means every node was seeing spurious elections and every goroutine
+// was queued behind the disk. Day 10 measured exactly that pair — a schedule
+// checkpoint reporting "stalled 2m43.149s in send (blocking call)" in a sweep
+// whose other runs were recording 13-MINUTE fsyncs in persist.
+//
+// Attributing the first to the system while excusing the second is the Day 9
+// mistake in reverse: there the invariant called a slow disk a concurrency
+// bug directly, here it does it one step removed, by blaming the pileup the
+// slow disk caused.
+//
+// Not a blanket exemption. A blocking-call stall in a run whose disk kept up
+// stays a VIOLATION, which is the case worth catching — the leadership
+// revocation deadlock that Day 8 found presented exactly that way.
+func downgradeStallsOnBrokenPremise(vs []Violation) []Violation {
+	brokenPremise := false
+	for _, v := range vs {
+		if v.Kind == KindHostIO {
+			brokenPremise = true
+			break
+		}
+	}
+	if !brokenPremise {
+		return vs
+	}
+	out := make([]Violation, 0, len(vs))
+	for _, v := range vs {
+		if v.Kind == KindReadyLoopStall {
+			v.Inconclusive = true
+			v.What += " — but this run also waited on the disk past its own election timeout, " +
+				"so the premise that makes this duration meaningful was already broken; not attributable"
+		}
+		out = append(out, v)
+	}
+	return out
+}
+
 // finish collects the result and turns whatever was found into Run's error.
 //
 // It exists because collect() can ADD a violation: the linearizability check
@@ -1108,6 +1173,8 @@ func (s *Sim) Run(ctx context.Context) (Result, error) {
 // a violation is the more useful thing to put in front of someone.
 func (s *Sim) finish() (Result, error) {
 	res := s.collect()
+	res.Violations = downgradeStallsOnBrokenPremise(res.Violations)
+	s.result.Violations = res.Violations
 	for _, v := range res.Violations {
 		if !v.Inconclusive {
 			return res, v
@@ -1167,6 +1234,10 @@ func (s *Sim) collect() Result {
 	// LinClients=0, and it had been latent since the sampler was added: the
 	// linearizability path was stopping the sampler as a side effect.
 	s.stopBackground()
+
+	// The apply site's observations become part of the Result here, on this
+	// goroutine, rather than being written into it as they happen.
+	s.foldObservations()
 
 	s.result.Faults.Net = s.net.Stats()
 	if n := s.anyNode(); n != nil {

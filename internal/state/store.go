@@ -38,9 +38,47 @@ const (
 	// commits whole or is rejected whole.
 	CommandVersionAllOrNothingPlan uint32 = 1
 	// CommandVersionPartialPlan skips invalid assignments and applies the
-	// rest. Current.
+	// rest.
 	CommandVersionPartialPlan uint32 = 2
+	// CommandVersionClaimedRenewal makes a RUNNING task's lease renewal
+	// follow the worker's CLAIM instead of merely its liveness. Current.
+	//
+	// The same situation as the ApplyPlan change above, arriving the same
+	// way — from having operated the thing. NO PROTO FIELD CHANGED: the fix
+	// reads running_task_ids, which RegisterWorker has carried since Day 3.
+	// What changed is what an entry MEANS. Under version 2 a heartbeat
+	// renewed every task the worker held; under version 3 it renews a
+	// RUNNING task only if the worker still names it.
+	//
+	// So the old behaviour is keyed on the version in the entry, for the
+	// same reason as ApplyPlan: a node replaying a log written under the old
+	// rule must reach the state the cluster actually had, not the state this
+	// build would have produced. Those differ concretely — a task that was
+	// stranded RUNNING then is reclaimed now.
+	CommandVersionClaimedRenewal uint32 = 3
+	// CommandVersionCurrent is the newest version this build understands.
+	//
+	// Entries ABOVE it are refused, not guessed at — see
+	// ErrCommandVersionTooNew. That refusal is the thing that makes a
+	// semantic change rollable out in any order, and it is the piece the
+	// renewal change above had to go without: the build before this one has
+	// no case for version 3, so it quietly applies its own rule and diverges.
+	// A build that stops instead cannot do that.
+	CommandVersionCurrent = CommandVersionClaimedRenewal
 )
+
+// ErrCommandVersionTooNew marks an entry written by a NEWER build than this
+// one, whose meaning this build therefore does not know.
+//
+// It is not ErrMalformedCommand: the entry is well formed, committed, and
+// correct — this binary is the thing that is out of date. The required
+// response is the same in both cases and for the same reason as an
+// undecodable entry: HALT. Skipping it would leave this replica missing a
+// mutation every up-to-date replica applied, which is silent divergence, and
+// a divergent replica is discovered only when somebody reads from it.
+// Applying it under the rules of whatever version this build does know is
+// worse, because it looks like success.
+var ErrCommandVersionTooNew = errors.New("command version is newer than this build understands")
 
 // ErrMalformedCommand marks a command the state machine cannot accept because
 // of its CONTENT, not because of the state it met.
@@ -243,6 +281,16 @@ type Result struct {
 	// Computed identically on every replica, like everything else here; only
 	// an observer meters it.
 	StaleReport bool
+	// FailedByBudget names the tasks a Tick took terminal FAILED because
+	// their lease lapsed with the attempt budget already spent.
+	//
+	// This is a terminal transition with NO REPORT behind it, and reporting
+	// it is what keeps a ledger checker honest. "Exactly one committed
+	// effect per task" is true of tasks that finished by REPORTING; a task
+	// whose attempts all died without a report has zero, by design, and a
+	// checker that cannot tell the two apart fires on correct behaviour.
+	// Day 10's ledger did exactly that until this field existed.
+	FailedByBudget []string
 	// DuplicateReport is true when the attempt WAS the live one but the task
 	// had already reached a terminal state — a redelivery of the report that
 	// won, rather than a loser arriving late. A different case, and lumping
@@ -411,6 +459,14 @@ func (s *StateStore) Apply(cmd *commandpb.Command) (Result, error) {
 	if cmd == nil {
 		return Result{}, fmt.Errorf("apply: nil command")
 	}
+	// REFUSE BEFORE MUTATING. Checked here rather than only at the caller so
+	// that every path into the state machine — the apply loop, a replay, a
+	// test — gets the refusal, and so the store cannot be left half-changed
+	// by an entry it did not understand.
+	if v := cmd.GetVersion(); v > CommandVersionCurrent {
+		return Result{}, fmt.Errorf("%w: entry at version %d, this build understands %d",
+			ErrCommandVersionTooNew, v, CommandVersionCurrent)
+	}
 	switch k := cmd.GetKind().(type) {
 	case *commandpb.Command_SubmitJob:
 		return s.applySubmitJob(k.SubmitJob)
@@ -423,7 +479,7 @@ func (s *StateStore) Apply(cmd *commandpb.Command) (Result, error) {
 	case *commandpb.Command_FailTask:
 		return s.applyFailTask(k.FailTask)
 	case *commandpb.Command_RegisterWorker:
-		return s.applyRegisterWorker(k.RegisterWorker)
+		return s.applyRegisterWorker(k.RegisterWorker, cmd.GetVersion())
 	case *commandpb.Command_Tick:
 		return s.applyTick(k.Tick)
 	default:
@@ -548,7 +604,7 @@ func specFromProto(p *schedulerpb.TaskSpec) TaskSpec {
 	(3) Extend leases on its ASSIGNED tasks, and on the RUNNING ones it still
 	    claims; promote the ASSIGNED ones it claims to RUNNING (sorted scan)
 */
-func (s *StateStore) applyRegisterWorker(c *commandpb.RegisterWorker) (Result, error) {
+func (s *StateStore) applyRegisterWorker(c *commandpb.RegisterWorker, version uint32) (Result, error) {
 	if c == nil {
 		return Result{}, fmt.Errorf("register worker: nil payload")
 	}
@@ -617,6 +673,16 @@ func (s *StateStore) applyRegisterWorker(c *commandpb.RegisterWorker) (Result, e
 		// full remaining TTL, which is four heartbeats wide, so a single
 		// heartbeat that races the worker's own claim bookkeeping costs
 		// nothing and the next one restores it.
+		// Entries written before the semantics changed replay under the rule
+		// they were written with. Version 0 means an entry predating the
+		// field entirely, which can only be the older meaning.
+		if version < CommandVersionClaimedRenewal {
+			t.LeaseExpiryMs = c.GetLeaseExpiryMs()
+			if t.State == TaskAssigned && claimed[t.ID] {
+				t.State = TaskRunning
+			}
+			continue
+		}
 		if t.State == TaskAssigned {
 			t.LeaseExpiryMs = c.GetLeaseExpiryMs()
 			if claimed[t.ID] {
@@ -742,6 +808,10 @@ func (s *StateStore) applyTick(c *commandpb.Tick) (Result, error) {
 			t.State = TaskFailed
 			t.LastError = fmt.Sprintf("lease expired on attempt %d of %d (%s)",
 				t.Attempt, t.Spec.MaxAttempts, reason)
+			// Reported, because this is the one terminal path no effect
+			// stands behind. Deterministic like everything else here: the
+			// scan is over sorted ids, so every replica builds the same list.
+			res.FailedByBudget = append(res.FailedByBudget, t.ID)
 			s.recomputeJobState(t.JobID)
 			continue
 		}
