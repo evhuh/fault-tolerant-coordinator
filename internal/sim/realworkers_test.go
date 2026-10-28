@@ -5,6 +5,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -150,4 +151,67 @@ func TestSameSeedReproducesTheFaultScheduleWithRealWorkers(t *testing.T) {
 		t.Fatal("no faults were scheduled at all; the test proves nothing")
 	}
 	t.Logf("seed 1234 schedule with real workers:\n%s", scheduleA)
+}
+
+// A run refuses to start when its task commands do not resolve on the host.
+//
+// /bin/true bit twice, through two different spec builders, and both times
+// silently: a task that cannot START is reported as a non-retryable failure,
+// which is an outcome the state machine handles correctly, so the run stayed
+// green while executing nothing. The second time it produced a calibration
+// with more committed effects than executions.
+//
+// This is the guard that makes that loud, checked in both directions —
+// a command that must resolve, and the deliberately-missing one that must
+// not.
+func TestRunRefusesCommandsThatDoNotResolveOnThisHost(t *testing.T) {
+	t.Run("a command that does not resolve", func(t *testing.T) {
+		cfg := quickConfig(1, 4)
+		cfg.RealWorkers = true
+		cfg.LinClients = 0
+		cfg.WorkerDir = t.TempDir()
+
+		s := New(cfg, dirsFor(t, cfg.Nodes))
+		// Exactly the historical bug: a plausible path that is not there.
+		s.cmdOK = "/bin/true-that-is-not-here"
+
+		_, err := s.Run(context.Background())
+		if err == nil {
+			t.Fatal("the run started with a success command that cannot be executed; every task " +
+				"would have failed to start and the run would have passed")
+		}
+		for _, want := range []string{"does not resolve", "executing nothing"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error does not explain the consequence (%q missing): %v", want, err)
+			}
+		}
+	})
+
+	t.Run("the deliberately missing command existing is also refused", func(t *testing.T) {
+		// The terminal-failure branch depends on cmdCannotStart NOT existing.
+		// A host that happened to have it would take that coverage away
+		// without anything turning red, so the check runs the other way too.
+		if _, err := os.Stat(cmdCannotStart); err == nil {
+			t.Skipf("%s exists on this host, which is the condition under test", cmdCannotStart)
+		}
+		cfg := quickConfig(1, 4)
+		cfg.RealWorkers = true
+		s := New(cfg, dirsFor(t, cfg.Nodes))
+		if err := s.validateCommands(); err != nil {
+			t.Fatalf("a healthy host was refused: %v", err)
+		}
+	})
+
+	t.Run("the simulated pool is not refused", func(t *testing.T) {
+		// Without real workers nothing executes the commands, so a bad path
+		// cannot mislead the run and demanding a shell would refuse runs that
+		// are fine.
+		cfg := quickConfig(1, 4)
+		s := New(cfg, dirsFor(t, cfg.Nodes))
+		s.cmdOK = "/nope"
+		s.cmdShell = "/nope"
+		if err := s.validateCommands(); err != nil {
+			t.Errorf("a simulated-pool run was refused over commands nothing runs: %v", err)
+		}
+	})
 }

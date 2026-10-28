@@ -173,6 +173,7 @@ func (c *Coordinator) StartRaft(cfg raftnode.Config) error {
 		Snapshot:          c.snapshotState,
 		Restore:           c.restoreState,
 		Stalled:           c.onStalled,
+		Snapshotted:       c.onSnapshotted,
 	})
 	if err != nil {
 		c.proposer = nil
@@ -305,7 +306,34 @@ func (c *Coordinator) proposeRaft(cmd *commandpb.Command) (state.Result, error) 
 	w := c.proposer.register(cmd.ProposalId)
 	defer c.proposer.forget(cmd.ProposalId)
 
-	ctx, cancel := context.WithTimeout(context.Background(), c.proposalTimeout())
+	// THE PROPOSAL'S CONTEXT HANGS OFF LEADERSHIP, not off Background.
+	//
+	// node.Propose blocks until raft ACCEPTS the entry, and the goroutine
+	// that accepts it is the Ready loop. So a proposal in flight when
+	// leadership is lost is waiting on the very loop that is inside
+	// revokeLeadership waiting for the scheduler worker that is waiting for
+	// this proposal. failAll does not help: it releases registered WAITERS,
+	// and this caller never reached its waiter.
+	//
+	// With Background() the cycle broke only when the proposal timeout fired
+	// — measured as 131ms and 187ms Ready-loop stalls in Day 10's
+	// calibration against a 250ms timeout, and at the 5s production default
+	// it would be a node that processes no raft messages for five seconds on
+	// every leadership change. Deriving from the leader context makes
+	// revocation cancel it immediately; Propose then returns
+	// context.Canceled, which the branch below already classifies as
+	// ErrProposalLost — "abandoned, may still commit, safe to retry" — which
+	// is precisely what such a proposal is.
+	//
+	// TestRevocationReleasesAnInFlightPropose pins it, and fails with the
+	// full timeout against the old context.
+	base := c.leaderContext()
+	if base == nil {
+		// Leadership went away between the check above and here. Nothing has
+		// been proposed yet, so this is definitive rather than ambiguous.
+		return state.Result{}, ErrNotLeader
+	}
+	ctx, cancel := context.WithTimeout(base, c.proposalTimeout())
 	defer cancel()
 	if err := c.proposer.node.Propose(ctx, data); err != nil {
 		// A proposal can fail to LAND for the same reasons it can fail to
@@ -387,10 +415,34 @@ func (c *Coordinator) proposeAsync(cmd *commandpb.Command) {
 // planner kept running would keep proposing plans that a new leader has
 // already superseded.
 func (c *Coordinator) onLeadershipChanged(isLeader bool) {
+	// TIMED, because this runs on the Ready loop and its cost is not
+	// constant. StartScheduling rebuilds the eval broker by SCANNING
+	// COMMITTED STATE — it serializes the whole state machine through
+	// c.Snapshot() — so the loop is blocked for as long as that takes, and
+	// that grows with the number of jobs. Day 10's 600-step calibration
+	// recorded 131ms and 187ms stalls in this phase against a 125ms
+	// threshold, on a healthy disk, which is what sent anyone looking.
+	//
+	// The measurement is kept rather than logged so the question "does it
+	// scale with state" can be answered with a curve instead of an anecdote.
+	start := time.Now()
+	defer func() {
+		took := time.Since(start)
+		var jobs int
+		c.read(func(st *state.StateStore) { jobs = st.JobCount() })
+		c.stallMu.Lock()
+		c.leadershipChanges = append(c.leadershipChanges, LeadershipChange{
+			IsLeader: isLeader, Duration: took, Jobs: jobs,
+		})
+		c.stallMu.Unlock()
+	}()
+
 	if isLeader {
 		log.Printf("coordinator: became leader, establishing leadership")
 		ctx, cancel := context.WithCancel(context.Background())
-		c.leaderCancel = cancel
+		c.leaderMu.Lock()
+		c.leaderCtx, c.leaderCancel = ctx, cancel
+		c.leaderMu.Unlock()
 		c.StartScheduling(ctx)
 		go c.RunTicker(ctx)
 		return
@@ -415,11 +467,30 @@ func (c *Coordinator) onLeadershipChanged(isLeader bool) {
 	if c.proposer != nil {
 		c.proposer.failAll(ErrProposalLost)
 	}
-	if c.leaderCancel != nil {
-		c.leaderCancel()
-		c.leaderCancel = nil
-	}
+	c.cancelLeader()
 	c.StopScheduling()
+}
+
+// leaderContext returns the context that lives exactly as long as this node's
+// leadership, or nil when it does not lead.
+func (c *Coordinator) leaderContext() context.Context {
+	c.leaderMu.Lock()
+	defer c.leaderMu.Unlock()
+	return c.leaderCtx
+}
+
+// cancelLeader cancels the leader-only context, which is the first thing
+// revocation does. Separated out so a test can exercise the revocation
+// mechanism without racing the Ready loop for the handler.
+func (c *Coordinator) cancelLeader() {
+	c.leaderMu.Lock()
+	cancel := c.leaderCancel
+	c.leaderCancel = nil
+	c.leaderCtx = nil
+	c.leaderMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 }
 
 // IsLeader reports whether this node may accept writes. Without Raft wired
@@ -553,6 +624,39 @@ func (c *Coordinator) onStalled(st raftnode.Stall) {
 	c.stallMu.Lock()
 	c.stalls = append(c.stalls, st)
 	c.stallMu.Unlock()
+}
+
+// onSnapshotted records what a snapshot cost this node's Ready loop.
+//
+// Kept, not just logged, because the question a long run has to answer is a
+// TREND: the snapshot grows with state and the loop is blocked for all of
+// it, so what matters is whether the cost is climbing toward the stall
+// threshold, which no single log line can say.
+func (c *Coordinator) onSnapshotted(st raftnode.SnapshotStat) {
+	c.stallMu.Lock()
+	c.snapshots = append(c.snapshots, st)
+	c.stallMu.Unlock()
+}
+
+// LeadershipChange is what one leadership transition cost the Ready loop.
+type LeadershipChange struct {
+	IsLeader bool
+	Duration time.Duration
+	Jobs     int
+}
+
+// LeadershipChanges reports the transitions this node went through, in order.
+func (c *Coordinator) LeadershipChanges() []LeadershipChange {
+	c.stallMu.Lock()
+	defer c.stallMu.Unlock()
+	return append([]LeadershipChange(nil), c.leadershipChanges...)
+}
+
+// Snapshots reports the snapshots this node took, in order.
+func (c *Coordinator) Snapshots() []raftnode.SnapshotStat {
+	c.stallMu.Lock()
+	defer c.stallMu.Unlock()
+	return append([]raftnode.SnapshotStat(nil), c.snapshots...)
 }
 
 // Stalls reports Ready-loop stalls observed on this node.

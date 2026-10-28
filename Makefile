@@ -1,4 +1,4 @@
-.PHONY: proto test race vet build sweeps repro release-check
+.PHONY: proto test race vet build sweeps repro fsync-gate release-check
 
 # Regenerate both schemas. Run from proto/ so `source:` in the generated headers stays stable; --go_opt=module strips the package prefix so files land in proto/commandpb and proto/schedulerpb rather than a nested tree
 PROTO_MODULE := github.com/evazheng/fault-tolerant-coordinator/proto
@@ -87,10 +87,35 @@ repro:
 	scripts/loop-test.sh ./internal/sim/ 'TestReplayWindowReproducesTheRealizedWindow' 10 20
 	FTC_SWEEPS=1 scripts/loop-test.sh ./internal/sim/ 'TestReplayWorkerPauseReproducesTheRealizedPause' 10 20
 
-# Everything a tag asserts: the default suite, the race detector, the
-# reproducibility checkpoints under repetition, and the sweeps whose numbers
-# the claim rests on.
-release-check: vet test race repro sweeps
+# Is this host capable of supporting the claim at all?
+#
+# Every timing judgement in the harness is measured against a clock compressed
+# to a 250ms election timeout, and disk I/O does not compress with it. When
+# fsync latency climbs, runs stop completing: the checkpoints SKIP and the
+# stalls go INCONCLUSIVE, both of which exit 0. A release would then assert
+# over runs that checked nothing.
+#
+# The budgets come from the premise, not from the best measurement. Mean 12ms
+# is under half a 25ms tick, so a loop that fsyncs can still keep up; worst
+# 100ms is under the 125ms stall threshold, so one slow sync cannot end a run.
+# Measured on a quiet machine: mean 3.1-3.8ms, worst 5-13ms, which is
+# comfortable margin. Measured during back-to-back race suites: fsyncs of 1 to
+# 13 MINUTES, which is what this gate exists to refuse.
+fsync-gate:
+	go run ./cmd/fsyncprobe
+
+# Everything a tag asserts: a host that can support the premise, then the
+# default suite, the race detector, the reproducibility checkpoints under
+# repetition, and the sweeps whose numbers the claim rests on.
+#
+# FTC_STRICT_STALLS makes an UNATTRIBUTABLE stall fail rather than be
+# tolerated. Ordinary development tolerates one — a laptop hiccup turning six
+# tests red teaches nothing — but a run that is supporting a claim cannot pass
+# on "the harness could not tell". The gate above runs first, so this should
+# never trip; if it does, the host degraded mid-run and nothing from it is
+# quotable.
+release-check: fsync-gate
+	FTC_STRICT_STALLS=1 $(MAKE) vet test race repro sweeps
 
 vet:
 	go vet ./...

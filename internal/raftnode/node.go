@@ -168,6 +168,18 @@ type Handler struct {
 	// rather than the one it had before. Same coherence requirement as
 	// Apply's index.
 	RestoredAt func(index uint64)
+
+	// Snapshotted fires after a snapshot has been serialized, made durable,
+	// and had its entries compacted away — the whole of the work that
+	// happens INSIDE the Ready loop.
+	//
+	// It reports what that cost, because the cost GROWS WITH STATE and the
+	// loop is blocked for all of it. etcd does this asynchronously; this does
+	// not, and the honest version of that gap is a number rather than a
+	// sentence. A snapshot that approaches StallThreshold means the run's
+	// compressed timings are about to stop holding, and a long run needs to
+	// see that trend coming rather than discover it as a truncated schedule.
+	Snapshotted func(SnapshotStat)
 }
 
 // Stall is one observed Ready-loop stall, with the phase it was in.
@@ -650,6 +662,11 @@ func (n *Node) maybeSnapshot() error {
 		return nil
 	}
 
+	// Timed from the serialize, because that is where the Ready loop stops
+	// being available: everything from here to the compaction below is
+	// synchronous on this goroutine.
+	started := time.Now()
+
 	data, err := n.h.Snapshot()
 	if err != nil {
 		return fmt.Errorf("serialize state machine: %w", err)
@@ -689,7 +706,21 @@ func (n *Node) maybeSnapshot() error {
 	n.snapshotIndex = n.appliedIndex
 	log.Printf("raftnode: node %d snapshotted at index %d (%d bytes), log compacted to %d",
 		n.cfg.ID, n.appliedIndex, len(data), compactIndex)
+	if n.h.Snapshotted != nil {
+		n.h.Snapshotted(SnapshotStat{
+			Index:    n.appliedIndex,
+			Bytes:    len(data),
+			Duration: time.Since(started),
+		})
+	}
 	return nil
+}
+
+// SnapshotStat is one snapshot's cost, as paid on the Ready loop.
+type SnapshotStat struct {
+	Index    uint64
+	Bytes    int
+	Duration time.Duration
 }
 
 // handleReady processes one Ready batch. It returns false when the node must

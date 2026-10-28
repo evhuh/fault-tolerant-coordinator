@@ -520,6 +520,20 @@ So the rollout order is load-bearing and it is the opposite of intuitive: **upgr
 Forward compatibility is not available retroactively; the previous build cannot be taught to refuse a version it does not know.
 That refusal now exists, which is the next section.
 
+### Runs are bounded at 600 steps, and the reason is the snapshot
+
+A simulated run cannot be made arbitrarily long, and the limit is not patience.
+
+`maybeSnapshot` serializes the state machine, fsyncs it, and compacts the WAL **synchronously inside the Ready loop**, so the node processes no raft messages for the whole of it. Measured at 600 steps and ~1,500 jobs: 71–83 snapshots per run, 1.0–1.3MB each, durations flat at 27–32ms with a worst of 60ms — fsync-dominated at that size, not size-dominated, which is why the cost does not visibly climb *within* a run.
+
+It climbs across longer ones. `Encode` is linear at about **6.5ms per MB** (measured: 408µs at 50KB, 1.34ms at 201KB, 5.24ms at 804KB), and a 6,000-step run projects to **10–13MB of state**, so 65–85ms of serialization plus the fsync — against a **125ms** stall threshold. The run would begin tripping host-io stalls near its end and truncate exactly where it got interesting.
+
+So the Day 10 checkpoint buys scale with **breadth rather than depth**: many seeds at the calibrated 600-step width, not one long run. What that leaves untested is stated plainly: **state growth beyond ~1,500 jobs in a single run is unmeasured**, and nothing here establishes how the system behaves with a state machine an order of magnitude larger.
+
+Decompressing the clock to buy headroom was considered and rejected: the timing parameters are coupled, and a 1s election timeout against a 300ms lease TTL breaks the Day 8 ordering that an election must resolve inside a lease. Scaling all of them together would also void the worker-slot capacity arithmetic the workload is calibrated against, and with it the overlap floor.
+
+**The product fix is asynchronous snapshotting**, which is what etcd does and what this does not. Until then the ceiling is real and the bound is honest.
+
 ### The refusal, and what it changes
 
 `StateStore.Apply` rejects any entry stamped above `CommandVersionCurrent`, before mutating anything, and `applyCommitted` **halts the node** when a committed entry carries one — before applying it and before the applied index moves, so a restarted node meets the same entry instead of skipping past it.
@@ -658,6 +672,16 @@ induced faults, the state machine never contradicted itself, replicas never
 diverged at a shared log position, no Ready loop blocked on its own goroutine,
 and no corrupt message reached consensus. It says nothing about read
 linearizability or duplicate effects.
+
+### A proposal's context hangs off leadership
+
+`node.Propose` blocks until raft ACCEPTS the entry, and the goroutine that accepts it is the Ready loop. A proposal still in flight when leadership is lost is therefore waiting on the loop that is inside `revokeLeadership`, waiting for the scheduler worker that is waiting for the proposal. `failAll` does not break it: that releases registered *waiters*, and such a caller never reached its waiter.
+
+With the context derived from `context.Background()` the cycle broke only when the proposal timeout fired. Day 10's calibration measured it as **131ms and 187ms Ready-loop stalls** in the leadership-change phase, on a healthy disk, against the simulator's 250ms timeout — and at the 5s production default the same bug is a node that processes no raft messages for five seconds on every leadership change.
+
+The propose context now derives from the leader context, so revocation cancels it immediately and `Propose` returns `context.Canceled`, which was already classified as `ErrProposalLost` — abandoned, may still commit, safe to retry, which is exactly what such a proposal is.
+
+This is the Day 8 revocation deadlock, found again in the half the original fix did not cover. `TestRevocationReleasesAnInFlightPropose` measured 200ms of a 300ms timeout before the fix and 0s after, and passed 12 of 12 loops. Worth noting how it was found: not by reading the code, but because the stall invariant reported a phase name, and the phase name was `leadership-change`.
 
 ### Two rules for reading a failing run
 

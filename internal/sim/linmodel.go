@@ -86,6 +86,20 @@ func jobsModel() porcupine.Model {
 		Step: func(st, in, out interface{}) (bool, interface{}) {
 			return linStep(st.(linState), in.(linInput), out.(linOutput))
 		},
+		// PARTITIONING IS WHAT MAKES A LONG HISTORY CHECKABLE.
+		//
+		// porcupine's search is exponential in how many operations overlap,
+		// so one 6,000-step history is not a bigger version of a 600-step
+		// one — it is a search that does not finish, and an unfinished search
+		// reports Unknown, which this harness reports as INCONCLUSIVE. The
+		// headline property would come back "we could not tell" precisely as
+		// the run got long enough to be interesting.
+		//
+		// Partitioning is sound only if operations in different parts cannot
+		// constrain each other, so the parts are the CONNECTED COMPONENTS of
+		// the coupling this model expresses, not simply one part per job id.
+		// See linPartitions.
+		Partition:         linPartitions,
 		DescribeOperation: describeLinOp,
 		DescribeState: func(st interface{}) string {
 			s := st.(linState)
@@ -215,4 +229,108 @@ func linLookup(set, key string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// linPartitions splits a history into independently checkable parts.
+//
+// # Why not simply one part per job id
+//
+// Partitioning by job id alone would lose a real check. Two submits sharing a
+// dedup key MUST return the same job — that is the whole of
+// effectively-once at the client boundary — and a system that got it wrong
+// would return two different ids, which job-id keying would file in two
+// different parts where neither could see the other. The violation would
+// vanish exactly when it happened.
+//
+// So the parts are the connected components over BOTH kinds of name this
+// model knows: dedup keys and job ids. Two operations land together when they
+// share either. For a correct system that is almost always one part per job;
+// for an incorrect one it is still one part per *coupling*, which is what
+// soundness needs.
+//
+// An AMBIGUOUS submit carries no job id and is identity in the spec, so it
+// could be dropped — but it is kept, grouped by its key, because a later
+// retry of that key is exactly how such a submit becomes observable, and the
+// two have to be checked together.
+//
+// # What makes this sound
+//
+// Every operation here names the one job it concerns: a get names it in its
+// input, a submit in its output. No operation observes the set of jobs
+// without naming one. Add ListJobs and this is immediately wrong — the same
+// trigger that breaks the ambiguous-submit shortcut above, for the same
+// reason: a list couples every job to every other.
+func linPartitions(ops []porcupine.Operation) [][]porcupine.Operation {
+	uf := newUnionFind()
+	// First pass: every operation declares the names it touches, and names
+	// touched together are joined.
+	names := make([][]string, len(ops))
+	for i, op := range ops {
+		in := op.Input.(linInput)
+		out := op.Output.(linOutput)
+		var ns []string
+		if in.Key != "" {
+			ns = append(ns, "key:"+in.Key)
+		}
+		if in.JobID != "" {
+			ns = append(ns, "job:"+in.JobID)
+		}
+		if out.JobID != "" {
+			ns = append(ns, "job:"+out.JobID)
+		}
+		if len(ns) == 0 {
+			// Nothing named: cannot constrain anything, so it is its own
+			// part. Only reachable if an operation is recorded with neither
+			// a key nor a job, which the clients do not do.
+			ns = append(ns, fmt.Sprintf("orphan:%d", i))
+		}
+		for _, n := range ns[1:] {
+			uf.union(ns[0], n)
+		}
+		names[i] = ns
+	}
+
+	// Second pass: group by component. Insertion order is preserved so the
+	// parts are deterministic — porcupine does not require it, but a verdict
+	// that depends on map iteration order is not one you can diff.
+	index := map[string]int{}
+	var parts [][]porcupine.Operation
+	for i, op := range ops {
+		root := uf.find(names[i][0])
+		at, ok := index[root]
+		if !ok {
+			at = len(parts)
+			index[root] = at
+			parts = append(parts, nil)
+		}
+		parts[at] = append(parts[at], op)
+	}
+	return parts
+}
+
+// unionFind over string names, which is all this needs: a few thousand names
+// and no deletions.
+type unionFind struct{ parent map[string]string }
+
+func newUnionFind() *unionFind { return &unionFind{parent: map[string]string{}} }
+
+func (u *unionFind) find(x string) string {
+	p, ok := u.parent[x]
+	if !ok {
+		u.parent[x] = x
+		return x
+	}
+	if p == x {
+		return x
+	}
+	root := u.find(p)
+	u.parent[x] = root // path compression
+	return root
+}
+
+func (u *unionFind) union(a, b string) {
+	ra, rb := u.find(a), u.find(b)
+	if ra != rb {
+		u.parent[ra] = rb
+	}
 }

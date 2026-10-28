@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	"github.com/evazheng/fault-tolerant-coordinator/internal/client"
 	"github.com/evazheng/fault-tolerant-coordinator/internal/raftnode"
 	"github.com/evazheng/fault-tolerant-coordinator/internal/state"
+	commandpb "github.com/evazheng/fault-tolerant-coordinator/proto/commandpb"
 	schedulerpb "github.com/evazheng/fault-tolerant-coordinator/proto/schedulerpb"
 )
 
@@ -975,5 +977,121 @@ func TestRevocationDoesNotBlock(t *testing.T) {
 		t.Logf("revocation completed in %s", elapsed.Round(time.Millisecond))
 	case <-time.After(10 * time.Second):
 		t.Fatal("revocation never returned — the Ready loop is deadlocked against the scheduler")
+	}
+}
+
+// Leadership revocation must release a proposal that is already in flight.
+//
+// THE DAY 8 DEADLOCK CLASS, INCOMPLETELY FIXED. revokeLeadership fails
+// pending proposals first and only then waits for the scheduler, precisely so
+// the Ready loop never waits on a worker that is waiting on the Ready loop.
+// But failAll releases REGISTERED WAITERS, and a worker blocked inside
+// node.Propose never reached its waiter: Propose blocks until raft accepts the
+// entry, and the goroutine that would accept it is the Ready loop — the one
+// sitting in StopScheduling. Its context came from context.Background(), so
+// cancelling the leader context did not touch it either.
+//
+// The symptom is not a hang. It self-heals when the proposal timeout fires,
+// which is why it showed up as a 131ms and a 187ms Ready-loop stall in Day
+// 10's 600-step calibration — both just under the 250ms timeout in force
+// there — and why it was invisible at the 5s production default, where it
+// would instead look like a node that processes no raft messages for five
+// seconds on every leadership change.
+//
+// The test blocks the Ready loop inside an apply, starts a proposal that
+// therefore cannot be accepted, and then does what revocation does: cancels
+// the leader context. A proposal that is still stuck after that is waiting on
+// its own timeout.
+func TestRevocationReleasesAnInFlightPropose(t *testing.T) {
+	blocked := make(chan struct{})
+	release := make(chan struct{})
+	var armed atomic.Bool
+
+	cfg := DefaultConfig()
+	cfg.Sched.Workers = 1
+	cfg.Sched.LeaseTTLMs = cfg.LeaseTTL.Milliseconds()
+	// Short enough that the unfixed behaviour is a fast failure rather than a
+	// five-second one, and far enough above the assertion below that the two
+	// cannot be confused.
+	cfg.ProposalTimeout = 300 * time.Millisecond
+	cfg.OnApply = func(cmd *commandpb.Command, res state.Result) {
+		// Block exactly one apply, on the Ready loop's own goroutine. That is
+		// what stops raft accepting further proposals.
+		if armed.CompareAndSwap(true, false) {
+			close(blocked)
+			<-release
+		}
+	}
+
+	coord := New(cfg)
+	rcfg := raftnode.DefaultConfig()
+	rcfg.ID = 1
+	rcfg.Peers = map[uint64]string{1: fmt.Sprintf("http://127.0.0.1:%d", freePort(t))}
+	rcfg.DataDir = t.TempDir()
+	rcfg.TickInterval = 20 * time.Millisecond
+	rcfg.ElectionTick = 10
+	rcfg.HeartbeatTick = 1
+	if err := coord.StartRaft(rcfg); err != nil {
+		t.Fatalf("start raft: %v", err)
+	}
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+		coord.StopRaft()
+		coord.StopScheduling()
+	})
+
+	deadline := time.Now().Add(5 * time.Second)
+	for !coord.IsLeader() && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !coord.IsLeader() {
+		t.Fatal("single node never became leader")
+	}
+
+	// One proposal to get an apply, which the hook above then parks on.
+	armed.Store(true)
+	go func() { _, _ = coord.propose(tickCmd(1_700_000_000_000)) }()
+	select {
+	case <-blocked:
+	case <-time.After(3 * time.Second):
+		t.Fatal("no apply arrived to block the Ready loop; the test never set up its condition")
+	}
+
+	// With the loop parked, this one cannot be accepted by raft.
+	done := make(chan error, 1)
+	go func() {
+		_, err := coord.propose(tickCmd(1_700_000_000_001))
+		done <- err
+	}()
+	// Give it time to reach node.Propose and block there. If it has already
+	// returned, the condition under test did not hold.
+	select {
+	case err := <-done:
+		t.Fatalf("the second proposal was accepted while the Ready loop was parked (%v); "+
+			"the test is not exercising an in-flight propose", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// Exactly what revocation does.
+	start := time.Now()
+	coord.cancelLeader()
+	err := <-done
+	took := time.Since(start)
+	t.Logf("in-flight propose returned %v after %s (proposal timeout is %s)",
+		err, took.Round(time.Millisecond), cfg.ProposalTimeout)
+
+	if took > 80*time.Millisecond {
+		t.Errorf("an in-flight propose survived leadership revocation for %s — it is waiting out "+
+			"its own %s timeout, and revokeLeadership waits for the scheduler worker that is "+
+			"waiting for it. The propose context must derive from the leader context.",
+			took.Round(time.Millisecond), cfg.ProposalTimeout)
+	}
+	if !errors.Is(err, ErrProposalLost) {
+		t.Errorf("err = %v, want ErrProposalLost: the entry was abandoned and may still commit, "+
+			"which is exactly what that error means", err)
 	}
 }

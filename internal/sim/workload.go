@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"hash/fnv"
+	"os"
 	"time"
 
 	schedulerpb "github.com/evazheng/fault-tolerant-coordinator/proto/schedulerpb"
@@ -131,8 +132,47 @@ func (s *Sim) drainSomeWork() {
 // Appends are O_APPEND writes of well under PIPE_BUF from separate processes,
 // which do not interleave on a local filesystem.
 func (s *Sim) specFor(step, job, task int) *schedulerpb.TaskSpec {
-	cmd := s.commandFor(step, job, task)
-	spec := &schedulerpb.TaskSpec{Command: cmd, MaxAttempts: 5}
+	id := fmt.Sprintf("step-%d-%d-%d", step, job, task)
+	// SOME TASKS ARE SLOW, and they have to be, or overlap stays at zero: a
+	// task that finishes inside its lease is never reclaimed mid-execution,
+	// so the only attempt that exists is the one that completed. A slow task
+	// outlives its lease, is reclaimed, and keeps running — exactly the
+	// at-least-once case the ledger exists to measure.
+	//
+	// Hashed, like every other workload decision, so the slow set is the same
+	// on a replay and the fault RNG is untouched.
+	slow := s.cfg.RealWorkers && s.hashUnit(id, 0, "slow") < s.cfg.SlowTaskFraction
+	return s.wrapSpec(s.commandFor(step, job, task), slow, 5)
+}
+
+// linSpec is the spec a RECORDED CLIENT's submit carries.
+//
+// IT GOES THROUGH THE SAME BUILDER, and it did not before — which produced a
+// measurement impossible on its face. The recorded clients submitted
+// `{Command: "/bin/true", MaxAttempts: 1}` directly: a path that does not
+// exist on this host, so every one of those tasks failed to START, was
+// reported non-retryable, and became a COMMITTED EFFECT that never executed.
+// They also bypassed the wrapper, so they wrote nothing to the payload log
+// and were invisible to the execution count.
+//
+// With roughly 1,300 such jobs in a 600-step run against about 770 real
+// executions, the calibration reported 10,585 effects over 5,022 executions —
+// more effects than executions, which cannot happen when an effect is an
+// accepted terminal report for an attempt that ran. Not a double count: two
+// different populations compared as though they were one.
+//
+// Never slow, and one attempt. These exist to make job existence observable
+// and a recorded client submits far more often than the workload does;
+// letting a fifth of them sleep six leases would hand the ledger's instrument
+// the job of flooding the worker slots.
+func (s *Sim) linSpec() *schedulerpb.TaskSpec {
+	return s.wrapSpec(s.cmdOK, false, 1)
+}
+
+// wrapSpec turns a command into a spec, wrapped in the payload log when real
+// workers are running.
+func (s *Sim) wrapSpec(cmd string, slow bool, maxAttempts int32) *schedulerpb.TaskSpec {
+	spec := &schedulerpb.TaskSpec{Command: cmd, MaxAttempts: maxAttempts}
 	if !s.cfg.RealWorkers || s.overlapLog == "" {
 		return spec
 	}
@@ -146,17 +186,8 @@ func (s *Sim) specFor(step, job, task int) *schedulerpb.TaskSpec {
 		return spec
 	}
 
-	// SOME TASKS ARE SLOW, and they have to be, or overlap stays at zero: a
-	// task that finishes inside its lease is never reclaimed mid-execution,
-	// so the only attempt that exists is the one that completed. A slow task
-	// outlives its lease, is reclaimed, and keeps running — exactly the
-	// at-least-once case this ledger exists to measure.
-	//
-	// Hashed, like every other workload decision, so the slow set is the same
-	// on a replay and the fault RNG is untouched.
 	sleep := ""
-	id := fmt.Sprintf("step-%d-%d-%d", step, job, task)
-	if s.hashUnit(id, 0, "slow") < s.cfg.SlowTaskFraction {
+	if slow {
 		// SIX LEASES, measured rather than guessed. 2.5 was the first value
 		// and it produced a reclaim with no overlap: the lease takes a full
 		// TTL to lapse after the worker freezes, the planner then has to
@@ -218,6 +249,60 @@ func (s *Sim) commandFor(step, job, task int) string {
 		return s.cmdFail
 	}
 	return cmdCannotStart
+}
+
+// validateCommands refuses to start a run whose tasks cannot be executed.
+//
+// /bin/true HAS NOW BITTEN TWICE, through two different spec builders, and
+// both times it was silent in the same direction. The workload shipped it
+// from Day 3 and nothing ran it until real workers arrived, at which point
+// every task reported "fork/exec /bin/true: no such file or directory" —
+// there is no /bin/true on this host, only /usr/bin/true. Then the recorded
+// clients turned out to carry their own copy of the same literal, which made
+// roughly 1,300 tasks per run fail to start while still being counted as
+// committed effects, and produced a calibration with more effects than
+// executions.
+//
+// Neither failure announced itself. A task that cannot start is reported as a
+// non-retryable failure, which is a perfectly ordinary outcome the state
+// machine handles correctly, so the run stays green and the workload quietly
+// stops being a workload. The only defence is to check the commands against
+// the host BEFORE the run, where "this cannot work here" is loud.
+//
+// cmdCannotStart is checked in the OPPOSITE direction, deliberately: the
+// terminal-failure branch depends on it not existing, so a host that happens
+// to have that path would silently take that coverage away.
+func (s *Sim) validateCommands() error {
+	if !s.cfg.RealWorkers {
+		// Nothing executes the commands, so a bad path cannot mislead a run
+		// — and demanding a shell on a host that only ever simulates workers
+		// would refuse runs that are fine.
+		return nil
+	}
+	for _, c := range []struct {
+		what string
+		path string
+	}{
+		{"success command", s.cmdOK},
+		{"retryable-failure command", s.cmdFail},
+		{"shell for the payload wrapper", s.cmdShell},
+	} {
+		info, err := os.Stat(c.path)
+		if err != nil {
+			return fmt.Errorf("%s %q does not resolve on this host: %w — every task using it would "+
+				"fail to START, which the state machine reports as an ordinary non-retryable "+
+				"failure, so the run would stay green while executing nothing",
+				c.what, c.path, err)
+		}
+		if info.IsDir() || info.Mode()&0o111 == 0 {
+			return fmt.Errorf("%s %q is not executable (mode %s)", c.what, c.path, info.Mode())
+		}
+	}
+	if _, err := os.Stat(cmdCannotStart); err == nil {
+		return fmt.Errorf("%q EXISTS on this host, so the terminal-failure branch would never be "+
+			"reached: tasks meant to fail to start would run instead", cmdCannotStart)
+	}
+	return nil
 }
 
 // slowTaskLeases is how many lease TTLs a slow task's payload sleeps for.

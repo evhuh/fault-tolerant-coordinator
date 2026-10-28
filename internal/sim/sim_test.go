@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -50,7 +51,13 @@ func ownViolations(res Result, ignore func(ViolationKind) bool) []Violation {
 		// timeout, so the duration this stall is measured against was never
 		// valid. See downgradeStallsOnBrokenPremise. A stall that is still a
 		// VIOLATION is kept, because that is the case worth catching.
-		if v.Inconclusive && v.Kind.IsStall() {
+		//
+		// UNLESS THE RUN IS SUPPORTING A CLAIM. Under FTC_STRICT_STALLS — set
+		// by release-check — an unattributable stall fails, because "we could
+		// not tell" is not a basis for a release. The fsync gate runs first
+		// so this should never trip; if it does, the host degraded mid-run
+		// and the numbers are not quotable.
+		if v.Inconclusive && v.Kind.IsStall() && !strictStalls() {
 			continue
 		}
 		out = append(out, v)
@@ -92,7 +99,7 @@ func notMine(err error) bool {
 	if !errors.As(err, &v) {
 		return false
 	}
-	if v.Inconclusive && v.Kind.IsStall() {
+	if v.Inconclusive && v.Kind.IsStall() && !strictStalls() {
 		return true // the host broke the premise; see ownViolations
 	}
 	return v.Kind.IsLinearizability() || v.Kind.IsEnvironment() || v.Kind.IsLedger()
@@ -118,6 +125,15 @@ func inconclusiveOnly(res Result) bool {
 	}
 	return true
 }
+
+// strictStalls reports whether an UNATTRIBUTABLE stall should fail rather
+// than be tolerated.
+//
+// Off for ordinary development, where a laptop's disk hiccup turning six
+// tests red teaches nothing. On for release-check, where the run's whole
+// purpose is to support a claim and "the host broke the premise" means the
+// claim is unsupported rather than met.
+func strictStalls() bool { return os.Getenv("FTC_STRICT_STALLS") == "1" }
 
 // findKind returns the first violation of a kind, which is how a test asserts
 // on the check it owns rather than on whatever failed first.
@@ -519,13 +535,20 @@ func TestStallIsNotAttributableWhenTheHostBrokeThePremise(t *testing.T) {
 
 	// On its own it stays a violation: this is the case worth catching, and
 	// the Day 8 leadership-revocation deadlock presented exactly this way.
-	only := downgradeStallsOnBrokenPremise([]Violation{stall})
+	only, hostIOCount, downgraded := downgradeStallsOnBrokenPremise([]Violation{stall})
 	if len(only) != 1 || only[0].Inconclusive {
 		t.Errorf("a stall in a healthy-disk run must stay a VIOLATION, got %+v", only)
 	}
+	if hostIOCount != 0 || downgraded != 0 {
+		t.Errorf("counts = host-io %d downgraded %d, want 0 and 0", hostIOCount, downgraded)
+	}
 
 	// Alongside a host-io stall it is not attributable.
-	both := downgradeStallsOnBrokenPremise([]Violation{stall, hostIO})
+	both, hostIOCount, downgraded := downgradeStallsOnBrokenPremise([]Violation{stall, hostIO})
+	if hostIOCount != 1 || downgraded != 1 {
+		t.Errorf("counts = host-io %d downgraded %d, want 1 and 1 — an unattributable stall that is "+
+			"not counted reads as a clean pass", hostIOCount, downgraded)
+	}
 	if len(both) != 2 {
 		t.Fatalf("downgrade changed the violation count: %+v", both)
 	}
@@ -544,7 +567,7 @@ func TestStallIsNotAttributableWhenTheHostBrokeThePremise(t *testing.T) {
 	// Other kinds are never touched. An invariant failure is not a timing
 	// judgement and a slow disk is no excuse for it.
 	inv := Violation{Seed: 1, Step: 4, Kind: KindInvariant, What: "task x is RUNNING with no worker"}
-	kept := downgradeStallsOnBrokenPremise([]Violation{inv, hostIO})
+	kept, _, _ := downgradeStallsOnBrokenPremise([]Violation{inv, hostIO})
 	if kept[0].Inconclusive {
 		t.Errorf("a state invariant was downgraded by a slow disk: %+v", kept[0])
 	}

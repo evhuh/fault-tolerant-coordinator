@@ -236,7 +236,7 @@ func (s *Sim) linSubmit(ctx context.Context, n *node, client, seq int, w linWher
 	resp, err := n.svc.SubmitJob(ctx, &schedulerpb.SubmitJobRequest{
 		ClientId:  fmt.Sprintf("lin-%d", client),
 		RequestId: fmt.Sprintf("%d", seq),
-		Tasks:     []*schedulerpb.TaskSpec{{Command: "/bin/true", MaxAttempts: 1}},
+		Tasks:     []*schedulerpb.TaskSpec{s.linSpec()},
 	})
 
 	out := s.classifySubmit(resp, err)
@@ -283,7 +283,7 @@ func (s *Sim) targetStaleRead(ctx context.Context, client int, seq *int) bool {
 	resp, err := majority.svc.SubmitJob(ctx, &schedulerpb.SubmitJobRequest{
 		ClientId:  fmt.Sprintf("tgt-%d", client),
 		RequestId: fmt.Sprintf("%d", *seq),
-		Tasks:     []*schedulerpb.TaskSpec{{Command: "/bin/true", MaxAttempts: 1}},
+		Tasks:     []*schedulerpb.TaskSpec{s.linSpec()},
 	})
 	out := s.classifySubmit(resp, err)
 	op.done(out)
@@ -316,7 +316,7 @@ func (s *Sim) targetedReadAfterWake(woken, majority *node) {
 	resp, err := majority.svc.SubmitJob(ctx, &schedulerpb.SubmitJobRequest{
 		ClientId:  "wake",
 		RequestId: fmt.Sprintf("%d", s.wakeSeq),
-		Tasks:     []*schedulerpb.TaskSpec{{Command: "/bin/true", MaxAttempts: 1}},
+		Tasks:     []*schedulerpb.TaskSpec{s.linSpec()},
 	})
 	out := s.classifySubmit(resp, err)
 	op.done(out)

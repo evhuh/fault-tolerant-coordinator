@@ -192,7 +192,13 @@ type Coordinator struct {
 	// single node — every test below Day 6 depends on that.
 	raft     *raftnode.Node
 	proposer *raftProposer
-	// leaderCancel stops the leader-only goroutines on revocation.
+	// leaderCtx is alive for exactly as long as this node leads, and
+	// leaderCancel ends it on revocation.
+	//
+	// Both are read from OTHER goroutines than the Ready loop — every
+	// proposal derives its context from leaderCtx — so they are guarded.
+	leaderMu     sync.Mutex
+	leaderCtx    context.Context
 	leaderCancel context.CancelFunc
 
 	// tickFailures counts Tick proposals that did not commit. Dropped ticks
@@ -206,6 +212,14 @@ type Coordinator struct {
 	// that goroutine blocked on work the goroutine itself serves.
 	stallMu sync.Mutex
 	stalls  []raftnode.Stall
+	// snapshots records what each snapshot cost the Ready loop. Guarded by
+	// stallMu because it is the same kind of observation taken from the same
+	// goroutine, and one mutex for both keeps that goroutine's critical
+	// sections to a single uncontended lock.
+	snapshots []raftnode.SnapshotStat
+	// leadershipChanges records what each transition cost the Ready loop, and
+	// how much state it was carrying at the time.
+	leadershipChanges []LeadershipChange
 
 	// fatalErr records an unrecoverable failure that halted this node.
 	fatalOnce sync.Once

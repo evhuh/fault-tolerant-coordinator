@@ -415,6 +415,29 @@ type Result struct {
 	Window WindowPlan
 	// Pause explains the pause sequence when one was injected.
 	Pause PauseDiag
+	// LeadershipChanges is what each leadership transition cost the Ready
+	// loop, with the job count it was carrying — the curve that says whether
+	// the broker rebuild scales with state.
+	LeadershipChanges []server.LeadershipChange
+	// Snapshots is what each snapshot cost the Ready loop that took it, in
+	// order, across every node.
+	//
+	// A TREND, not a total, is the useful form: the snapshot grows with
+	// state and blocks the loop for all of it, so a long run's real question
+	// is whether that cost is climbing toward the stall threshold. A run
+	// that ends with snapshots near the threshold was about to start
+	// truncating, and would have looked fine until it did.
+	Snapshots []raftnode.SnapshotStat
+	// HostIOStalls and DowngradedStalls are the stall accounting, reported
+	// on every run.
+	//
+	// A DOWNGRADED stall is one this run could not attribute: a blocking
+	// call on the Ready loop, in a run whose disk also blew past its own
+	// election timeout. It is neither a clean pass nor a finding, and it has
+	// to be COUNTED or it reads as the former — the whole reason the
+	// downgrade is a reporting hazard rather than a fix.
+	HostIOStalls     int
+	DowngradedStalls int
 	// Ledger is what the effect ledger observed, reported whether or not it
 	// found anything.
 	Ledger Ledger
@@ -995,6 +1018,14 @@ func (s *Sim) logf(format string, args ...any) {
 // let the cluster run, then CHECK INVARIANTS. Checking after every step is
 // what turns "it crashed eventually" into "it broke at step 17 of seed 42".
 func (s *Sim) Run(ctx context.Context) (Result, error) {
+	// FIRST, before a single node starts: can this host execute the tasks
+	// this run will submit? A bad command path makes a run green and empty,
+	// so it fails here in milliseconds rather than after a quiet hour. See
+	// validateCommands.
+	if err := s.validateCommands(); err != nil {
+		return s.result, fmt.Errorf("seed %d: %w", s.cfg.Seed, err)
+	}
+
 	defer s.shutdown()
 
 	for i := 1; i <= s.cfg.Nodes; i++ {
@@ -1136,27 +1167,26 @@ func (s *Sim) Run(ctx context.Context) (Result, error) {
 // Not a blanket exemption. A blocking-call stall in a run whose disk kept up
 // stays a VIOLATION, which is the case worth catching — the leadership
 // revocation deadlock that Day 8 found presented exactly that way.
-func downgradeStallsOnBrokenPremise(vs []Violation) []Violation {
-	brokenPremise := false
+func downgradeStallsOnBrokenPremise(vs []Violation) (out []Violation, hostIO, downgraded int) {
 	for _, v := range vs {
 		if v.Kind == KindHostIO {
-			brokenPremise = true
-			break
+			hostIO++
 		}
 	}
-	if !brokenPremise {
-		return vs
+	if hostIO == 0 {
+		return vs, 0, 0
 	}
-	out := make([]Violation, 0, len(vs))
+	out = make([]Violation, 0, len(vs))
 	for _, v := range vs {
 		if v.Kind == KindReadyLoopStall {
 			v.Inconclusive = true
 			v.What += " — but this run also waited on the disk past its own election timeout, " +
 				"so the premise that makes this duration meaningful was already broken; not attributable"
+			downgraded++
 		}
 		out = append(out, v)
 	}
-	return out
+	return out, hostIO, downgraded
 }
 
 // finish collects the result and turns whatever was found into Run's error.
@@ -1173,8 +1203,10 @@ func downgradeStallsOnBrokenPremise(vs []Violation) []Violation {
 // a violation is the more useful thing to put in front of someone.
 func (s *Sim) finish() (Result, error) {
 	res := s.collect()
-	res.Violations = downgradeStallsOnBrokenPremise(res.Violations)
-	s.result.Violations = res.Violations
+	vs, hostIO, downgraded := downgradeStallsOnBrokenPremise(res.Violations)
+	res.Violations, res.HostIOStalls, res.DowngradedStalls = vs, hostIO, downgraded
+	s.result.Violations = vs
+	s.result.HostIOStalls, s.result.DowngradedStalls = hostIO, downgraded
 	for _, v := range res.Violations {
 		if !v.Inconclusive {
 			return res, v
@@ -1238,6 +1270,15 @@ func (s *Sim) collect() Result {
 	// The apply site's observations become part of the Result here, on this
 	// goroutine, rather than being written into it as they happen.
 	s.foldObservations()
+
+	// Snapshot costs, from every node that is still up. Collected here
+	// rather than streamed, because the trend is read at the end.
+	for _, id := range s.liveIDs() {
+		if n, ok := s.nodeAt(id); ok {
+			s.result.Snapshots = append(s.result.Snapshots, n.coord.Snapshots()...)
+			s.result.LeadershipChanges = append(s.result.LeadershipChanges, n.coord.LeadershipChanges()...)
+		}
+	}
 
 	s.result.Faults.Net = s.net.Stats()
 	if n := s.anyNode(); n != nil {

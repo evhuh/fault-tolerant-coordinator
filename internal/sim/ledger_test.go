@@ -35,6 +35,7 @@ func TestEffectLedger(t *testing.T) {
 	drained, runs := 0, 0
 	var overlapPerRun, stalePerRun []int
 	earlyExits := 0
+	downgradedStalls, hostIOStalls := 0, 0
 
 	// EIGHT SEEDS, to measure the distribution rather than sample it. Three
 	// was enough to show the assertions hold and far too few to say anything
@@ -71,6 +72,14 @@ func TestEffectLedger(t *testing.T) {
 			l.DrainWaited.Round(1e6))
 		t.Logf("seed %d: terminal with no effect, by attempt budget=%d (correct, and measured)",
 			seed, l.NoEffectByBudget)
+		// STALL ACCOUNTING ON EVERY ROW. A downgraded stall is a run the
+		// harness could not attribute, and a sweep that quotes rates over
+		// such runs is quoting the host. Printed whether or not it is zero,
+		// because a zero is the thing being claimed.
+		t.Logf("seed %d: stalls: host-io=%d unattributable=%d",
+			seed, res.HostIOStalls, res.DowngradedStalls)
+		downgradedStalls += res.DowngradedStalls
+		hostIOStalls += res.HostIOStalls
 		t.Logf("seed %d: quiesced=%v drain budget %s | run outcome: %v",
 			seed, l.Quiesced, l.DrainBound, err)
 
@@ -132,6 +141,8 @@ func TestEffectLedger(t *testing.T) {
 	// silently includes truncated runs reads lower than the truth and the
 	// reader cannot tell.
 	t.Logf("runs that ended before quiescence: %d/%d", earlyExits, runs)
+	t.Logf("STALLS across the sweep: %d host-io, %d unattributable%s",
+		hostIOStalls, downgradedStalls, quotableNote(hostIOStalls, downgradedStalls))
 
 	if execs == 0 {
 		t.Fatal("no attempt executed at all: the ledger checked nothing")
@@ -203,4 +214,17 @@ func countNonZero(xs []int) int {
 		}
 	}
 	return n
+}
+
+// quotableNote says plainly whether the sweep's numbers can be quoted.
+//
+// A sweep with host-io stalls measured a host that could not sustain the
+// run's compressed timings, so its rates describe the disk as much as the
+// system. Saying so next to the number is cheaper than discovering it later
+// from a figure already in a README.
+func quotableNote(hostIO, downgraded int) string {
+	if hostIO == 0 && downgraded == 0 {
+		return " — the host sustained the run's timings, so these rates are quotable"
+	}
+	return " — THE HOST DID NOT SUSTAIN THE RUN'S TIMINGS; re-measure on a quiet machine before quoting these rates"
 }
