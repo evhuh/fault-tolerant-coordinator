@@ -3,6 +3,7 @@ package raftnode
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -27,8 +28,16 @@ import (
 type Transport interface {
 	// Listen starts receiving, handing every well-formed message to step.
 	Listen(selfURL string, step func(context.Context, *raftpb.Message) error) error
-	// Send delivers a message to m.To, best effort.
-	Send(m *raftpb.Message)
+	// Send delivers a message to m.To and reports whether the SEND ATTEMPT
+	// completed — not whether the message arrived, which no sender can know.
+	//
+	// The error exists for MsgSnap. raft retries an append on its own, but it
+	// parks a follower in StateSnapshot until the application reports the
+	// snapshot's OUTCOME, so a send that failed has to be distinguishable
+	// from one that went out. A transport that cannot tell returns nil, and
+	// the resulting ReportSnapshot(Finish) still unparks the follower:
+	// probing resumes, the follower rejects, and the leader re-snapshots.
+	Send(m *raftpb.Message) error
 	Close()
 }
 
@@ -86,20 +95,26 @@ func (t *httpTransport) Listen(selfURL string, step func(context.Context, *raftp
 	return nil
 }
 
-func (t *httpTransport) Send(m *raftpb.Message) {
+func (t *httpTransport) Send(m *raftpb.Message) error {
 	addr, ok := t.peers[m.GetTo()]
 	if !ok {
-		return
+		return fmt.Errorf("no address for node %d", m.GetTo())
 	}
 	b, err := proto.Marshal(m)
 	if err != nil {
-		return
+		return err
 	}
 	resp, err := t.client.Post(addr+"/raft", "application/octet-stream", bytes.NewReader(b))
 	if err != nil {
-		return // peer down or partitioned; raft's own protocol retries
+		// RETURNED, not swallowed. This used to be a bare return with the
+		// comment "peer down or partitioned; raft's own protocol retries" —
+		// true of MsgApp and FALSE of MsgSnap, which raft does not retry
+		// until the application reports the outcome. Swallowing it here is
+		// what let one failed POST park a follower forever.
+		return err
 	}
 	_ = resp.Body.Close()
+	return nil
 }
 
 func (t *httpTransport) Close() {

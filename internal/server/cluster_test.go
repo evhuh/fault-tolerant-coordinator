@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1094,4 +1095,108 @@ func TestRevocationReleasesAnInFlightPropose(t *testing.T) {
 		t.Errorf("err = %v, want ErrProposalLost: the entry was abandoned and may still commit, "+
 			"which is exactly what that error means", err)
 	}
+}
+
+// Nothing outside RaftStatus may handle a raft.Status.
+//
+// THE TRAP, THREE TIMES. raft.Status reaches Term through an embedded
+// *raftpb.HardState whose field is itself a *uint64, so `st.Term`
+// nil-dereferences when there is no hard state and compares pointer
+// addresses when two are compared. Day 8's MsgHup experiment compared
+// addresses and concluded a term had not moved. The fix for that wrote the
+// correct idiom in a comment directly above raftnode.Status. Day 10 then
+// segfaulted a diagnostic run on the nil pointer anyway, in a helper written
+// without reading that comment — and took two runs of a three-hour
+// checkpoint with it.
+//
+// A comment did not stop it twice, so this does. RaftStatus returns plain
+// values now, and this test fails if any other code starts handling the raw
+// type again.
+func TestNothingReadsRaftStatusTermDirectly(t *testing.T) {
+	root := ".."
+	allowed := map[string]bool{
+		// The one place that converts a raft.Status into plain values.
+		filepath.Join("server", "raft.go"): true,
+		// raftnode owns the node and exposes Status for tests; its own
+		// comment is the one that documents the trap.
+		filepath.Join("raftnode", "node.go"): true,
+		// This test names the type to forbid it.
+		filepath.Join("server", "cluster_test.go"): true,
+	}
+
+	var offenders []string
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() || filepath.Ext(path) != ".go" {
+			return err
+		}
+		rel, _ := filepath.Rel(root, path)
+		if allowed[rel] {
+			return nil
+		}
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		for i, line := range strings.Split(string(b), "\n") {
+			trimmed := strings.TrimSpace(line)
+			// Prose may name the trap; that is how it stays known.
+			if strings.HasPrefix(trimmed, "//") {
+				continue
+			}
+			// RaftStatus().Term is the SAFE read — RaftInfo.Term is a plain
+			// uint64 — so it must not be confused with Status().Term on the
+			// raw type. Blanking it first is what keeps the rule narrow
+			// enough to be true: a check that flags correct code gets
+			// deleted by the next person.
+			if flagsLine(line) {
+				offenders = append(offenders, fmt.Sprintf("%s:%d: %s", rel, i+1, trimmed))
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walking %s: %v", root, err)
+	}
+	if len(offenders) > 0 {
+		t.Errorf("raft.Status handled outside RaftStatus, which is how the Term trap got walked into "+
+			"three times:\n  %s\nUse Coordinator.RaftStatus(), which returns RaftInfo with plain values.",
+			strings.Join(offenders, "\n  "))
+	}
+
+	// AND THE CHECK CAN FAIL. A guard that cannot fire is decoration, and
+	// this one is a string scan, which is exactly the kind that silently
+	// stops matching.
+	for _, reintroduced := range []string{
+		"\tst := n.coord.Status().Term",
+		"var s raft.Status",
+		"x := st.HardState.Term",
+	} {
+		if !flagsLine(reintroduced) {
+			t.Errorf("the scan would not flag %q, so it would not catch the trap coming back", reintroduced)
+		}
+	}
+	for _, fine := range []string{
+		"\tterm := n.coord.RaftStatus().Term",
+		"// Status().Term is a trap; see RaftInfo",
+	} {
+		if flagsLine(fine) {
+			t.Errorf("the scan flags %q, which is correct code or prose; a check that fails on "+
+				"correct code gets deleted", fine)
+		}
+	}
+}
+
+// flagsLine applies the same rule the walk above does, to one line.
+func flagsLine(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	if strings.HasPrefix(trimmed, "//") {
+		return false
+	}
+	probe := strings.ReplaceAll(trimmed, "RaftStatus()", "«safe»")
+	for _, bad := range []string{"raft.Status", ".HardState.Term", "Status().Term"} {
+		if strings.Contains(probe, bad) {
+			return true
+		}
+	}
+	return false
 }

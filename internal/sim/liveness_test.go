@@ -199,6 +199,5 @@ func rejoinTermMovement(t *testing.T, disablePreVote bool) uint64 {
 // moved look like a term that never moved for the wrong reason.
 func termOf(t *testing.T, n *node) uint64 {
 	t.Helper()
-	st := n.coord.RaftStatus()
-	return st.HardState.GetTerm()
+	return n.coord.RaftStatus().Term
 }

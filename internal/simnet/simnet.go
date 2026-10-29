@@ -129,8 +129,22 @@ type Network struct {
 	// together produces a "drop rate" that is mostly messages to a node that
 	// is switched off, which is not a network fault at all — and a metric
 	// that reports 33% when 2% was configured is worse than no metric.
-	sent, delivered      int
-	droppedRandom        int // the configured drop rate
+	sent, delivered int
+	droppedRandom   int // the configured drop rate
+	// MsgSnap accounting, separate from everything else.
+	//
+	// A DROPPED MsgSnap IS NOT LIKE A DROPPED MsgApp. raft retries an append
+	// on its own, but it holds the follower in StateSnapshot until the
+	// APPLICATION reports the snapshot's outcome — and until Day 10 nothing
+	// in this build ever did. The follower then acks nothing while its
+	// heartbeat responses keep it RecentActive, so the leader keeps a term it
+	// cannot commit in. Counting these separately is what lets a frozen-clock
+	// window be traced to a cause instead of correlated with a symptom.
+	snapSent  int
+	snapDrops []SnapDrop
+	// dropSnapTo is a countdown of MsgSnap messages to swallow per
+	// destination, for DropSnapshotsTo.
+	dropSnapTo           map[uint64]int
 	droppedPartition     int // crossed a partition
 	droppedDown          int // addressed to a stopped node
 	corrupted            int // bytes mangled at send
@@ -176,6 +190,15 @@ func (n *Network) Transport(id uint64) raftnode.Transport {
 // is partitioned, so nodes inside the set still talk to each other. That is
 // what makes a minority partition able to elect nothing while the majority
 // carries on.
+// DECIDED BUT NOT YET IMPLEMENTED: this REPLACES the isolated set, and the
+// agreed semantics are additive — see "Partition semantics" in
+// docs/architecture.md.
+//
+// Replacing is why a held leader partition can be cancelled one step into its
+// hold by the schedule's next partition, while holdHeal goes on suppressing
+// heals, leaving the simulator believing it holds a partition it released.
+// The change waits behind the snapshot-reporting fix because it makes the
+// adversary strictly harsher and voids the calibrated floors.
 func (n *Network) Partition(ids ...uint64) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -187,6 +210,28 @@ func (n *Network) Partition(ids ...uint64) {
 
 // Heal removes every partition.
 func (n *Network) Heal() { n.Partition() }
+
+// DropSnapshotsTo drops the next n MsgSnap messages addressed to id.
+//
+// A TARGETED FAULT, because the defect it exposes needs one specific message
+// lost and nothing else. etcd/raft holds a follower in StateSnapshot until
+// the application reports the snapshot's outcome, so a single dropped MsgSnap
+// parks that follower permanently when nothing ever reports — and that is not
+// reachable by raising the random drop rate without disturbing everything
+// else in the run.
+//
+// The ordinary adversary drops MsgSnap too, at the configured rate; this
+// exists so a deterministic test can show the causal chain rather than sample
+// for it. Day 10 sampled 24 seeds for a frozen-clock window and found none,
+// which at a ~6% per-run rate is a one-in-four outcome and settles nothing.
+func (n *Network) DropSnapshotsTo(id uint64, count int) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.dropSnapTo == nil {
+		n.dropSnapTo = map[uint64]int{}
+	}
+	n.dropSnapTo[id] = count
+}
 
 // Hold pauses delivery to a node, queueing what arrives instead of dropping
 // it. Models a process that is not being scheduled.
@@ -326,6 +371,42 @@ func (n *Network) dropReason(from, to uint64) dropReason {
 	return reasonNone
 }
 
+// SnapDrop is one MsgSnap that never arrived.
+type SnapDrop struct {
+	AtMs   int64
+	From   uint64
+	To     uint64
+	Reason string
+}
+
+// noteSnapDropLocked records a dropped MsgSnap. Caller must hold n.mu.
+func (n *Network) noteSnapDropLocked(isSnap bool, from, to uint64, reason string) {
+	if !isSnap {
+		return
+	}
+	n.snapDrops = append(n.snapDrops, SnapDrop{
+		AtMs: time.Now().UnixMilli(), From: from, To: to, Reason: reason,
+	})
+}
+
+// SnapTraffic reports how many snapshots were sent and which were dropped.
+func (n *Network) SnapTraffic() (sent int, drops []SnapDrop) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.snapSent, append([]SnapDrop(nil), n.snapDrops...)
+}
+
+// name is the drop reason as a word, for diagnostics.
+func (r dropReason) name() string {
+	switch r {
+	case reasonDown:
+		return "node-down"
+	case reasonPartition:
+		return "partition"
+	}
+	return "none"
+}
+
 // countDrop records a drop under its own reason. Caller must hold n.mu.
 func (n *Network) countDrop(r dropReason) {
 	switch r {
@@ -353,31 +434,54 @@ func (t *transport) Listen(_ string, step func(context.Context, *raftpb.Message)
 
 // Send marshals, decides this message's fate from the seeded RNG, and
 // delivers it asynchronously.
-func (t *transport) Send(m *raftpb.Message) {
+// Send reports whether the SEND ATTEMPT completed, which in an in-memory
+// network is almost always yes.
+//
+// A DROPPED MESSAGE RETURNS nil, deliberately: a real network drop looks like
+// success to the sender too, and a simnet that reported drops as send errors
+// would hand raft information no production sender has — making the harness
+// easier on the system than reality is.
+func (t *transport) Send(m *raftpb.Message) error {
 	// Marshal on the SENDER's goroutine, before any fault decision — the
 	// real transport does, and keeping it here means the receiver still
 	// unmarshals and still drops anything corrupt.
 	b, err := proto.Marshal(m)
 	if err != nil {
-		return
+		return nil
 	}
 
 	n := t.net
+	isSnap := m.GetType() == raftpb.MsgSnap
+
 	n.mu.Lock()
 	if n.closed {
 		n.mu.Unlock()
-		return
+		return nil
 	}
 	n.sent++
+	if isSnap {
+		n.snapSent++
+	}
+	// The targeted snapshot drop goes FIRST, so a test can lose a MsgSnap
+	// without also arranging a partition or a kill to do it.
+	if isSnap && n.dropSnapTo[m.GetTo()] > 0 {
+		n.dropSnapTo[m.GetTo()]--
+		n.droppedRandom++
+		n.noteSnapDropLocked(isSnap, t.id, m.GetTo(), "targeted")
+		n.mu.Unlock()
+		return nil
+	}
 	if r := n.dropReason(t.id, m.GetTo()); r != reasonNone {
 		n.countDrop(r)
+		n.noteSnapDropLocked(isSnap, t.id, m.GetTo(), r.name())
 		n.mu.Unlock()
-		return
+		return nil
 	}
 	if n.f.DropRate > 0 && n.rng.Float64() < n.f.DropRate {
 		n.droppedRandom++
+		n.noteSnapDropLocked(isSnap, t.id, m.GetTo(), "random")
 		n.mu.Unlock()
-		return
+		return nil
 	}
 	// Corrupt AFTER the drop decisions, so the two faults stay independent
 	// and each count means what it says.
@@ -392,7 +496,7 @@ func (t *transport) Send(m *raftpb.Message) {
 			// raft actually claims to handle.
 			n.corruptDroppedAtLink++
 			n.mu.Unlock()
-			return
+			return nil
 		}
 		n.corruptDelivered++
 	}
@@ -403,7 +507,7 @@ func (t *transport) Send(m *raftpb.Message) {
 
 	if step == nil {
 		n.wg.Done()
-		return
+		return nil
 	}
 
 	go func() {
@@ -475,6 +579,10 @@ func (t *transport) Send(m *raftpb.Message) {
 		}
 		_ = step(context.Background(), msg)
 	}()
+	// The ATTEMPT completed. Whether the message arrives is decided on the
+	// goroutine above, and a sender does not learn that here any more than
+	// it would over a real network.
+	return nil
 }
 
 // pickDelayLocked draws this message's latency. Caller must hold n.mu, so the

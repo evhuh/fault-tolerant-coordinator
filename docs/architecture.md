@@ -594,6 +594,32 @@ The weaker claim is still the one that matters: a failure you can put the *same 
 
 **Seeded ids** — `Config.Rand`. Ids drawn from `crypto/rand` differ every run, so two runs of one seed could not be diffed. The seed reproduces the schedule; readable ids are what make that reproduction *usable*.
 
+### Partition semantics: additive isolation — DECIDED, NOT YET IMPLEMENTED
+
+**Status: the semantics below are the decision. The code still does the old thing.** This section is written ahead of the change on purpose, because the numbers already measured were measured under the old rule and have to be labelled before anyone quotes them. It is marked here, and in `simnet.Partition`, until the behaviour matches.
+
+`Network.Partition(ids...)` **replaces** the isolated set on every call. Day 10's checkpoint found what that costs, in a frozen-clock window that printed its own fault sequence:
+
+```
+step 359  partition LEADER node 2, held for 3 steps   → isolated={2}
+step 360  partition node 3                            → isolated={3}, node 2 SILENTLY HEALED
+sample at step 360: leaderPartitioned=false
+```
+
+The held leader partition was cancelled one step into a three-step hold by the schedule's next partition, while `holdHeal` kept suppressing *heals* for the full three steps — so the simulator believed it was still holding a partition it had already released. Two costs. Ordinary runs' leader partitions are shorter than they log, which weakens that fault. And the simulator's connectivity view is what the frozen-clock invariant's exemptions are built on, so an invariant was reasoning from a picture that did not describe what raft experienced.
+
+The decided semantics:
+
+- **Additive isolation.** `partition X` ADDS X to the isolated set. Isolating one node never releases another.
+- **A held partition survives later partition events** and ends only at its own scheduled heal. A hold means what it says.
+- **Heals release only the nodes they name**, with heal-everything as its own explicit event rather than the degenerate case of `Partition()` with no arguments.
+
+What this does to the numbers already taken, stated plainly rather than quietly:
+
+- **Every figure in the Day 10 checkpoint was measured under REPLACE semantics**, including the fault counts (7,089 partitions, 2,448 leader partitions over 64 seeds) — under which a reported leader partition was often not held for as long as it claimed.
+- **The overlap and stale-rejection floors are VOID.** They were calibrated at 0.85 and 1.17 per 100 run-steps against an adversary that cancelled its own partitions; additive isolation is a strictly harsher adversary, and a floor carried across that change would be a number pretending to be a measurement.
+- **Recalibration comes before the next checkpoint**, on the same two-sweep basis as the first calibration, and the new floors carry their n and seed range like every other quoted rate.
+
 ### Drop reasons are counted apart
 
 A message can fail to arrive for three unrelated reasons, and folding them together produces a "drop rate" that is mostly messages to a switched-off node:
@@ -672,6 +698,31 @@ induced faults, the state machine never contradicted itself, replicas never
 diverged at a shared log position, no Ready loop blocked on its own goroutine,
 and no corrupt message reached consensus. It says nothing about read
 linearizability or duplicate effects.
+
+### A dropped snapshot parked a follower forever
+
+etcd/raft puts a follower in `StateSnapshot` when it sends it a snapshot and pauses every log probe to it — `Progress.IsPaused()` is unconditionally true in that state — until the application calls `Node.ReportSnapshot`. **Nothing in this build ever called it**, in either transport, and `ReportUnreachable` was never called either. raft's own documentation names the consequence: the follower "could end up in a limbo, never getting any updates from the leader."
+
+What made it survive this long is that it is SILENT in the worst way. The parked follower keeps answering heartbeats, so `Progress.RecentActive` stays true, CheckQuorum is satisfied and the leader is never deposed — it simply holds its term and commits nothing. `httpTransport.Send` swallowed its POST error under the comment *"peer down or partitioned; raft's own protocol retries"*, which is true of `MsgApp` and false of `MsgSnap`.
+
+Measured deterministically, one dropped `MsgSnap` and nothing else:
+
+```
+before:  term=2  ackingQuorum=false  commit=486
+         node1: StateSnapshot  match=0  pendingSnapshot=481  recentActive=TRUE  paused=TRUE
+         -> 6s of "proposal lost", leader holds its term
+
+after:   term=2  ackingQuorum=true   commit=489
+         node1: StateReplicate  match=489  pendingSnapshot=0  paused=false
+```
+
+The fix is in `raftnode`, so both transports get it: `Transport.Send` returns whether the send ATTEMPT completed (not whether the message arrived, which no sender can know), `Node.send` reports `ReportSnapshot(Finish|Failure)` for every `MsgSnap` and `ReportUnreachable` on any failed send. `simnet` returns nil on a drop, deliberately — a real network drop looks like success to its sender too, and reporting drops as send errors would hand raft information production does not have.
+
+No `PendingSnapshot` timeout is needed: both outcomes call `BecomeProbe`, so probing resumes either way, and a snapshot that never arrived is caught by the follower rejecting the next probe. `Failure` additionally clears `PendingSnapshot` so probing does not resume from an index that was never applied.
+
+**What is claimed, and what is not.** The mechanism is proven and the fix is verified by `TestDroppedSnapshotDoesNotParkAFollower`, which fails without the report and passes with it. It MATCHES the shape of all five frozen-clock windows the Day 10 checkpoint recorded — one leader, one term, no leadership transitions, nominal quorum, proposals lost for seconds — but those windows were captured before the raft progress table was instrumented, so **none of them shows a follower in `StateSnapshot`** and the attribution is unproven. A 24-seed hunt with full instrumentation then found no windows at all, which at a ~6% per-run rate is a one-in-four outcome and settles nothing.
+
+The evidence that would settle it is a post-fix 64-seed checkpoint under the *same* adversary, before the partition semantics change: the pre-fix rate was 4 of 64, so zero windows across 64 seeds is roughly a 2% outcome by chance.
 
 ### A proposal's context hangs off leadership
 

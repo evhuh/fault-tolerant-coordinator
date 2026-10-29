@@ -6,8 +6,10 @@ import (
 	"encoding/hex"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
+	"github.com/evazheng/fault-tolerant-coordinator/internal/server"
 	"github.com/evazheng/fault-tolerant-coordinator/internal/state"
 )
 
@@ -132,7 +134,17 @@ func (s *Sim) checkInvariants(step int) []Violation {
 	// says the node is paused. Once it has been woken, the ordinary rules
 	// apply again and a clock that stays frozen FAILS, which is an
 	// assertion this harness could not previously make at all.
-	switch nowMs := s.stateClock(lead); {
+	nowMs := s.stateClock(lead)
+	leadRaft := lead.coord.RaftStatus()
+	s.clockLog = append(s.clockLog, clockSample{
+		AtMs: time.Now().UnixMilli(), Step: step, ClockMs: nowMs,
+		LeaderID: lead.id, Term: leadRaft.Term,
+		Quorum: s.hasQuorum(), LeaderPartitioned: s.net.IsPartitioned(lead.id),
+		Paused: s.pausedNode(lead.id),
+		Raft:   leadRaft,
+	})
+
+	switch {
 	case s.pausedNode(lead.id):
 		s.clockFrozenSteps = 0
 		s.lastClock = nowMs
@@ -142,9 +154,21 @@ func (s *Sim) checkInvariants(step int) []Violation {
 	case nowMs == s.lastClock && s.lastClock > 0:
 		s.clockFrozenSteps++
 		if s.clockFrozenSteps >= frozenClockSteps {
-			add("leader's state-machine clock stuck at %d for %d consecutive steps "+
-				"(%d tick failures) — ticks are being dropped silently, so no lease will ever expire",
-				nowMs, s.clockFrozenSteps, lead.coord.TickFailures())
+			// CLASSIFIED, not counted. The first version printed
+			// TickFailures(), which is the node's LIFETIME total, next to a
+			// six-step condition as though it measured the window — and it
+			// counts failures only, so a tick that committed and was clamped
+			// was invisible to it. Day 10's checkpoint fired four times and
+			// reported "ticks are being dropped silently" on that basis,
+			// which named a mechanism the number could not establish.
+			add("leader's state-machine clock stuck at %d for %d consecutive steps — %s",
+				nowMs, s.clockFrozenSteps, classifyTicks(lead.coord.TickSamples()))
+			// THE WINDOW ITSELF, captured once, so the diagnosis does not
+			// depend on re-running a 6%-of-runs finding with better logging.
+			// It records what happened INSIDE the span: every clock sample,
+			// every leadership transition with its term and the gap since
+			// the last one, every injected fault, and the tick census.
+			s.result.FrozenClock = s.describeFrozenWindow(step)
 		}
 	default:
 		s.clockFrozenSteps = 0
@@ -449,4 +473,178 @@ func (s *Sim) stateClock(n *node) int64 {
 	var ms int64
 	n.coord.ReadState(func(st *state.StateStore) { ms = st.NowMs() })
 	return ms
+}
+
+// classifyTicks renders what the recent Tick proposals actually did.
+//
+// Three outcomes with three different conclusions: a tick that FAILED never
+// committed, one that was CLAMPED committed and deliberately did nothing
+// because its timestamp was not ahead of the committed clock, and one that
+// ADVANCED moved the clock. A frozen clock with only clamps is a clock-skew
+// defect in the proposal; a frozen clock with failures spread across
+// several raft TERMS is a cluster electing; a frozen clock with failures
+// inside one term is a liveness defect. The term spread is what separates
+// the last two, so it is reported.
+func classifyTicks(ss []server.TickSample) string {
+	if len(ss) == 0 {
+		return "no Tick proposals were recorded on this node"
+	}
+	var advanced, clamped, failed int
+	errs := map[string]int{}
+	terms := map[uint64]bool{}
+	for _, s := range ss {
+		terms[s.Term] = true
+		switch s.Outcome {
+		case server.TickAdvanced:
+			advanced++
+		case server.TickClamped:
+			clamped++
+		default:
+			failed++
+			errs[s.Err]++
+		}
+	}
+	parts := make([]string, 0, len(errs))
+	for e, n := range errs {
+		parts = append(parts, fmt.Sprintf("%dx %s", n, e))
+	}
+	sort.Strings(parts)
+	return fmt.Sprintf("last %d ticks on this node: %d advanced, %d clamped, %d failed (%s) across %d raft term(s)",
+		len(ss), advanced, clamped, failed, strings.Join(parts, ", "), len(terms))
+}
+
+// describeFrozenWindow renders everything that happened inside a frozen-clock
+// span, as lines meant to be read.
+//
+// It exists because the first attempt to diagnose this finding had to infer a
+// transition rate from the tail of a log ("~20 transitions, so one every
+// 45ms") and could not say which injected fault explained any of them. An
+// inference reported as a measurement is the failure mode this whole harness
+// is built against, so the window reports itself.
+func (s *Sim) describeFrozenWindow(step int) []string {
+	samples := s.clockLog
+	if len(samples) > frozenClockSteps+2 {
+		samples = samples[len(samples)-(frozenClockSteps+2):]
+	}
+	if len(samples) == 0 {
+		return nil
+	}
+	from, to := samples[0].AtMs, samples[len(samples)-1].AtMs
+
+	out := []string{fmt.Sprintf("frozen-clock window: steps %d..%d, %dms of wall time",
+		samples[0].Step, step, to-from)}
+	for _, c := range samples {
+		out = append(out, fmt.Sprintf("  +%4dms step %3d clock=%d leader=node%d term=%d simQuorum=%v leaderPartitioned=%v paused=%v | raft: ackingQuorum=%v commit=%d %s",
+			c.AtMs-from, c.Step, c.ClockMs, c.LeaderID, c.Term, c.Quorum, c.LeaderPartitioned, c.Paused,
+			c.Raft.AckingQuorum, c.Raft.Commit, describeFollowers(c.Raft.Followers)))
+	}
+
+	// Leadership transitions inside the window, per node, with the gap since
+	// the previous one: a gap shorter than an election timeout is a defect
+	// in its own right when PreVote is on.
+	type transition struct {
+		atMs   int64
+		nodeID uint64
+		gained bool
+		term   uint64
+	}
+	var ts []transition
+	for _, id := range s.liveIDs() {
+		n, ok := s.nodeAt(id)
+		if !ok {
+			continue
+		}
+		for _, lc := range n.coord.LeadershipChanges() {
+			if lc.AtMs >= from && lc.AtMs <= to {
+				ts = append(ts, transition{lc.AtMs, id, lc.IsLeader, lc.Term})
+			}
+		}
+	}
+	sort.Slice(ts, func(i, j int) bool { return ts[i].atMs < ts[j].atMs })
+	election := time.Duration(s.cfg.ElectionTick) * s.cfg.TickInterval
+	out = append(out, fmt.Sprintf("  leadership transitions inside the window: %d (election timeout %s)",
+		len(ts), election))
+	var prev int64
+	for i, tr := range ts {
+		verb := "LOST   "
+		if tr.gained {
+			verb = "GAINED "
+		}
+		gap := ""
+		if i > 0 {
+			d := time.Duration(tr.atMs-prev) * time.Millisecond
+			gap = fmt.Sprintf(" (+%s since previous", d)
+			if d < election {
+				gap += ", FASTER THAN AN ELECTION TIMEOUT"
+			}
+			gap += ")"
+		}
+		out = append(out, fmt.Sprintf("  +%4dms node%d %s term=%d%s", tr.atMs-from, tr.nodeID, verb, tr.term, gap))
+		prev = tr.atMs
+	}
+
+	// The injected faults that could explain them.
+	s.mu.Lock()
+	faults := append([]faultEvent(nil), s.faultLog...)
+	s.mu.Unlock()
+	inWindow := 0
+	for _, f := range faults {
+		if f.AtMs >= from-int64(election/time.Millisecond) && f.AtMs <= to {
+			inWindow++
+			out = append(out, fmt.Sprintf("  +%4dms FAULT step %d: %s", f.AtMs-from, f.Step, f.What))
+		}
+	}
+	if inWindow == 0 {
+		out = append(out, "  NO injected fault landed inside the window or one election timeout before it — "+
+			"this churn is unexplained by the adversary")
+	}
+
+	// THE SNAPSHOT TRAFFIC, which is where the cause lives if the limbo
+	// hypothesis holds: a MsgSnap dropped to a follower parks it in
+	// StateSnapshot, and nothing in this build reports the outcome, so the
+	// leader never resumes probing it.
+	snapSent, snapDrops := s.net.SnapTraffic()
+	out = append(out, fmt.Sprintf("  MsgSnap traffic: %d sent this run, %d dropped", snapSent, len(snapDrops)))
+	for _, d := range snapDrops {
+		rel := d.AtMs - from
+		when := fmt.Sprintf("+%dms", rel)
+		if rel < 0 {
+			when = fmt.Sprintf("%dms BEFORE the window", -rel)
+		}
+		out = append(out, fmt.Sprintf("    %s MsgSnap node%d->node%d DROPPED (%s)",
+			when, d.From, d.To, d.Reason))
+	}
+
+	// And the tick census per node, which is what says whether ticks failed
+	// inside one tenure or across many.
+	for _, id := range s.liveIDs() {
+		if n, ok := s.nodeAt(id); ok {
+			out = append(out, fmt.Sprintf("  node%d ticks: %s", id, classifyTicks(n.coord.TickSamples())))
+		}
+	}
+	return out
+}
+
+// describeFollowers renders raft's progress table for one sample.
+//
+// StateSnapshot with a PendingSnapshot is the limbo case: the leader has
+// paused log probes to that follower and will not resume until the
+// application calls ReportSnapshot — which this build never does — while the
+// follower's heartbeat responses keep RecentActive true, so CheckQuorum is
+// satisfied and the leader keeps a term it cannot commit in.
+func describeFollowers(fs []server.FollowerProgress) string {
+	if len(fs) == 0 {
+		return "no followers"
+	}
+	parts := make([]string, 0, len(fs))
+	for _, f := range fs {
+		flag := ""
+		if f.State == "StateSnapshot" {
+			flag = " LIMBO?"
+		}
+		parts = append(parts, fmt.Sprintf("node%d=%s match=%d pendingSnap=%d active=%v paused=%v%s",
+			f.ID, strings.TrimPrefix(f.State, "State"), f.Match, f.PendingSnapshot,
+			f.RecentActive, f.Paused, flag))
+	}
+	return strings.Join(parts, " | ")
 }

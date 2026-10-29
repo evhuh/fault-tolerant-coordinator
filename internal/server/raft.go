@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"sort"
 	"sync"
 	"time"
 
@@ -433,6 +434,7 @@ func (c *Coordinator) onLeadershipChanged(isLeader bool) {
 		c.stallMu.Lock()
 		c.leadershipChanges = append(c.leadershipChanges, LeadershipChange{
 			IsLeader: isLeader, Duration: took, Jobs: jobs,
+			AtMs: time.Now().UnixMilli(), Term: c.RaftStatus().Term,
 		})
 		c.stallMu.Unlock()
 	}()
@@ -588,11 +590,108 @@ func (c *Coordinator) restoreState(data []byte) error {
 // position — comparing two nodes at DIFFERENT positions is meaningless, since
 // a node a few entries behind legitimately holds different state.
 // RaftStatus exposes raft's view of this node, for tests and diagnostics.
-func (c *Coordinator) RaftStatus() raft.Status {
+func (c *Coordinator) RaftStatus() RaftInfo {
 	if c.raft == nil {
-		return raft.Status{}
+		return RaftInfo{}
 	}
-	return c.raft.Status()
+	st := c.raft.Status()
+	info := RaftInfo{
+		// GetTerm, never st.Term. See RaftInfo.
+		Term:     st.HardState.GetTerm(),
+		Lead:     st.Lead,
+		State:    st.RaftState.String(),
+		IsLeader: st.RaftState == raft.StateLeader,
+		Commit:   st.HardState.GetCommit(),
+	}
+	// Sorted ids, never a map range: a diagnosis that depends on Go's map
+	// iteration order cannot be diffed between two runs.
+	ids := make([]uint64, 0, len(st.Progress))
+	for id := range st.Progress {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+
+	// The leader itself always acks.
+	acking := 0
+	if info.IsLeader {
+		acking = 1
+	}
+	for _, id := range ids {
+		pr := st.Progress[id]
+		if id == st.ID {
+			continue
+		}
+		f := FollowerProgress{
+			ID: id, State: pr.State.String(), Match: pr.Match, Next: pr.Next,
+			PendingSnapshot: pr.PendingSnapshot, RecentActive: pr.RecentActive,
+			Paused: pr.IsPaused(),
+		}
+		info.Followers = append(info.Followers, f)
+		// Paused covers StateSnapshot unconditionally, which is the limbo
+		// case: raft will send this follower nothing until the application
+		// reports the snapshot's outcome.
+		if f.RecentActive && !f.Paused {
+			acking++
+		}
+	}
+	info.AckingQuorum = acking >= len(st.Progress)/2+1
+	return info
+}
+
+// FollowerProgress is raft's own view of one follower, flattened.
+//
+// IT ANSWERS A QUESTION THE SIMULATOR'S CONNECTIVITY VIEW CANNOT. The
+// frozen-clock invariant exempts itself when the simulator thinks quorum is
+// available, which counts nodes that are UP AND UNPARTITIONED — not nodes
+// that can actually ACK. A follower in StateSnapshot acks nothing: the
+// leader has paused log probes to it and will not resume until the
+// application calls ReportSnapshot. Its heartbeat responses still keep
+// RecentActive true, so CheckQuorum is satisfied and the leader keeps its
+// term while committing nothing.
+//
+// That matches the shape of every frozen-clock window Day 10's checkpoint
+// recorded: one leader, one term, quorum "available", 2.6 seconds of
+// proposals lost. Which of the two a given window was — a follower in limbo
+// or something else — is only visible here, and no window captured before
+// this type existed can answer it.
+type FollowerProgress struct {
+	ID              uint64
+	State           string
+	Match           uint64
+	Next            uint64
+	PendingSnapshot uint64
+	RecentActive    bool
+	Paused          bool
+}
+
+// RaftInfo is raft's view of this node, flattened into plain values.
+//
+// THE TYPE EXISTS TO DELETE A TRAP. raft.Status reaches Term through an
+// embedded *raftpb.HardState, and the field behind it is itself a *uint64, so
+// `st.Term` both nil-dereferences when there is no hard state and compares
+// pointer addresses when two are compared. That trap has now been walked into
+// three times in this repo: Day 8's MsgHup experiment compared addresses, and
+// Day 10 segfaulted a diagnostic run on the nil pointer — after the fix for
+// the first one had written the correct idiom in a comment directly above
+// Status().
+//
+// A comment did not stop it twice, so the type does: nothing outside this
+// function handles a raft.Status, and TestNothingReadsRaftStatusTermDirectly
+// fails if that changes.
+type RaftInfo struct {
+	Term     uint64
+	Lead     uint64
+	State    string
+	IsLeader bool
+	// Commit is the index this node believes committed, and Followers raft's
+	// progress table when this node leads.
+	Commit    uint64
+	Followers []FollowerProgress
+	// AckingQuorum is whether a MAJORITY of the cluster could acknowledge a
+	// proposal right now: the leader itself plus every follower that is not
+	// paused and is recently active. This is the quorum test the frozen-clock
+	// invariant should have been using.
+	AckingQuorum bool
 }
 
 // AppliedIndex is the log position of the state the store currently holds.
@@ -643,6 +742,14 @@ type LeadershipChange struct {
 	IsLeader bool
 	Duration time.Duration
 	Jobs     int
+	// AtMs is when it happened, and Term the raft term it happened in.
+	//
+	// Both are here so a frozen-clock window can COUNT the transitions
+	// inside it instead of inferring a rate from a log tail — and so
+	// transitions closer together than an election timeout, which PreVote is
+	// supposed to prevent, are visible as such.
+	AtMs int64
+	Term uint64
 }
 
 // LeadershipChanges reports the transitions this node went through, in order.

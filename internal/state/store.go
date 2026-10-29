@@ -281,6 +281,19 @@ type Result struct {
 	// Computed identically on every replica, like everything else here; only
 	// an observer meters it.
 	StaleReport bool
+	// TickAdvanced and TickClamped report which of the two things a Tick did.
+	//
+	// They exist because a frozen state-machine clock has TWO causes that
+	// look identical from outside: ticks that never commit, and ticks that
+	// commit and then do nothing because the timestamp they carry is not
+	// ahead of the committed one. The second is a silent no-op — the clamp
+	// below is deliberate and correct, since a clock that moved backwards
+	// could un-expire a lease — but a verifier that cannot tell it from a
+	// failed proposal will diagnose the wrong defect. Day 10's checkpoint
+	// reported "ticks are being dropped silently" from a counter that only
+	// ever counted failures, so a clamp would have been invisible to it.
+	TickAdvanced bool
+	TickClamped  bool
 	// FailedByBudget names the tasks a Tick took terminal FAILED because
 	// their lease lapsed with the attempt budget already spent.
 	//
@@ -719,12 +732,14 @@ func (s *StateStore) applyTick(c *commandpb.Tick) (Result, error) {
 
 	// (1) Clamp. A backwards tick is a no-op, not an error.
 	wasUnset := s.nowMs == 0
+	var res Result
 	if c.GetNowMs() > s.nowMs {
 		s.nowMs = c.GetNowMs()
+		res.TickAdvanced = true
+	} else {
+		res.TickClamped = true
 	}
 	now := s.nowMs
-
-	var res Result
 
 	// (2) Workers whose lease lapsed are LOST; the planner must stop assigning to them. Their tasks are reclaimed by (3) on the same tick
 	for _, id := range s.sortedWorkerIDs() {

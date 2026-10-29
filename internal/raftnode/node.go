@@ -723,6 +723,55 @@ type SnapshotStat struct {
 	Duration time.Duration
 }
 
+// send delivers one message and REPORTS THE OUTCOME BACK TO RAFT.
+//
+// THE REPORT IS THE WHOLE POINT, and its absence was a liveness defect that
+// survived until Day 10. raft puts a follower in StateSnapshot when it sends
+// a snapshot and pauses every log probe to it — Progress.IsPaused() is
+// unconditionally true in that state — until the application calls
+// ReportSnapshot. Nothing here ever did, in either transport, and raft's own
+// documentation names the consequence: the follower "could end up in a limbo,
+// never getting any updates from the leader".
+//
+// Worse, it is SILENT. The parked follower's heartbeat responses keep
+// Progress.RecentActive true, so CheckQuorum is satisfied and the leader
+// keeps its term while committing nothing. Measured deterministically: one
+// dropped MsgSnap, the other follower down, and the leader sat in one term
+// with ackingQuorum=false for six seconds of "proposal lost" —
+// TestDroppedSnapshotDoesNotParkAFollower, which fails without the report
+// below and passes with it.
+//
+// WHAT IS AND IS NOT CLAIMED. The mechanism above is proven and matches the
+// shape of all five frozen-clock windows Day 10's checkpoint recorded — one
+// leader, one term, no transitions, nominal quorum, proposals lost. It is NOT
+// established that those five windows were this: they were captured before
+// the raft-view instrumentation existed, so no window has a progress table
+// showing a follower in StateSnapshot. The evidence that would settle it is a
+// post-fix 64-seed checkpoint under the same adversary: the pre-fix rate was
+// 4 of 64, so zero windows across 64 seeds is about a 2% outcome by chance.
+//
+// Reporting at SEND TIME is sufficient and needs no timeout: both outcomes
+// call BecomeProbe in raft, so probing resumes either way, and if the
+// snapshot never arrived the follower rejects the probe and the leader
+// re-snapshots. Failure additionally clears PendingSnapshot so probing does
+// not resume from a snapshot index that was never applied.
+func (n *Node) send(m *raftpb.Message) {
+	err := n.tp.Send(m)
+
+	if m.GetType() == raftpb.MsgSnap {
+		status := raft.SnapshotFinish
+		if err != nil {
+			status = raft.SnapshotFailure
+		}
+		n.node.ReportSnapshot(m.GetTo(), status)
+	}
+	if err != nil {
+		// Tells raft to stop optimistically streaming to a peer it cannot
+		// reach, which is what etcd's own transport does on a failed send.
+		n.node.ReportUnreachable(m.GetTo())
+	}
+}
+
 // handleReady processes one Ready batch. It returns false when the node must
 // stop.
 //
@@ -799,7 +848,7 @@ func (n *Node) handleReady(rd raft.Ready) bool {
 	// durable actually are.
 	n.phase.Store(phaseSend)
 	for _, m := range rd.Messages {
-		go n.tp.Send(m)
+		go n.send(m)
 	}
 
 	// 3. APPLY

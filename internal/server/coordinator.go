@@ -206,6 +206,7 @@ type Coordinator struct {
 	// every tick looks healthy and has a frozen clock.
 	tickFailMu     sync.Mutex
 	tickFailures   int
+	tickSamples    []TickSample
 	tickFailLogged time.Time
 
 	// stalls records Ready-loop stalls. A non-empty list means something on
@@ -467,7 +468,18 @@ func (c *Coordinator) RunTicker(ctx context.Context) {
 	// one carries a fresher timestamp and the state machine clamps forward.
 	// Crashing a healthy node over it is far worse.
 	tick := func() {
-		_, err := c.propose(tickCmd(c.nowMs()))
+		// EVERY OUTCOME IS RECORDED, not just the failures.
+		//
+		// A frozen state-machine clock has two causes that look the same from
+		// outside — ticks that never commit, and ticks that commit without
+		// advancing anything because their timestamp was clamped — and the
+		// cumulative failure counter could not tell them apart. Day 10's
+		// checkpoint printed that counter next to a six-step frozen-clock
+		// condition as though it measured the window; it measures the node's
+		// lifetime. See noteTick.
+		proposed := c.nowMs()
+		res, err := c.propose(tickCmd(proposed))
+		c.noteTick(proposed, res, err)
 		if err == nil {
 			return
 		}
@@ -643,6 +655,81 @@ func isFatalTickError(err error) bool {
 //
 // Mid-failover these come in bursts, and a line per failure at one tick per
 // 200ms buries everything else in the log exactly when it is being read.
+// TickOutcome is what one Tick proposal did.
+type TickOutcome uint8
+
+const (
+	// TickAdvanced committed and moved the state-machine clock forward.
+	TickAdvanced TickOutcome = iota + 1
+	// TickClamped committed and did NOT move the clock, because the
+	// timestamp it carried was not ahead of the committed one. A deliberate
+	// no-op, and invisible to a failure counter.
+	TickClamped
+	// TickFailed never committed.
+	TickFailed
+)
+
+func (o TickOutcome) String() string {
+	switch o {
+	case TickAdvanced:
+		return "advanced"
+	case TickClamped:
+		return "clamped"
+	case TickFailed:
+		return "failed"
+	}
+	return "unknown"
+}
+
+// TickSample is one Tick proposal's outcome, with what it carried and the
+// raft term it was proposed in.
+//
+// The TERM is the part that turns this from a count into a diagnosis: ticks
+// that fail across leadership changes are a cluster electing, while ticks
+// that fail inside one tenure with quorum are a defect. Those have opposite
+// conclusions and the same symptom.
+type TickSample struct {
+	ProposedMs int64
+	Outcome    TickOutcome
+	Err        string
+	Term       uint64
+	IsLeader   bool
+}
+
+// tickSampleRing bounds what is kept. Several steps' worth at the
+// simulator's tick period, which is all any window needs.
+const tickSampleRing = 256
+
+func (c *Coordinator) noteTick(proposed int64, res state.Result, err error) {
+	s := TickSample{
+		ProposedMs: proposed,
+		IsLeader:   c.IsLeader(),
+		Term:       c.RaftStatus().Term,
+	}
+	switch {
+	case err != nil:
+		s.Outcome, s.Err = TickFailed, err.Error()
+	case res.TickAdvanced:
+		s.Outcome = TickAdvanced
+	default:
+		s.Outcome = TickClamped
+	}
+
+	c.tickFailMu.Lock()
+	c.tickSamples = append(c.tickSamples, s)
+	if len(c.tickSamples) > tickSampleRing {
+		c.tickSamples = c.tickSamples[len(c.tickSamples)-tickSampleRing:]
+	}
+	c.tickFailMu.Unlock()
+}
+
+// TickSamples reports the recent Tick outcomes, oldest first.
+func (c *Coordinator) TickSamples() []TickSample {
+	c.tickFailMu.Lock()
+	defer c.tickFailMu.Unlock()
+	return append([]TickSample(nil), c.tickSamples...)
+}
+
 func (c *Coordinator) noteTickFailure(err error) {
 	c.tickFailMu.Lock()
 	c.tickFailures++

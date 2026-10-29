@@ -428,6 +428,10 @@ type Result struct {
 	// that ends with snapshots near the threshold was about to start
 	// truncating, and would have looked fine until it did.
 	Snapshots []raftnode.SnapshotStat
+	// FrozenClock is the rendered timeline of a frozen-clock window, set
+	// only when that invariant fired. The window reports itself so the
+	// diagnosis does not depend on reproducing a 6%-of-runs finding.
+	FrozenClock []string
 	// HostIOStalls and DowngradedStalls are the stall accounting, reported
 	// on every run.
 	//
@@ -763,6 +767,13 @@ type Sim struct {
 	// worker" was always going to be hiding.
 	cmdOK   string
 	cmdFail string
+	// faultLog is every injected fault with the wall time it landed, so a
+	// frozen-clock window can be asked WHICH fault explains the churn inside
+	// it rather than being correlated by eye against a step number.
+	faultLog []faultEvent
+	// clockLog is one sample per invariant check: the committed clock, who
+	// led, in which term, and whether the exemptions applied.
+	clockLog []clockSample
 	// lastClock is the leader's state-machine clock at the previous check,
 	// and clockFrozenSteps how many checks it has failed to move.
 	lastClock        int64
@@ -1006,6 +1017,46 @@ func (s *Sim) awaitLeader(within time.Duration) *node {
 		time.Sleep(2 * time.Millisecond)
 	}
 	return nil
+}
+
+// faultEvent is one injected fault, timestamped.
+type faultEvent struct {
+	AtMs int64
+	Step int
+	What string
+}
+
+// clockSample is one invariant check's view of the committed clock.
+type clockSample struct {
+	AtMs              int64
+	Step              int
+	ClockMs           int64
+	LeaderID          uint64
+	Term              uint64
+	Quorum            bool
+	LeaderPartitioned bool
+	Paused            bool
+	// Raft is the LEADER'S OWN view at this sample: whether a majority could
+	// actually acknowledge a proposal, and the per-follower progress behind
+	// that answer. The simulator's Quorum field above counts nodes that are
+	// up and unpartitioned, which a follower in StateSnapshot satisfies
+	// while acking nothing.
+	Raft server.RaftInfo
+}
+
+// noteFault logs a fault AND records it with a timestamp.
+//
+// Both, because the two readers want different things: a human reading a
+// verbose run wants the step-ordered narrative, and the frozen-clock window
+// wants to know which faults landed inside a 900ms span. Correlating a step
+// number against raft's own timestamps by eye is how an inference gets
+// reported as a measurement.
+func (s *Sim) noteFault(step int, format string, args ...any) {
+	what := fmt.Sprintf(format, args...)
+	s.mu.Lock()
+	s.faultLog = append(s.faultLog, faultEvent{AtMs: time.Now().UnixMilli(), Step: step, What: what})
+	s.mu.Unlock()
+	s.logf("step %d: %s", step, what)
 }
 
 func (s *Sim) logf(format string, args ...any) {
@@ -1533,7 +1584,7 @@ func (s *Sim) applyFault(step int) {
 		}
 		s.net.Partition(victim)
 		s.result.Faults.Partitions++
-		s.logf("step %d: partition node %d", step, victim)
+		s.noteFault(step, "partition node %d", victim)
 
 	case roll < 70:
 		if protect {
@@ -1560,14 +1611,14 @@ func (s *Sim) applyFault(step int) {
 		s.holdHeal = s.cfg.LeaderPartitionSteps
 		s.result.Faults.Partitions++
 		s.result.Faults.LeaderPartitions++
-		s.logf("step %d: partition LEADER node %d, held for %d steps", step, lead.id, s.holdHeal)
+		s.noteFault(step, "partition LEADER node %d, held for %d steps", lead.id, s.holdHeal)
 
 	case roll < 80:
 		// Heal, and count it: a partition that is never healed is just a
 		// smaller cluster.
 		if s.heal(step) {
 			s.result.Faults.Heals++
-			s.logf("step %d: heal", step)
+			s.noteFault(step, "heal")
 		}
 
 	case roll < 93:
@@ -1590,7 +1641,7 @@ func (s *Sim) applyFault(step int) {
 		}
 		s.stop(victim)
 		s.result.Faults.NodeKills++
-		s.logf("step %d: kill node %d", step, victim)
+		s.noteFault(step, "kill node %d", victim)
 
 	default:
 		// Restart something that is down, from its own disk.
@@ -1598,7 +1649,7 @@ func (s *Sim) applyFault(step int) {
 			if _, up := s.nodeAt(id); !up {
 				if err := s.start(id); err == nil {
 					s.result.Faults.NodeRestarts++
-					s.logf("step %d: restart node %d", step, id)
+					s.noteFault(step, "restart node %d", id)
 				}
 				return
 			}
@@ -1657,8 +1708,8 @@ func (s *Sim) pauseLeader(step int) bool {
 	s.pauseUntilStep = step + s.cfg.PauseSteps
 	s.result.Window = WindowPlan{Fired: true, Step: step, NodeID: lead.id, Paused: true}
 	s.result.Faults.Pauses++
-	s.logf("step %d: PAUSE leader node %d (ticker frozen, inbound held) until step %d",
-		step, lead.id, s.pauseUntilStep)
+	s.noteFault(step, "PAUSE leader node %d (ticker frozen, inbound held) until step %d",
+		lead.id, s.pauseUntilStep)
 	return true
 }
 
@@ -1680,7 +1731,7 @@ func (s *Sim) wakeIfDue(step int) {
 
 	// 1. The process is scheduled again.
 	woken.clk.Resume()
-	s.logf("step %d: WAKE node %d — reading before its queued messages are released", step, woken.id)
+	s.noteFault(step, "WAKE node %d — reading before its queued messages are released", woken.id)
 
 	// 2. Read from it while it is still unaware. One targeted read against
 	// the freshest job the majority committed during the pause.
@@ -1699,7 +1750,7 @@ func (s *Sim) wakeIfDue(step int) {
 			if n, ok := s.nodeAt(id); ok {
 				st := n.coord.RaftStatus()
 				s.logf("    node %d: leader=%v term=%d raftState=%v lead=%d",
-					id, n.coord.IsLeader(), st.HardState.GetTerm(), st.RaftState, st.Lead)
+					id, n.coord.IsLeader(), st.Term, st.State, st.Lead)
 			}
 		}
 	case !woken.coord.IsLeader():
@@ -1813,8 +1864,8 @@ func (s *Sim) injectTargetedWindow(step int) {
 	s.result.Window = WindowPlan{Fired: true, Step: step, NodeID: lead.id}
 	s.result.Faults.Partitions++
 	s.result.Faults.LeaderPartitions++
-	s.logf("step %d: TARGETED partition of LEADER node %d, held for %d steps",
-		step, lead.id, s.holdHeal)
+	s.noteFault(step, "TARGETED partition of LEADER node %d, held for %d steps",
+		lead.id, s.holdHeal)
 }
 
 func quorum(n int) int { return n/2 + 1 }
