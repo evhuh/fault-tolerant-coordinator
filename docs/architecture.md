@@ -617,10 +617,34 @@ The decided semantics:
 What this does to the numbers already taken, stated plainly rather than quietly:
 
 - **Every figure in the Day 10 checkpoint was measured under REPLACE semantics**, including the fault counts (7,089 partitions, 2,448 leader partitions over 64 seeds) — under which a reported leader partition was often not held for as long as it claimed.
-- **The overlap and stale-rejection floors are VOID.** They were calibrated at 0.85 and 1.17 per 100 run-steps against an adversary that cancelled its own partitions; additive isolation is a strictly harsher adversary, and a floor carried across that change would be a number pretending to be a measurement.
-- **Recalibration comes before the next checkpoint**, on the same two-sweep basis as the first calibration, and the new floors carry their n and seed range like every other quoted rate.
+- **The overlap and stale-rejection floors were VOID** and have been recalibrated. They were calibrated at 0.85 and 1.17 per 100 run-steps against an adversary that cancelled its own partitions; additive isolation is a strictly harsher adversary, and a floor carried across that change would be a number pretending to be a measurement.
+- **The new floors are 200 overlapping executions and 300 stale rejections** over 64 seeds x 600 steps, measured on the additive adversary. See "Recalibration under additive isolation" below.
 
 **The experiment this change waited behind is done.** The snapshot-reporting fix was measured over 64 seeds under the OLD replace semantics first, because changing the adversary at the same time would have confounded the only question that run existed to answer. It returned zero frozen-clock windows and is recorded in `results/2026-10-29-checkpoint-a/`. Additive isolation is next, and the floors it needs are recalibrated rather than carried.
+
+### Recalibration under additive isolation
+
+Two 8-seed sweeps at the checkpoint's exact configuration — 600 steps, real workers, the additive adversary — with the floors disabled so the calibration could not fail on the numbers it exists to measure.
+
+| sweep | seeds | run-steps | overlaps | per 100 | stale | per 100 |
+|---|---|---|---|---|---|---|
+| A | 101–108 | 4,800 | 35 | 0.729 | 64 | 1.333 |
+| B | 201–208 | 4,800 | 72 | 1.500 | 106 | 2.208 |
+| pooled | both | 9,600 | 107 | 1.115 | 170 | 1.771 |
+
+Pooled, that projects to about **428 overlaps and 680 stale** over 64 seeds x 600 steps, and the floors sit near half of it: **200 and 300**.
+
+**Why those numbers hold.** The two sweeps disagree by about 2x on overlaps, so the floors are set to survive the LOWER one: sweep A alone projects to about **280 overlaps and 512 stale**, and both clear 200 and 300 with room. Excluding sweep A's richest seed as well still projects 238 overlaps. The justification is deliberately NOT a count of standard deviations away from the pooled mean — the A/B gap is about 2.3 standard errors, so the variance estimated from 16 seeds probably understates the real spread, and a floor argued from that variance would be quoting a confidence it has not earned.
+
+**The 2x gap is seed luck, not the host.** Mean fsync per seed was flat across both sweeps (2,775–3,370µs), fault counts were comparable (1,004 vs 1,032 partitions, 378 vs 386 leader partitions), and the fixed-compute probe averaged 13,295µs in A against 13,735µs in B. Sweep B's pre-run host gate recorded a 78ms worst probe, which was a single outlier that left no trace in any seed.
+
+**Whether sweep A was perturbed: no, as far as the probes can tell.** Three short verification runs were started on the machine during sweep A, inside seed 105's window (seed 105 ran 07:32:28–07:34:55; the runs began at 07:33:00, 07:33:01 and 07:33:10). Seed 105's probes show no degradation — its fixed-compute reading of 12,509µs is mid-range for the sweep, its post-run reading of 9,590µs is the FASTEST of the eight, and its scheduler overshoot of 142/138µs is at the best end. Contention would have made those slower, not faster. Seed 105 is nonetheless sweep A's richest seed at 9 overlaps, so a causal link cannot be excluded from probe data alone; the robustness check above drops it entirely and the floors still hold. The lesson, recorded because it was learned the hard way twice: nothing else runs on the machine during a sweep whose numbers will be quoted.
+
+**Both sweeps were healthy otherwise.** 16 of 16 seeds completed all 600 steps, 16 of 16 reached quiescence and drained, `0 host-io` and `0 unattributable` stalls in both, worst snapshot 65ms against the 125ms threshold. This answers the open question about the harsher adversary: **held partitions do not starve the drain**, so the 600-step bound needed no revisiting.
+
+The full record is in `results/2026-10-30-calibration/`.
+
+### Checkpoint (a)'s coverage numbers
 
 **The coverage numbers from that run are floors-met, not quotable.** 299 overlapping executions against a floor of 160 and 467 stale rejections against a floor of 200, but seed 54 took a 175ms host-I/O stall, which trips the rule that a rate measured on a host that did not sustain the run's timings is re-measured before being quoted. They are superseded by the additive-isolation checkpoint, which is where quotable coverage comes from.
 

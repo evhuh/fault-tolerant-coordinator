@@ -1,0 +1,33 @@
+host gate passed: fsync x40 in /var/folders/3v/0jfghh590nz_ycvrp0qkw12h0000gn/T/: mean 5.346ms, worst 78.01ms
+run 20261030-114229 started 2026-10-30T07:42:29-04:00, rows -> /tmp/ftc-cal/rows-201.jsonl
+seed 201/208: steps=600/600 wall=2m33.68s effects=2335 execs=2678 overlaps=5 stale=13 drained=true lin=Ok(covered=false) stalls=0/0 violations=1
+seed 202/208: steps=600/600 wall=2m33.212s effects=2153 execs=2552 overlaps=7 stale=11 drained=true lin=Ok(covered=false) stalls=0/0 violations=1
+seed 203/208: steps=600/600 wall=2m33.48s effects=1882 execs=2154 overlaps=12 stale=17 drained=true lin=Ok(covered=false) stalls=0/0 violations=1
+seed 204/208: steps=600/600 wall=2m32.714s effects=2141 execs=2516 overlaps=10 stale=16 drained=true lin=Ok(covered=false) stalls=0/0 violations=1
+seed 205/208: steps=600/600 wall=2m34.88s effects=1971 execs=2341 overlaps=14 stale=15 drained=true lin=Ok(covered=false) stalls=0/0 violations=1
+seed 206/208: steps=600/600 wall=2m24.913s effects=1724 execs=1998 overlaps=5 stale=6 drained=true lin=Ok(covered=false) stalls=0/0 violations=1
+seed 207/208: steps=600/600 wall=2m29.678s effects=2008 execs=2392 overlaps=5 stale=10 drained=true lin=Ok(covered=false) stalls=0/0 violations=1
+seed 208/208: steps=600/600 wall=2m31.766s effects=1966 execs=2314 overlaps=14 stale=18 drained=true lin=Ok(covered=false) stalls=0/0 violations=1
+=== DAY 10 CHECKPOINT: 8 seeds x 600 steps, 20m14s of cumulative run time ===
+PROVENANCE: run 20261030-114229, reported 2026-10-30T08:02:46-04:00, rows read from /tmp/ftc-cal/rows-201.jsonl (seeds ran 2026-10-30T07:42:29-04:00 .. 2026-10-30T08:00:14-04:00)
+FAULTS INDUCED: 216 kills, 216 restarts, 1032 partitions, 386 leader partitions, 0 pauses, 452 heals
+EFFECTS: 16180 committed over 18945 executions (700 duplicate reports ignored, 1001 terminal by attempt budget)
+LEDGER COVERAGE: 72 overlapping executions (floor 0), 106 late reports rejected as stale (floor 0)
+  overlaps per run: [5 7 12 10 14 5 5 14]
+  stale per run:    [13 11 17 16 15 6 10 18]
+DRAIN: 8 of 8 runs reached quiescence, 8 of those drained; 8 run(s) completed all 600 steps
+STALLS: 0 host-io, 0 unattributable — the host sustained the run's timings, so these rates are quotable
+SNAPSHOTS: worst 65ms at 1612KB (stall threshold 125ms)
+LINEARIZABILITY: 8 histories, 0 Illegal, 37536 ops checked, 4354 ambiguous (12%), worst check 6ms
+  COVERED: 0 of 8. The shipped configuration closes the split-brain read window by construction — CheckQuorum steps a cut-off leader down in about one election timeout — so these histories could not have exposed a stale read. Zero Illegal here is NOT linearizability evidence; that evidence is the targeted sweeps, which are covered 8/8 and report 8/8 Illegal under local reads against 0/8 under the ReadIndex barrier.
+RACE DETECTOR: deliberately NOT run here. Race instrumentation slows the apply path enough that this run's compressed timings stop holding — measured as 8 to 31 second Ready-loop stalls — so -race coverage lives in `make test` and `make repro` instead.
+FSYNC: worst bracketing probe 4218us (budget 100ms)
+HOST OVER THE RUN (does position in the run predict trouble?):
+FINDING: seed 201: INCONCLUSIVE [linearizability-coverage] seed 201 step 600: history of 5124 operations contained no read that could have been stale (662 ops on a partitioned node, 0 under split brain, 0 split-brain reads, 0 of them targeted) — this run cannot count toward a linearizability claim
+FINDING: seed 202: INCONCLUSIVE [linearizability-coverage] seed 202 step 600: history of 4852 operations contained no read that could have been stale (406 ops on a partitioned node, 9 under split brain, 8 split-brain reads, 0 of them targeted) — this run cannot count toward a linearizability claim
+FINDING: seed 203: INCONCLUSIVE [linearizability-coverage] seed 203 step 600: history of 4235 operations contained no read that could have been stale (505 ops on a partitioned node, 0 under split brain, 0 split-brain reads, 0 of them targeted) — this run cannot count toward a linearizability claim
+FINDING: seed 204: INCONCLUSIVE [linearizability-coverage] seed 204 step 600: history of 5100 operations contained no read that could have been stale (558 ops on a partitioned node, 14 under split brain, 11 split-brain reads, 0 of them targeted) — this run cannot count toward a linearizability claim
+FINDING: seed 205: INCONCLUSIVE [linearizability-coverage] seed 205 step 600: history of 4602 operations contained no read that could have been stale (737 ops on a partitioned node, 3 under split brain, 1 split-brain reads, 0 of them targeted) — this run cannot count toward a linearizability claim
+FINDING: seed 206: INCONCLUSIVE [linearizability-coverage] seed 206 step 600: history of 4107 operations contained no read that could have been stale (498 ops on a partitioned node, 5 under split brain, 5 split-brain reads, 0 of them targeted) — this run cannot count toward a linearizability claim
+FINDING: seed 207: INCONCLUSIVE [linearizability-coverage] seed 207 step 600: history of 4888 operations contained no read that could have been stale (601 ops on a partitioned node, 0 under split brain, 0 split-brain reads, 0 of them targeted) — this run cannot count toward a linearizability claim
+FINDING: seed 208: INCONCLUSIVE [linearizability-coverage] seed 208 step 600: history of 4628 operations contained no read that could have been stale (577 ops on a partitioned node, 5 under split brain, 4 split-brain reads, 0 of them targeted) — this run cannot count toward a linearizability claim
