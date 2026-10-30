@@ -293,23 +293,21 @@ func (s *Service) RequestTask(ctx context.Context, req *schedulerpb.RequestTaskR
 
 // heldTask returns the task this worker currently holds, if any.
 //
-// The scan is over SORTED ids so the answer never depends on map iteration
+// Answered from the worker->tasks index, so the cost is bounded by this
+// worker's capacity rather than by the size of the cluster's task map. It used
+// to sort EVERY task id in the store, on every pass of the long poll, under
+// the apply lock — 540-695ms Ready-loop stalls in apply at 10,000 tasks with
+// 256 pollers. See "No O(state) work under the apply lock on an RPC path" in
+// docs/architecture.md.
+//
+// The index returns ids SORTED, so the answer never depends on map iteration
 // order. A worker holding several tasks (capacity > 1) gets the lowest-sorted
 // one it has not yet claimed locally; the worker dedups its own claims.
 func (s *Service) heldTask(workerID string) (state.Task, bool) {
 	var out state.Task
 	var found bool
 	s.c.read(func(st *state.StateStore) {
-		for _, id := range st.TaskIDs() {
-			t, ok := st.Task(id)
-			if !ok || t.WorkerID != workerID {
-				continue
-			}
-			if t.State == state.TaskAssigned {
-				out, found = t, true
-				return
-			}
-		}
+		out, found = st.AssignedTaskFor(workerID)
 	})
 	return out, found
 }

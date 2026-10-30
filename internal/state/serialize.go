@@ -185,6 +185,11 @@ func (s *StateStore) Restore(data []byte) error {
 
 	s.jobs, s.tasks, s.workers, s.evals, s.sessions = jobs, tasks, workers, evals, sessions
 	s.nowMs = snap.GetNowMs()
+	// DERIVED STATE IS REBUILT, not restored. tasksByWorker is not in the
+	// snapshot — it carries no version and the wire format is unchanged — so
+	// it has to be recomputed from the tasks just installed. Doing it here
+	// rather than in the caller means no future restore path can forget.
+	s.rebuildTasksByWorker()
 	return nil
 }
 

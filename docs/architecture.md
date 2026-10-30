@@ -779,6 +779,53 @@ So the claim is: the mechanism is proven, the fix is verified by a deterministic
 
 Fixed in `29644d1`. The full record is in `results/2026-10-29-checkpoint-a/`, and the running order is in the roadmap's "Day 10 — HANDOFF" section.
 
+### No O(state) work under the apply lock on an RPC path
+
+**The rule: an RPC handler must not do work proportional to total state while holding `c.mu`.** `Coordinator.read` takes the same mutex `applyCommitted` takes to apply committed entries, so an RPC that scans the whole store under it does not merely answer slowly — it stops the Ready loop, and a Ready loop stopped for longer than an election timeout costs leadership.
+
+Day 11's benchmark found one. `Service.heldTask`, answering "which task does worker W hold", called `StateStore.TaskIDs()` — which allocates and SORTS every task id in the store — and then scanned the result linearly. It ran on every pass of the `RequestTask` long poll, with 256 pollers (8 workers x concurrency 32).
+
+Measured on a real 3-node cluster at 10,000 tasks: **Ready-loop stalls of 540-695ms in the `apply` phase** on multiple nodes, **7-9 leadership changes per 30-second window**, commit latency **322-696ms**, and almost nothing completing. The CPU profile is the thing that named it: 18% CPU over 20s with 59% of samples in `pthread_cond_signal`/`pthread_cond_wait`, and the only application function present was `heldTask` at 16% cumulative, reaching `sortedTaskIDs` through `pdqsortOrdered`. It was not a CPU problem; it was **lock hold time serializing against apply**. Three plausible per-apply culprits — `applyRegisterWorker`'s scan per heartbeat, `recomputeJobState` per completion, and the tick scans — were all checked against the profile and none appeared (`applyTick` at 0.83%).
+
+The fix is a worker->tasks index, `StateStore.tasksByWorker`:
+
+- **Derived state.** Not serialized, no snapshot or command version change, rebuilt from the tasks map by `rebuildTasksByWorker` inside `Restore` — so a restore path cannot forget it.
+- **Maintained inside `Apply`**, at every transition that changes a task's `WorkerID`, through `setTaskWorker` — the single place that field is assigned. Seven call sites were routed through it, because an index maintained at six is an index that is wrong at the seventh.
+- **Deterministic**, like everything else in the state machine: `TasksHeldBy` returns ids SORTED, so two replicas never answer the same question differently even on a read path.
+
+Verified two ways. `TestTasksByWorkerIndexMatchesAFullScan` walks 40 random command sequences — dispatch, completion, retryable and terminal failure, lease expiry, heartbeats claiming nothing, snapshot+restore — and compares the index against a full scan after **every** step, continuing from the restored store so a bad rebuild poisons all later steps. It was confirmed to fire: a mutation that skips de-indexing on clear reports `worker "w-0" holds [t-01 t-02] by scan, [t-01 t-02 t-03] by index`, and commenting out the rebuild reports `index covers 0 worker(s), a full scan finds 2`.
+
+`TestAssignedTaskForCostIsFlatInStateSize` is the regression test, asserted as a RATIO rather than an absolute duration so it is not a statement about one laptop:
+
+| tasks in store | before | after |
+|---|---|---|
+| 1,000 | 73.7µs | 119ns |
+| 10,000 | 906.7µs | 96ns |
+| 50,000 | 5.19ms | 72ns |
+
+Before the fix the cost grew 12.3x and 70.4x with the state; after it, it is flat.
+
+**What the fix bought, measured on the same real cluster.** The 10,000-task scenario that produced 540-695ms apply stalls and 7-9 leadership changes per window now runs clean, and the degradation that remains is gradual rather than a cliff:
+
+| tasks in store | stalls | leadership changes | commit latency | assignments/s |
+|---|---|---|---|---|
+| 10,000 | 0 | 1 (initial election) | 30.8ms | 29.4 |
+| 50,000 | 0 | 1 (initial election) | 35.9ms | 23.8 |
+| 150,000 | 0 | 1 (initial election) | 220.8ms | 3.8 |
+
+**There is no new stall boundary up to 150,000 tasks** — the Ready loop never exceeded the 500ms threshold at any size tested. What replaces the cliff is a CPU ceiling, and a second profile at 150,000 tasks attributes it rather than guessing: the process is CPU-bound (138% over 20s), and the cost is almost entirely sorting and scanning the task map on the SCHEDULER and TICK paths, not the RPC path:
+
+- `sortedTaskIDs` accounts for **87.6%** of all sort time (8.03s of 9.17s) — the tick-path callers noted below.
+- `StateStore.Snapshot` accounts for the other **12.4%**, sorting 150,000 ids to build each planning snapshot.
+- `Snapshot.InFlight` is **18.5% cumulative**, called per worker from `computePlan` and scanning every task each time: O(workers x tasks) per plan.
+
+So the honest statement of scale is: **correct and stall-free to at least 150,000 tasks, with useful throughput to roughly 50,000.** Beyond that the scheduler's per-plan scans dominate and throughput falls about 6x while latency rises about 6x. Fixing that is a second index (in-flight counts per worker) plus a cheaper planning snapshot, and it is deliberately NOT done here — the defect that cost leadership is fixed, and this one degrades gracefully and is now measured.
+
+**Two limits this does NOT remove**, recorded rather than left to be rediscovered:
+
+- **`sortedTaskIDs` still has four other callers**, three on Tick paths in `store.go` and one in `serialize.go`'s `Encode`. They run under the apply lock on the APPLY path rather than an RPC path, so the rule above does not forbid them, and the profile put `applyTick` at 0.83% — but they are the same O(n log n)-per-entry shape and they are the next thing to bite as state grows. The tick cost is paid once per tick; the RPC cost was paid once per poll per worker, which is why that one was fatal first.
+- **The `RequestTask` long poll SPINS on a 50ms interval; it does not wait on a notification.** `pollInterval` exists so the poll never holds `c.mu` while it waits — take the lock, look, release, sleep, repeat — which is correct and was deliberate. The consequence is a floor on wake-ups: 256 pollers at 50ms is ~5,120 lock acquisitions per second whatever the state size. Cheap now that each one is ~100ns, and the reason the old scan was multiplied into a stall. A notification-based wake-up would remove the floor entirely and is not needed at this scale.
+
 ### A proposal's context hangs off leadership
 
 `node.Propose` blocks until raft ACCEPTS the entry, and the goroutine that accepts it is the Ready loop. A proposal still in flight when leadership is lost is therefore waiting on the loop that is inside `revokeLeadership`, waiting for the scheduler worker that is waiting for the proposal. `failAll` does not break it: that releases registered *waiters*, and such a caller never reached its waiter.

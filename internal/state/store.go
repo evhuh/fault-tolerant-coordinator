@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"slices"
 	"sort"
 
 	commandpb "github.com/evazheng/fault-tolerant-coordinator/proto/commandpb"
@@ -418,6 +419,23 @@ type StateStore struct {
 	// policy is fixed at construction and never changes for the life of the
 	// store. It must be identical on every replica — see Policy.
 	policy Policy
+
+	// tasksByWorker indexes tasks by the worker currently holding them:
+	// tasksByWorker[w] holds exactly the ids whose Task.WorkerID == w.
+	//
+	// DERIVED STATE. It is not serialized, carries no command or snapshot
+	// version, and is rebuilt from the tasks map on restore — so adding it
+	// changes no wire format and needs no version bump. It is maintained
+	// inside Apply at every transition that changes a task's WorkerID, which
+	// makes it deterministic on every replica like everything else here.
+	//
+	// It exists because answering "which task does worker W hold" used to
+	// sort EVERY task id in the store. That sort ran on the RequestTask long
+	// poll, under the apply lock, 256 pollers at a time: measured as 540-695ms
+	// Ready-loop stalls in apply at 10,000 tasks, with leadership changing 7
+	// to 9 times in a 30-second window. The profile is in
+	// results/2026-10-30-day11-profile/.
+	tasksByWorker map[string]map[string]struct{}
 }
 
 // New builds a store with production policy.
@@ -433,6 +451,8 @@ func NewWithPolicy(p Policy) *StateStore {
 		workers:  make(map[string]*Worker),
 		evals:    make(map[string]*Eval),
 		sessions: make(map[sessionKey]session), // for (clientID, requestID) dedup
+
+		tasksByWorker: make(map[string]map[string]struct{}),
 	}
 }
 
@@ -813,7 +833,7 @@ func (s *StateStore) applyTick(c *commandpb.Tick) (Result, error) {
 		if workerLost {
 			reason = EvalWorkerLost
 		}
-		t.WorkerID = ""
+		s.setTaskWorker(t, "")
 		t.LeaseExpiryMs = 0
 
 		// The attempt budget is shared by both failure paths. FailTask retries
@@ -888,7 +908,7 @@ func (s *StateStore) applyPlan(c *commandpb.ApplyPlan, version uint32) (Result, 
 			continue
 		}
 		t.State = TaskPending
-		t.WorkerID = ""
+		s.setTaskWorker(t, "")
 		t.LeaseExpiryMs = 0
 		t.LastError = st.GetReason()
 		res.PlanApplied++
@@ -937,7 +957,7 @@ func (s *StateStore) applyPlan(c *commandpb.ApplyPlan, version uint32) (Result, 
 		seen[a.GetTaskId()] = true
 		t.State = TaskAssigned
 		t.NotBeforeMs = 0 // dispatched; the backoff is spent
-		t.WorkerID = a.GetWorkerId()
+		s.setTaskWorker(t, a.GetWorkerId())
 		t.Attempt = a.GetAttempt()
 		t.LeaseExpiryMs = a.GetLeaseExpiryMs()
 		res.PlanApplied++
@@ -1026,7 +1046,7 @@ func (s *StateStore) applyCompleteTask(c *commandpb.CompleteTask) (Result, error
 	t.State = TaskComplete
 	t.ResultRef = c.GetResultRef()
 	t.ExitCode = c.GetExitCode()
-	t.WorkerID = c.GetWorkerId()
+	s.setTaskWorker(t, c.GetWorkerId())
 	t.LeaseExpiryMs = 0
 	t.LastError = ""
 
@@ -1062,7 +1082,7 @@ func (s *StateStore) applyFailTask(c *commandpb.FailTask) (Result, error) {
 
 	res := Result{JobID: t.JobID}
 	t.LastError = c.GetError()
-	t.WorkerID = ""
+	s.setTaskWorker(t, "")
 	t.LeaseExpiryMs = 0
 
 	if c.GetRetryable() && t.Attempt < t.Spec.MaxAttempts {
@@ -1285,7 +1305,7 @@ func (s *StateStore) applyPlanAllOrNothing(c *commandpb.ApplyPlan) (Result, erro
 	for _, st := range c.GetStops() {
 		t := s.tasks[st.GetTaskId()]
 		t.State = TaskPending
-		t.WorkerID = ""
+		s.setTaskWorker(t, "")
 		t.LeaseExpiryMs = 0
 		t.LastError = st.GetReason()
 		res.PlanApplied++
@@ -1293,7 +1313,7 @@ func (s *StateStore) applyPlanAllOrNothing(c *commandpb.ApplyPlan) (Result, erro
 	for _, a := range c.GetAssignments() {
 		t := s.tasks[a.GetTaskId()]
 		t.State = TaskAssigned
-		t.WorkerID = a.GetWorkerId()
+		s.setTaskWorker(t, a.GetWorkerId())
 		t.Attempt = a.GetAttempt()
 		t.LeaseExpiryMs = a.GetLeaseExpiryMs()
 		res.PlanApplied++
@@ -1315,4 +1335,90 @@ func (s *StateStore) CorruptForTesting(taskID string) {
 	if t, ok := s.tasks[taskID]; ok {
 		t.State = TaskPending // worker and lease deliberately left behind
 	}
+}
+
+// setTaskWorker moves a task between workers and keeps tasksByWorker exact.
+//
+// THE ONLY PLACE Task.WorkerID is assigned. Every transition goes through it —
+// dispatch, completion, failure, reclaim, worker loss and restore — because an
+// index maintained at six call sites is an index that is wrong at the seventh.
+// TestTasksByWorkerIndexMatchesAFullScan walks random command sequences and
+// compares against a full scan after every step.
+func (s *StateStore) setTaskWorker(t *Task, workerID string) {
+	if t.WorkerID == workerID {
+		return
+	}
+	if old := t.WorkerID; old != "" {
+		if set := s.tasksByWorker[old]; set != nil {
+			delete(set, t.ID)
+			// Emptied sets are REMOVED rather than left behind. A worker that
+			// comes and goes would otherwise accumulate one empty map each
+			// time, which is a leak in an always-on coordinator.
+			if len(set) == 0 {
+				delete(s.tasksByWorker, old)
+			}
+		}
+	}
+	t.WorkerID = workerID
+	if workerID == "" {
+		return
+	}
+	set := s.tasksByWorker[workerID]
+	if set == nil {
+		set = make(map[string]struct{})
+		s.tasksByWorker[workerID] = set
+	}
+	set[t.ID] = struct{}{}
+}
+
+// rebuildTasksByWorker recomputes the index from the tasks map.
+//
+// Called after a snapshot restore, which replaces the maps wholesale. Derived
+// state that is not serialized has to be rebuilt somewhere, and doing it here
+// rather than in the caller means a future restore path cannot forget.
+func (s *StateStore) rebuildTasksByWorker() {
+	s.tasksByWorker = make(map[string]map[string]struct{}, len(s.workers))
+	for id, t := range s.tasks {
+		if t.WorkerID == "" {
+			continue
+		}
+		set := s.tasksByWorker[t.WorkerID]
+		if set == nil {
+			set = make(map[string]struct{})
+			s.tasksByWorker[t.WorkerID] = set
+		}
+		set[id] = struct{}{}
+	}
+}
+
+// TasksHeldBy returns the ids this worker holds, SORTED.
+//
+// Sorted because the caller's answer must not depend on map iteration order:
+// two replicas answering the same question differently is the divergence this
+// package exists to prevent, even on a read path.
+func (s *StateStore) TasksHeldBy(workerID string) []string {
+	set := s.tasksByWorker[workerID]
+	if len(set) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(set))
+	for id := range set {
+		out = append(out, id)
+	}
+	slices.Sort(out)
+	return out
+}
+
+// AssignedTaskFor returns the task this worker has been dispatched and has not
+// yet started, if any. O(tasks held by this worker) — bounded by the worker's
+// capacity — rather than O(all tasks in the cluster).
+func (s *StateStore) AssignedTaskFor(workerID string) (Task, bool) {
+	for _, id := range s.TasksHeldBy(workerID) {
+		t, ok := s.tasks[id]
+		if !ok || t.State != TaskAssigned {
+			continue
+		}
+		return *t, true
+	}
+	return Task{}, false
 }
