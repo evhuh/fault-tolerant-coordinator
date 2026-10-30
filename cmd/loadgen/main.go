@@ -53,6 +53,8 @@ func main() {
 	tasksPerJob := flag.Int("tasks-per-job", 1, "tasks in each submitted job")
 	submitters := flag.Int("submitters", 64, "concurrent submitter goroutines")
 	command := flag.String("command", "", "task command; default resolves true(1) on this host")
+	taskArgs := flag.String("task-args", "", "comma-separated args for the task command, e.g. 30 for sleep")
+	taskTimeout := flag.Duration("task-timeout", 5*time.Second, "per-task timeout the coordinator enforces")
 	timeout := flag.Duration("timeout", 5*time.Second, "per-request deadline")
 	maxBacklog := flag.Float64("max-backlog", 2, "abort if undispatched slots exceed this many seconds of offered rate")
 	out := flag.String("out", "", "write the result as JSON to this path")
@@ -99,7 +101,8 @@ func main() {
 	//
 	// So: submit the backlog with NO workers connected, then start the pool.
 	if *prefill > 0 {
-		n := prefillJobs(ctx, pool, cmdPath, *prefill, *tasksPerJob, *submitters, *timeout)
+		n := prefillJobs(ctx, pool, cmdPath, splitAddrs(*taskArgs), *taskTimeout,
+			*prefill, *tasksPerJob, *submitters, *timeout)
 		log.Printf("prefill: %d of %d jobs submitted", n, *prefill)
 		if n < *prefill {
 			os.Exit(1)
@@ -114,6 +117,8 @@ func main() {
 		duration:       *duration,
 		tasksPerJob:    *tasksPerJob,
 		command:        cmdPath,
+		args:           splitAddrs(*taskArgs),
+		taskTimeout:    *taskTimeout,
 		timeout:        *timeout,
 		maxBacklog:     int64(*maxBacklog * *rate),
 		label:          *label,
@@ -154,6 +159,8 @@ type run struct {
 	duration       time.Duration
 	tasksPerJob    int
 	command        string
+	args           []string
+	taskTimeout    time.Duration
 	timeout        time.Duration
 	maxBacklog     int64
 	label          string
@@ -433,7 +440,8 @@ func (r *run) taskSpecs() []*schedulerpb.TaskSpec {
 	for i := range specs {
 		specs[i] = &schedulerpb.TaskSpec{
 			Command:     r.command,
-			TimeoutMs:   5000,
+			Args:        r.args,
+			TimeoutMs:   r.taskTimeout.Milliseconds(),
 			MaxAttempts: 3,
 		}
 	}
@@ -520,8 +528,8 @@ func splitAddrs(s string) []string {
 
 // prefillJobs submits as fast as the cluster will accept, with no schedule and
 // no latency measurement: the only output that matters is how many landed.
-func prefillJobs(ctx context.Context, pool *client.Pool, command string,
-	jobs, tasksPerJob, submitters int, timeout time.Duration) int {
+func prefillJobs(ctx context.Context, pool *client.Pool, command string, args []string,
+	taskTimeout time.Duration, jobs, tasksPerJob, submitters int, timeout time.Duration) int {
 
 	var ok atomic.Int64
 	work := make(chan int, submitters*2)
@@ -533,7 +541,8 @@ func prefillJobs(ctx context.Context, pool *client.Pool, command string,
 			clientID := fmt.Sprintf("prefill-%d", id)
 			specs := make([]*schedulerpb.TaskSpec, tasksPerJob)
 			for j := range specs {
-				specs[j] = &schedulerpb.TaskSpec{Command: command, TimeoutMs: 5000, MaxAttempts: 3}
+				specs[j] = &schedulerpb.TaskSpec{Command: command, Args: args,
+					TimeoutMs: taskTimeout.Milliseconds(), MaxAttempts: 3}
 			}
 			for seq := range work {
 				rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)

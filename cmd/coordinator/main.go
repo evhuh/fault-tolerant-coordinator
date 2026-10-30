@@ -8,6 +8,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -114,6 +115,51 @@ func main() {
 		mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
 		mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
 		mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+		// /debug/workers exists so a BENCHMARK can define t=0 exactly.
+		//
+		// Worker reclaim latency is measured from the last heartbeat
+		// RECEIVED, which is `lease_expiry_ms - leaseTTL` in committed state.
+		// Nothing outside the process could read that, so the Day 11 trial
+		// would have had to infer t=0 instead of knowing it.
+		//
+		// Read-only, and on the private listener rather than the client API:
+		// it bypasses the NOT_LEADER guard and reports one node's local view,
+		// so it is a debugging surface in the same category as pprof and must
+		// never be mistaken for an API. It reports the committed clock
+		// alongside the leases, because a lease expiry means nothing without
+		// the clock it is compared against.
+		mux.HandleFunc("/debug/workers", func(w http.ResponseWriter, r *http.Request) {
+			type workerView struct {
+				ID            string   `json:"worker_id"`
+				State         string   `json:"state"`
+				RegisteredMs  int64    `json:"registered_ms"`
+				LeaseExpiryMs int64    `json:"lease_expiry_ms"`
+				Capacity      int32    `json:"capacity"`
+				HeldTaskIDs   []string `json:"held_task_ids"`
+			}
+			out := struct {
+				NowMs    int64        `json:"now_ms"`
+				WallMs   int64        `json:"wall_ms"`
+				IsLeader bool         `json:"is_leader"`
+				Workers  []workerView `json:"workers"`
+			}{WallMs: time.Now().UnixMilli(), IsLeader: coord.IsLeader()}
+			coord.ReadState(func(st *state.StateStore) {
+				out.NowMs = st.NowMs()
+				for _, id := range st.WorkerIDs() {
+					wk, ok := st.Worker(id)
+					if !ok {
+						continue
+					}
+					out.Workers = append(out.Workers, workerView{
+						ID: wk.ID, State: wk.State.String(),
+						RegisteredMs: wk.RegisteredMs, LeaseExpiryMs: wk.LeaseExpiryMs,
+						Capacity: wk.Capacity, HeldTaskIDs: st.TasksHeldBy(id),
+					})
+				}
+			})
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(out)
+		})
 		ms := &http.Server{Addr: *metricsAddr, Handler: mux}
 		go func() {
 			if err := ms.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -124,6 +170,13 @@ func main() {
 		}()
 		defer ms.Close()
 		go sampleGauges(coord, *metricsSample)
+		// The listener carries pprof and /debug/workers, so a non-loopback
+		// bind is worth saying out loud rather than discovering later.
+		if h, _, err := net.SplitHostPort(*metricsAddr); err != nil || !isLoopback(h) {
+			log.Printf("WARNING: metrics listener %s is not loopback-bound, and it serves "+
+				"pprof and /debug/workers — bind it to 127.0.0.1 unless the network is trusted",
+				*metricsAddr)
+		}
 		log.Printf("metrics on %s/metrics and pprof on %s/debug/pprof/, gauges resampled every %s",
 			*metricsAddr, *metricsAddr, *metricsSample)
 	}
@@ -235,4 +288,17 @@ func sampleGauges(coord *server.Coordinator, every time.Duration) {
 		ready, blocked := coord.BrokerStats()
 		metrics.Sample(pending, assigned, running, ready+blocked)
 	}
+}
+
+// isLoopback reports whether a listen host is unambiguously local. An empty
+// host means "all interfaces", which is the case the warning exists for.
+func isLoopback(host string) bool {
+	if host == "" {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
