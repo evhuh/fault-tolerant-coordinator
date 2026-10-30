@@ -531,12 +531,18 @@ const (
 	// budget, so the disk is not what blocked the loop.
 	//
 	// Inconclusive for that seed, and labelled as a KNOWN PRODUCT LIMITATION
-	// rather than a host failure, because the cost is systematic rather than
-	// environmental: `maybeSnapshot` serializes, fsyncs and compacts INSIDE the
-	// Ready loop, `Encode` is linear at about 6.5ms/MB, and a large enough
-	// state exceeds the stall threshold on any disk. Measured twice: 91ms at
-	// 1.43MB under replace semantics, 133ms at 1.60MB under additive
-	// isolation, against a 125ms threshold.
+	// rather than a host failure, because of WHERE the work happens:
+	// `maybeSnapshot` serializes, fsyncs and compacts INSIDE the Ready loop,
+	// so an fsync tail stops the node processing raft messages for its whole
+	// duration.
+	//
+	// Not size-driven, which is worth stating because the obvious reading is
+	// wrong. Serialization runs at about 6.5ms/MB, so a 1.6MB state accounts
+	// for roughly 10ms; two worst-case observations of 91ms at 1.43MB and
+	// 133ms at 1.60MB, against a 125ms threshold, are therefore a disk tail
+	// landing inside the snapshot rather than a state that outgrew the
+	// budget. The limitation is that the loop is exposed to tail latency at
+	// all, which asynchronous snapshotting removes.
 	//
 	// Distinct from KindHostIO deliberately. Calling this one host-io blames
 	// the machine for the program's own design and fires the "the host did not

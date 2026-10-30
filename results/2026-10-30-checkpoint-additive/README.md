@@ -33,12 +33,16 @@ FINDING: seed 3: INCONCLUSIVE [snapshot-budget] seed 3 step 308: node 2 Ready lo
 SNAPSHOTS: worst 133ms at 1601KB (stall threshold 125ms)
 ```
 
-Seed 3's bracketing host probes stayed inside the gate's budget — fsync mean 3,188µs before and 9,061µs after, worst 19,067µs, against 12ms mean and 100ms worst — so the disk is not what blocked the loop.
-The cost is systematic: `maybeSnapshot` serializes, fsyncs and compacts inside the Ready loop, `Encode` is linear at about 6.5ms/MB, and a large enough state exceeds the threshold on any disk.
-It is therefore classified `snapshot-budget`, inconclusive for that seed and labelled a known product limitation, and it deliberately does NOT fire the "the host did not sustain the run's timings" banner — re-measuring on a quieter machine would reproduce it.
+Seed 3's bracketing host probes stayed inside the gate's budget — fsync mean 3,188µs before and 9,061µs after, worst 19,067µs, against 12ms mean and 100ms worst — so the host was not failing the run's premise.
+What happened instead is an **fsync tail landing inside the synchronous snapshot**: `maybeSnapshot` serializes, fsyncs and compacts inside the Ready loop, so the node processes no raft messages for the whole of it.
+It is therefore classified `snapshot-budget`, inconclusive for that seed and labelled a known product limitation, and it deliberately does NOT fire the "the host did not sustain the run's timings" banner.
 
-Worth stating because it is the one judgement call: seed 3's post-run worst probe of 19ms was the highest of the 64 seeds, roughly four times typical, though still well inside the 100ms budget.
-The classification follows the stated rule; a stricter probe budget would flip this seed to `host-io`.
+**It is not size-driven**, which is the obvious reading and the wrong one.
+Serialization runs at about 6.5ms/MB, so a 1.6MB state accounts for roughly **10ms** — and the step from 1.43MB to 1.60MB is about 1ms, which cannot explain 91ms rising to 133ms.
+The two figures are two worst-case observations, not a growth trend.
+Seed 3's post-run worst probe of 19ms was the highest of the 64 seeds, roughly four times typical though well inside the 100ms budget, which is the shape of a tail rather than of a load.
+The limitation is that the Ready loop is exposed to disk tail latency at all; asynchronous snapshotting removes that, and a quieter machine only shortens the tail.
+The classification follows the stated rule, and a stricter probe budget would flip this seed to `host-io`.
 
 ## What is in here
 

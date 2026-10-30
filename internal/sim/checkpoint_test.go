@@ -689,10 +689,10 @@ func relabelStall(r checkpointRow, finding string) string {
 		" — the SNAPSHOT exceeded this run's compressed timings while the host's own probes stayed "+
 			"inside the gate's budget (fsync mean %dus before and %dus after, worst %dus, against "+
 			"12ms mean and 100ms worst), so this is a KNOWN PRODUCT LIMITATION rather than a host "+
-			"failure: the snapshot is serialized, fsynced and compacted inside the Ready loop at "+
-			"about 6.5ms/MB, so a large enough state exceeds the threshold on any disk. The seed is "+
-			"inconclusive and asynchronous snapshotting is the fix; re-measuring on a quieter "+
-			"machine would reproduce it.",
+			"failure: the snapshot is serialized, fsynced and compacted inside the Ready loop, "+
+			"which exposes the loop to an fsync TAIL — serialization itself is only about 10ms at "+
+			"1.6MB, so size does not explain this. The seed is inconclusive and asynchronous "+
+			"snapshotting is the fix; a quieter machine has a shorter tail but still has one.",
 		r.FsyncBeforeMeanUs, r.FsyncAfterMeanUs, r.FsyncAfterWorstUs)
 }
 
