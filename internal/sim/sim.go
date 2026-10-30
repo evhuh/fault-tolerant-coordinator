@@ -28,6 +28,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -699,9 +700,16 @@ type Sim struct {
 	// stepNo is the fault step currently running, read by the recorded
 	// clients to pace themselves against the schedule.
 	stepNo atomic.Int64
-	// holdHeal counts down the steps during which healing is refused, so a
-	// deliberately-held partition is not undone by the next quiet step.
-	holdHeal int
+	// heldUntil maps a deliberately-isolated node to the step at which its
+	// hold expires, so a held partition is not undone by the next quiet step
+	// and is not cancelled by the next partition of somebody else either.
+	//
+	// Per node, and a step DEADLINE rather than a countdown, because both
+	// alternatives were measured wrong. One shared counter made any heal
+	// anywhere shorten an unrelated hold, and a countdown decremented only on
+	// heal attempts meant "held for 3 steps" actually meant three heal rolls,
+	// which is about five steps and varies with the seed.
+	heldUntil map[uint64]int
 	// targetedPartitionStep is the step at which targeted mode INJECTS a
 	// held leader partition, drawn once from the run's seed.
 	targetedPartitionStep int
@@ -1134,6 +1142,9 @@ func (s *Sim) Run(ctx context.Context) (Result, error) {
 		}
 
 		s.stepNo.Store(int64(step))
+		// BEFORE the fault roll: a hold that is due ends on its own schedule,
+		// not when the schedule next happens to roll a heal.
+		s.releaseExpiredHolds(step)
 		s.applyFault(step)
 		// The worker pause rides along with the fault step but is its own
 		// injection: it aims at a worker that is executing right now, which
@@ -1182,7 +1193,7 @@ func (s *Sim) Run(ctx context.Context) (Result, error) {
 	// check is against a converged cluster rather than mid-chaos. A system
 	// that is briefly inconsistent under partition is expected; one that
 	// stays inconsistent after healing is broken.
-	s.net.Heal()
+	s.healAll()
 	for id := uint64(1); id <= uint64(s.cfg.Nodes); id++ {
 		if _, up := s.nodeAt(id); !up {
 			_ = s.start(id)
@@ -1608,10 +1619,11 @@ func (s *Sim) applyFault(step int) {
 			return
 		}
 		s.net.Partition(lead.id)
-		s.holdHeal = s.cfg.LeaderPartitionSteps
+		s.hold(lead.id, step)
 		s.result.Faults.Partitions++
 		s.result.Faults.LeaderPartitions++
-		s.noteFault(step, "partition LEADER node %d, held for %d steps", lead.id, s.holdHeal)
+		s.noteFault(step, "partition LEADER node %d, held until step %d",
+			lead.id, s.heldUntil[lead.id])
 
 	case roll < 80:
 		// Heal, and count it: a partition that is never healed is just a
@@ -1657,21 +1669,80 @@ func (s *Sim) applyFault(step int) {
 	}
 }
 
-// heal removes every partition unless one is being deliberately held, and
-// reports whether it actually healed.
+// hold marks a node's partition as deliberately held, until
+// LeaderPartitionSteps steps from now.
 //
 // The hold exists because the quiet step heals, and quiet is the most common
 // step. A leader partition that is not protected lasts, on average, under two
 // steps and frequently exactly none — which is how the first runs managed two
 // partitions and zero operations against a cut-off leader.
+func (s *Sim) hold(id uint64, step int) {
+	if s.heldUntil == nil {
+		s.heldUntil = map[uint64]int{}
+	}
+	s.heldUntil[id] = step + s.cfg.LeaderPartitionSteps
+}
+
+// heal releases every partition that is not being deliberately held, and
+// reports whether it released anything.
+//
+// It names the nodes it releases rather than clearing the set, which is the
+// whole point of additive isolation: a heal rolled by the schedule must not
+// end a hold that has steps left to run.
 func (s *Sim) heal(step int) bool {
-	if s.holdHeal > 0 {
-		s.holdHeal--
-		s.logf("step %d: holding partition (%d steps left)", step, s.holdHeal)
+	var release, holding []uint64
+	for _, id := range s.net.PartitionedIDs() {
+		if until, ok := s.heldUntil[id]; ok && step < until {
+			holding = append(holding, id)
+			continue
+		}
+		delete(s.heldUntil, id)
+		release = append(release, id)
+	}
+	if len(holding) > 0 {
+		s.logf("step %d: holding partition of %v", step, holding)
+	}
+	if len(release) == 0 {
 		return false
 	}
-	s.net.Heal()
+	s.net.HealNodes(release...)
 	return true
+}
+
+// healAll releases every partition and abandons every hold.
+//
+// This is the explicit whole-network heal the decided semantics ask for, and
+// its callers are the ones entitled to it: quiescence, the end-of-run
+// convergence check, and targeted mode restoring full membership before it
+// opens its window. A fault schedule never calls it.
+func (s *Sim) healAll() {
+	s.net.HealAll()
+	s.heldUntil = map[uint64]int{}
+}
+
+// releaseExpiredHolds ends a hold at its own scheduled step, independently of
+// whether the schedule happens to roll a heal.
+//
+// Called once per step, before the fault roll, and it draws no randomness —
+// the schedule's draw order is what makes a seed replay, so a new event in
+// the loop must not consume from the RNG.
+func (s *Sim) releaseExpiredHolds(step int) {
+	var expired []uint64
+	for id, until := range s.heldUntil {
+		if step >= until {
+			expired = append(expired, id)
+		}
+	}
+	slices.Sort(expired)
+	for _, id := range expired {
+		delete(s.heldUntil, id)
+	}
+	if len(expired) == 0 {
+		return
+	}
+	s.net.HealNodes(expired...)
+	s.result.Faults.Heals++
+	s.noteFault(step, "hold expired, healing node(s) %v", expired)
 }
 
 // pauseLeader freezes the leader: its tickers stop and its inbound raft
@@ -1833,7 +1904,7 @@ func (s *Sim) injectTargetedWindow(step int) {
 				}
 			}
 		}
-		s.net.Heal()
+		s.healAll()
 		s.targetedPartitionStep = step + 1
 		return
 	}
@@ -1859,13 +1930,13 @@ func (s *Sim) injectTargetedWindow(step int) {
 		return
 	}
 	s.net.Partition(lead.id)
-	s.holdHeal = s.cfg.LeaderPartitionSteps
+	s.hold(lead.id, step)
 	s.windowPending = false
 	s.result.Window = WindowPlan{Fired: true, Step: step, NodeID: lead.id}
 	s.result.Faults.Partitions++
 	s.result.Faults.LeaderPartitions++
-	s.noteFault(step, "TARGETED partition of LEADER node %d, held for %d steps",
-		lead.id, s.holdHeal)
+	s.noteFault(step, "TARGETED partition of LEADER node %d, held until step %d",
+		lead.id, s.heldUntil[lead.id])
 }
 
 func quorum(n int) int { return n/2 + 1 }

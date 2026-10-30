@@ -229,7 +229,7 @@ func (s *Sim) quiesce(override time.Duration) {
 
 	// Everything healed and everyone back, so nothing is still being
 	// prevented from finishing.
-	s.net.Heal()
+	s.healAll()
 	// A pause that is still open outlives the schedule otherwise: a frozen
 	// ticker means the node never renews anything, so nothing it holds can
 	// ever drain.

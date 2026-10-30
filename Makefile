@@ -87,6 +87,45 @@ repro:
 	scripts/loop-test.sh ./internal/sim/ 'TestReplayWindowReproducesTheRealizedWindow' 10 20
 	FTC_SWEEPS=1 scripts/loop-test.sh ./internal/sim/ 'TestReplayWorkerPauseReproducesTheRealizedPause' 10 20
 
+# The Day 10 checkpoint, into a RUN-STAMPED directory.
+#
+# The stamp is the point. Two sweeps were once read off a stale log because a
+# second run wrote to the same path and failed before overwriting it — the
+# report that got read described the previous run. A fresh directory per run
+# makes that impossible, and the report now prints the run id, the row file
+# and the timestamps of the rows it read.
+#
+# SEED_FROM and SEEDS are a RANGE, and SEEDS is the LAST seed, not a count.
+# Resuming an interrupted run means pointing DIR back at its directory: rows
+# already recorded are skipped and the report is rebuilt from the file.
+#
+#   make checkpoint                                  # 64 seeds, fresh directory
+#   make checkpoint SEED_FROM=54 SEEDS=54            # one seed, fresh directory
+#   make checkpoint DIR=results/checkpoint-20261030-0012  # resume that run
+# ABSOLUTE, because `go test` runs the test binary with the PACKAGE directory
+# as its working directory. A relative path puts the rows and the per-seed
+# fault logs under internal/sim/ while the run log lands at the repo root, and
+# the first seed fails on a directory that does not exist there.
+DIR ?= $(CURDIR)/results/checkpoint-$(shell date -u +%Y%m%d-%H%M%S)
+SEED_FROM ?= 1
+SEEDS ?= 64
+STEPS ?= 600
+MIN_OVERLAPS ?= 200
+MIN_STALE ?= 300
+
+checkpoint: fsync-gate
+	@mkdir -p $(DIR)
+	@echo "checkpoint -> $(DIR)/rows.jsonl (log: $(DIR)/run.log)"
+	FTC_CHECKPOINT=1 \
+	FTC_CHECKPOINT_SEED_FROM=$(SEED_FROM) \
+	FTC_CHECKPOINT_SEEDS=$(SEEDS) \
+	FTC_CHECKPOINT_STEPS=$(STEPS) \
+	FTC_CHECKPOINT_MIN_OVERLAPS=$(MIN_OVERLAPS) \
+	FTC_CHECKPOINT_MIN_STALE=$(MIN_STALE) \
+	FTC_CHECKPOINT_OUT=$(DIR)/rows.jsonl \
+	  caffeinate -dimsu go test -count=1 ./internal/sim/ -run TestDay10Checkpoint \
+	    -v -timeout 300m > $(DIR)/run.log 2>&1
+
 # Is this host capable of supporting the claim at all?
 #
 # Every timing judgement in the harness is measured against a clock compressed

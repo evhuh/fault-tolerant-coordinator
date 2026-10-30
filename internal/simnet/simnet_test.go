@@ -3,6 +3,7 @@ package simnet
 import (
 	"context"
 	"math/rand"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -104,7 +105,7 @@ func TestHealRestoresDelivery(t *testing.T) {
 		t.Fatal("delivered across a partition")
 	}
 
-	n.Heal()
+	n.HealAll()
 	n.Transport(1).Send(msg(1, 2))
 	awaitCount(t, rs[2], 1, 2*time.Second)
 }
@@ -372,4 +373,60 @@ func TestCorruptMessageDroppedByPartitionIsNotALeak(t *testing.T) {
 	if st.DroppedPartition == 0 {
 		t.Error("nothing was dropped by the partition; the test proves nothing")
 	}
+}
+
+// Isolation is ADDITIVE: partitioning one node never releases another. The
+// replace semantics this supersedes were how a held leader partition could be
+// cancelled one step into its hold by the schedule's next partition.
+func TestPartitionIsAdditive(t *testing.T) {
+	n := New(1, Faults{})
+	n.Partition(2)
+	n.Partition(3)
+
+	for _, id := range []uint64{2, 3} {
+		if !n.IsPartitioned(id) {
+			t.Errorf("node %d is not partitioned; the second Partition released the first", id)
+		}
+	}
+	if got, want := n.PartitionedIDs(), []uint64{2, 3}; !slices.Equal(got, want) {
+		t.Errorf("PartitionedIDs = %v, want %v", got, want)
+	}
+}
+
+// A heal releases only the nodes it NAMES, so one partition can end while
+// another goes on being held.
+func TestHealNodesReleasesOnlyWhatItNames(t *testing.T) {
+	n := New(1, Faults{})
+	n.Partition(1, 2, 3)
+	n.HealNodes(2)
+
+	if n.IsPartitioned(2) {
+		t.Error("node 2 was named in the heal and is still partitioned")
+	}
+	for _, id := range []uint64{1, 3} {
+		if !n.IsPartitioned(id) {
+			t.Errorf("node %d was not named in the heal but was released anyway", id)
+		}
+	}
+
+	// Healing something already healed is not an error: a caller that holds
+	// a set of partitions may heal optimistically.
+	n.HealNodes(2)
+	n.HealAll()
+	if ids := n.PartitionedIDs(); len(ids) != 0 {
+		t.Errorf("HealAll left %v partitioned", ids)
+	}
+}
+
+// Partition() with no ids used to mean "heal everything". Under additive
+// semantics it would be a silent no-op, which would turn a missed call site
+// into an adversary that never partitions anything, so it panics instead.
+func TestPartitionWithNoIDsPanics(t *testing.T) {
+	n := New(1, Faults{})
+	defer func() {
+		if recover() == nil {
+			t.Error("Partition() with no ids did not panic")
+		}
+	}()
+	n.Partition()
 }

@@ -22,6 +22,7 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
+	"slices"
 	"sync"
 	"time"
 
@@ -183,33 +184,68 @@ func (n *Network) Transport(id uint64) raftnode.Transport {
 	return &transport{net: n, id: id}
 }
 
-// Partition cuts ids off from every node not in the set. Calling it with no
-// arguments heals the network.
+// Partition ADDS ids to the isolated set, cutting each off from every node
+// outside it. Isolating one node never releases another.
 //
 // One-sided by construction: a message is dropped when exactly ONE endpoint
 // is partitioned, so nodes inside the set still talk to each other. That is
 // what makes a minority partition able to elect nothing while the majority
 // carries on.
-// DECIDED BUT NOT YET IMPLEMENTED: this REPLACES the isolated set, and the
-// agreed semantics are additive — see "Partition semantics" in
-// docs/architecture.md.
 //
-// Replacing is why a held leader partition can be cancelled one step into its
-// hold by the schedule's next partition, while holdHeal goes on suppressing
-// heals, leaving the simulator believing it holds a partition it released.
-// The change waits behind the snapshot-reporting fix because it makes the
-// adversary strictly harsher and voids the calibrated floors.
+// Additive, and not merely as a preference. Replacing the set is why a held
+// leader partition could be cancelled one step into its hold by the
+// schedule's next partition while the caller went on suppressing heals,
+// leaving the simulator believing it held a partition it had released. A hold
+// has to mean what it says, so release is now something a caller ASKS for, by
+// name, through HealNodes or HealAll.
+//
+// Calling it with no arguments is a programming error and panics. It used to
+// mean "heal everything", and letting that spelling survive as a silent no-op
+// would convert any missed call site into an adversary that never partitions
+// anything — a strictly quieter run that still reports its fault counts.
+// See "Partition semantics" in docs/architecture.md.
 func (n *Network) Partition(ids ...uint64) {
+	if len(ids) == 0 {
+		panic("simnet: Partition() with no ids; use HealAll to release everything")
+	}
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	n.partitioned = map[uint64]bool{}
 	for _, id := range ids {
 		n.partitioned[id] = true
 	}
 }
 
-// Heal removes every partition.
-func (n *Network) Heal() { n.Partition() }
+// HealNodes releases only the nodes it names. Ids that are not partitioned
+// are ignored, so a caller may heal optimistically.
+func (n *Network) HealNodes(ids ...uint64) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	for _, id := range ids {
+		delete(n.partitioned, id)
+	}
+}
+
+// HealAll releases every partition. This is the explicit whole-network heal:
+// quiescence and the end-of-run convergence check need it, and a fault
+// schedule reaches for HealNodes instead.
+func (n *Network) HealAll() {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.partitioned = map[uint64]bool{}
+}
+
+// PartitionedIDs lists the isolated nodes, ascending. A caller that holds
+// some partitions and releases others needs to know what it is holding.
+func (n *Network) PartitionedIDs() []uint64 {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	ids := make([]uint64, 0, len(n.partitioned))
+	for id := range n.partitioned {
+		ids = append(ids, id)
+	}
+	slices.Sort(ids)
+	return ids
+}
 
 // DropSnapshotsTo drops the next n MsgSnap messages addressed to id.
 //

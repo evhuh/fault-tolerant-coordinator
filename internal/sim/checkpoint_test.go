@@ -36,10 +36,23 @@ import (
 // from zero is a run nobody finishes. A restart skips the seeds already in
 // the file.
 //
-// The floors are calibrated, not chosen: two 8-seed sweeps at this exact
-// configuration measured 41 and 41 overlaps and 62 and 51 stale rejections,
-// which is 0.85 overlaps and 1.17 stale per 100 run-steps. Scaled to 64 seeds
-// that projects to about 328 and 452; the floors sit near half of that.
+// The floors are calibrated, not chosen, and they are calibrated against the
+// ADDITIVE isolation adversary. Two 8-seed sweeps at this exact
+// configuration, seeds 101-108 and 201-208, measured 35 and 72 overlaps and
+// 64 and 106 stale rejections over 4,800 run-steps each: pooled, 1.115
+// overlaps and 1.771 stale per 100 run-steps, which projects to about 428 and
+// 680 over 64 seeds. The floors sit near half of that.
+//
+// The two sweeps disagree by about 2x on overlaps, which is seed luck and not
+// the host — per-seed fsync and CPU probes were flat across both — so the
+// floors are set to hold even at the LOWER sweep's rate: sweep A alone
+// projects to about 280 overlaps and 512 stale, both still clear. The
+// previous calibration's 41-and-41 agreement was luckier than it was careful,
+// and the pooled variance across 16 seeds probably understates the spread.
+//
+// Superseded figures: 160 and 200, calibrated at 0.85 and 1.17 per 100
+// run-steps against the REPLACE adversary, which cancelled its own
+// partitions.
 func TestDay10Checkpoint(t *testing.T) {
 	if os.Getenv("FTC_CHECKPOINT") != "1" {
 		t.Skip("the Day 10 checkpoint: set FTC_CHECKPOINT=1 (hours, and it must have a quiet host)")
@@ -53,9 +66,18 @@ func TestDay10Checkpoint(t *testing.T) {
 	// to look at 59 costs two hours for no information.
 	firstSeed := envInt(t, "FTC_CHECKPOINT_SEED_FROM", 1)
 	seeds := envInt(t, "FTC_CHECKPOINT_SEEDS", 64)
+	// SEEDS is the LAST seed, not a count, and reading it as a count puts the
+	// range the wrong way round. Refuse rather than report: an empty range
+	// used to run no seeds, print a report of zeros, and exit 0 — the same
+	// shape of lie as a reproducibility loop counting skips as passes.
+	if firstSeed > seeds {
+		t.Fatalf("empty seed range: FTC_CHECKPOINT_SEED_FROM=%d is past "+
+			"FTC_CHECKPOINT_SEEDS=%d, which is the LAST seed and not a count",
+			firstSeed, seeds)
+	}
 	steps := envInt(t, "FTC_CHECKPOINT_STEPS", 600)
-	minOverlaps := envInt(t, "FTC_CHECKPOINT_MIN_OVERLAPS", 160)
-	minStale := envInt(t, "FTC_CHECKPOINT_MIN_STALE", 200)
+	minOverlaps := envInt(t, "FTC_CHECKPOINT_MIN_OVERLAPS", 200)
+	minStale := envInt(t, "FTC_CHECKPOINT_MIN_STALE", 300)
 
 	// THE HOST GATE, before anything is claimed. A disk that cannot sustain
 	// the run's compressed timings produces runs that truncate and
@@ -71,12 +93,24 @@ func TestDay10Checkpoint(t *testing.T) {
 	t.Logf("host gate passed: %s", probe)
 
 	runStart := time.Now()
+	runID := runStart.UTC().Format("20060102-150405")
+	// PROVENANCE, printed before anything is measured and again in the
+	// report. A run whose output path collides with an earlier one — a stale
+	// log, a resumed row file, a redirect that silently failed — produces a
+	// report that describes a run nobody is looking at. Two sweeps were read
+	// off a stale log exactly that way.
+	t.Logf("run %s started %s, rows -> %s", runID, runStart.Format(time.RFC3339), out)
+
 	done, err := readRows(out)
 	if err != nil {
 		t.Fatalf("reading %s: %v", out, err)
 	}
 	if len(done) > 0 {
-		t.Logf("resuming: %d seed(s) already recorded in %s", len(done), out)
+		age := "unknown age"
+		if st, err := os.Stat(out); err == nil {
+			age = "last written " + st.ModTime().Format(time.RFC3339)
+		}
+		t.Logf("resuming: %d seed(s) already recorded in %s (%s)", len(done), out, age)
 	}
 
 	for seed := int64(firstSeed); seed <= int64(seeds); seed++ {
@@ -91,7 +125,7 @@ func TestDay10Checkpoint(t *testing.T) {
 		t.Logf("seed %d/%d: %s", seed, seeds, row.oneLine())
 	}
 
-	reportCheckpoint(t, done, steps, minOverlaps, minStale)
+	reportCheckpoint(t, done, steps, minOverlaps, minStale, runID, out, runStart)
 }
 
 // checkpointRow is one seed's result, as written to the file.
@@ -255,8 +289,15 @@ func runCheckpointSeed(t *testing.T, seed int64, steps int, runStart time.Time, 
 
 // reportCheckpoint builds the checkpoint from the FILE, so a resumed run reports on
 // everything that was ever measured rather than on this process's share.
-func reportCheckpoint(t *testing.T, rows map[int64]checkpointRow, steps, minOverlaps, minStale int) {
+func reportCheckpoint(t *testing.T, rows map[int64]checkpointRow, steps, minOverlaps, minStale int,
+	runID, out string, runStart time.Time) {
 	t.Helper()
+	// Nothing measured is not something passed. A report over no rows meets
+	// every floor it is given, including a floor of zero, which is how an
+	// empty sweep reads as a green checkpoint.
+	if len(rows) == 0 {
+		t.Fatal("no seeds were run; a checkpoint over zero rows measures nothing and cannot pass")
+	}
 	seeds := make([]int64, 0, len(rows))
 	for s := range rows {
 		seeds = append(seeds, s)
@@ -330,6 +371,12 @@ func reportCheckpoint(t *testing.T, rows map[int64]checkpointRow, steps, minOver
 	n := len(seeds)
 	t.Logf("=== DAY 10 CHECKPOINT: %d seeds x %d steps, %s of cumulative run time ===",
 		n, steps, (time.Duration(wallMs) * time.Millisecond).Round(time.Second))
+	// WHICH RUN IS THIS, AND WHAT DID IT READ. Say it in the report itself,
+	// not only in the shell that launched it: the report is what gets pasted
+	// into a handoff, and a figure without its provenance is a figure that
+	// can be read off the wrong file.
+	t.Logf("PROVENANCE: run %s, reported %s, rows read from %s%s",
+		runID, time.Now().Format(time.RFC3339), out, rowProvenance(rows, runStart))
 	t.Logf("FAULTS INDUCED: %d kills, %d restarts, %d partitions, %d leader partitions, %d pauses, %d heals",
 		kills, restarts, parts, leaderParts, pauses, heals)
 	t.Logf("EFFECTS: %d committed over %d executions (%d duplicate reports ignored, %d terminal by attempt budget)",
@@ -501,4 +548,44 @@ func hostDriftTable(rows map[int64]checkpointRow, seeds []int64) string {
 			i+1, q.n, q.compute/int64(q.n), q.sched/int64(q.n), q.heap/float64(q.n), q.findings)
 	}
 	return b.String()
+}
+
+// rowProvenance describes the rows a report was built from: when they were
+// written, and how many predate this run.
+//
+// Carried-over rows are legitimate — the checkpoint is resumable on purpose —
+// but a report that silently mixes them with a different adversary, step
+// count or build is a report that averages two experiments. Naming the count
+// and the span is what makes the mix visible.
+func rowProvenance(rows map[int64]checkpointRow, runStart time.Time) string {
+	if len(rows) == 0 {
+		return ""
+	}
+	var oldest, newest int64
+	carried := 0
+	startMs := runStart.UnixMilli()
+	for _, r := range rows {
+		if r.StartedAtMs == 0 {
+			continue
+		}
+		if oldest == 0 || r.StartedAtMs < oldest {
+			oldest = r.StartedAtMs
+		}
+		if r.StartedAtMs > newest {
+			newest = r.StartedAtMs
+		}
+		if r.StartedAtMs < startMs {
+			carried++
+		}
+	}
+	if oldest == 0 {
+		return " (rows carry no timestamps)"
+	}
+	span := fmt.Sprintf(" (seeds ran %s .. %s",
+		time.UnixMilli(oldest).Format(time.RFC3339),
+		time.UnixMilli(newest).Format(time.RFC3339))
+	if carried > 0 {
+		span += fmt.Sprintf("; %d of %d row(s) CARRIED OVER from an earlier run", carried, len(rows))
+	}
+	return span + ")"
 }

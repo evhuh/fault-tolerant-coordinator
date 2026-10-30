@@ -179,7 +179,7 @@ func rejoinTermMovement(t *testing.T, disablePreVote bool) uint64 {
 	termBefore := termOf(t, lead)
 	leaderBefore := lead.id
 
-	s.net.Heal()
+	s.healAll()
 	time.Sleep(8 * election)
 
 	termAfter := termOf(t, lead)
