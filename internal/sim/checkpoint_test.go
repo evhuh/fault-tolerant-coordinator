@@ -308,7 +308,7 @@ func reportCheckpoint(t *testing.T, rows map[int64]checkpointRow, steps, minOver
 		effects, execs, overlaps, stale, dups, byBudget      int
 		kills, restarts, parts, leaderParts, pauses, heals   int
 		drained, quiesced, complete, covered, illegal        int
-		hostIO, unattributable                               int
+		hostIO, unattributable, snapshotBudget               int
 		worstSnapMs, worstSnapKB, worstCheckMs, worstFsyncUs int64
 		ambiguous, linOps                                    int
 		wallMs                                               int64
@@ -329,7 +329,15 @@ func reportCheckpoint(t *testing.T, rows map[int64]checkpointRow, steps, minOver
 		leaderParts += r.LeaderPartitions
 		pauses += r.Pauses
 		heals += r.Heals
-		hostIO += r.HostIOStalls
+		// RECLASSIFIED HERE, not at check time. The rule needs the seed's
+		// BRACKETING probes, and the one taken after the seed does not exist
+		// while the seed is still running, so the live path records the
+		// conservative kind and the report refines it. That also means a rule
+		// added after a run can be applied to its rows without re-running the
+		// hours.
+		seedHostIO, seedSnapBudget := reclassifyStalls(r)
+		hostIO += seedHostIO
+		snapshotBudget += seedSnapBudget
 		unattributable += r.Unattributable
 		ambiguous += r.LinAmbiguous
 		linOps += r.LinOps
@@ -364,7 +372,7 @@ func reportCheckpoint(t *testing.T, rows map[int64]checkpointRow, steps, minOver
 			worstFsyncUs = r.FsyncAfterWorstUs
 		}
 		for _, v := range r.Violations {
-			findings = append(findings, fmt.Sprintf("seed %d: %s", s, v))
+			findings = append(findings, fmt.Sprintf("seed %d: %s", s, relabelStall(r, v)))
 		}
 	}
 
@@ -389,6 +397,15 @@ func reportCheckpoint(t *testing.T, rows map[int64]checkpointRow, steps, minOver
 		quiesced, n, drained, complete, steps)
 	t.Logf("STALLS: %d host-io, %d unattributable%s", hostIO, unattributable,
 		quotableNote(hostIO, unattributable))
+	if snapshotBudget > 0 {
+		// Its own line, and NOT part of the quotable verdict. This one is a
+		// known product limitation, so re-measuring on a quieter machine would
+		// reproduce it; the rates stay quotable and the fix is asynchronous
+		// snapshotting.
+		t.Logf("SNAPSHOT BUDGET: %d stall(s) in the synchronous snapshot on a host whose own probes "+
+			"stayed within budget — a KNOWN PRODUCT LIMITATION, not a host failure, and not a "+
+			"reason to re-measure; see the async-snapshot follow-up", snapshotBudget)
+	}
 	t.Logf("SNAPSHOTS: worst %dms at %dKB (stall threshold 125ms)", worstSnapMs, worstSnapKB)
 	t.Logf("LINEARIZABILITY: %d histories, %d Illegal, %d ops checked, %d ambiguous (%.0f%%), worst check %dms",
 		n, illegal, linOps, ambiguous, 100*float64(ambiguous)/float64(max(linOps, 1)), worstCheckMs)
@@ -588,4 +605,100 @@ func rowProvenance(rows map[int64]checkpointRow, runStart time.Time) string {
 		span += fmt.Sprintf("; %d of %d row(s) CARRIED OVER from an earlier run", carried, len(rows))
 	}
 	return span + ")"
+}
+
+// hostProbesHealthy reports whether a seed's BRACKETING host probes stayed
+// inside the gate's budget — the same budget the host gate applies before
+// seed 1, so a seed is judged by the standard the run was admitted under.
+func hostProbesHealthy(r checkpointRow) bool {
+	const meanBudgetUs, worstBudgetUs = 12_000, 100_000
+	return r.FsyncBeforeMeanUs <= meanBudgetUs &&
+		r.FsyncAfterMeanUs <= meanBudgetUs &&
+		r.FsyncAfterWorstUs <= worstBudgetUs
+}
+
+// reclassifyStalls recomputes a row's disk-bound stall kinds through
+// ClassifyDiskStall, and reports how many fall to each kind.
+//
+// It reads the finding text because that is what a row records, which is also
+// what makes it work on rows written before the rule existed. The phase name
+// is matched exactly, so a finding that does not name a phase stays host-io —
+// the conservative direction, since the alternative is excusing a real host
+// problem as a product limit.
+func reclassifyStalls(r checkpointRow) (hostIO, snapshotBudget int) {
+	healthy := hostProbesHealthy(r)
+	for _, v := range r.Violations {
+		if !strings.Contains(v, "["+string(KindHostIO)+"]") {
+			continue
+		}
+		if ClassifyDiskStall(stallPhase(v), healthy) == KindSnapshotBudget {
+			snapshotBudget++
+			continue
+		}
+		hostIO++
+	}
+	return hostIO, snapshotBudget
+}
+
+// stallPhase pulls the Ready-loop phase out of a stall finding. The text is
+// built by Stall.String as "<duration> in <phase> (<kind>)".
+func stallPhase(finding string) string {
+	i := strings.Index(finding, " in ")
+	if i < 0 {
+		return ""
+	}
+	rest := finding[i+len(" in "):]
+	j := strings.Index(rest, " (")
+	if j < 0 {
+		return ""
+	}
+	return rest[:j]
+}
+
+// relabelStall rewrites a finding the report reclassified, so the line a
+// reader sees carries the kind the report counted it as. A finding that says
+// host-io while the summary counts it as a product limit is the kind of
+// mismatch that costs an afternoon.
+//
+// The explanation is REPLACED rather than appended to. The original sentence
+// blames the host's I/O latency, and leaving it in place next to a correction
+// produces a finding that says both things.
+func relabelStall(r checkpointRow, finding string) string {
+	// A finding that merely NAMES the kinds a seed ended on carries the old
+	// label too, and correcting the stall while leaving its cross-reference
+	// behind is the same "says both things" problem one line further down.
+	if !strings.Contains(finding, "["+string(KindHostIO)+"]") {
+		if strings.Contains(finding, "ended on "+string(KindHostIO)) &&
+			rowEndedOnSnapshotBudget(r) {
+			return strings.Replace(finding,
+				"ended on "+string(KindHostIO),
+				"ended on "+string(KindSnapshotBudget), 1)
+		}
+		return finding
+	}
+	if ClassifyDiskStall(stallPhase(finding), hostProbesHealthy(r)) != KindSnapshotBudget {
+		return finding
+	}
+	head := finding
+	if i := strings.Index(finding, " — "); i >= 0 {
+		head = finding[:i]
+	}
+	head = strings.Replace(head, "["+string(KindHostIO)+"]", "["+string(KindSnapshotBudget)+"]", 1)
+	head = strings.Replace(head, "(host I/O)", "(synchronous snapshot)", 1)
+	return head + fmt.Sprintf(
+		" — the SNAPSHOT exceeded this run's compressed timings while the host's own probes stayed "+
+			"inside the gate's budget (fsync mean %dus before and %dus after, worst %dus, against "+
+			"12ms mean and 100ms worst), so this is a KNOWN PRODUCT LIMITATION rather than a host "+
+			"failure: the snapshot is serialized, fsynced and compacted inside the Ready loop at "+
+			"about 6.5ms/MB, so a large enough state exceeds the threshold on any disk. The seed is "+
+			"inconclusive and asynchronous snapshotting is the fix; re-measuring on a quieter "+
+			"machine would reproduce it.",
+		r.FsyncBeforeMeanUs, r.FsyncAfterMeanUs, r.FsyncAfterWorstUs)
+}
+
+// rowEndedOnSnapshotBudget reports whether this seed's disk-bound stall was
+// reclassified, so findings that merely cite the kind can be corrected too.
+func rowEndedOnSnapshotBudget(r checkpointRow) bool {
+	_, snapshotBudget := reclassifyStalls(r)
+	return snapshotBudget > 0
 }

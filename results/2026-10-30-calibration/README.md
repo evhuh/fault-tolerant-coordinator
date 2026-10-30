@@ -3,7 +3,7 @@
 The two sweeps the Day 10 checkpoint's coverage floors are derived from, measured against the ADDITIVE isolation adversary.
 The previous floors (160 and 200) were calibrated against the replace adversary and were void once isolation became additive.
 
-- **Commit under test:** `29644d1` plus the additive-isolation change (uncommitted at the time of measurement).
+- **Commit under test:** `29644d1` plus the additive-isolation change, which landed as `e633366` (`feat(sim): additive partition isolation`); this record landed as `0979e4f`.
 - **Configuration:** 600 steps, real workers, `FTC_CHECKPOINT_MIN_OVERLAPS=0` and `FTC_CHECKPOINT_MIN_STALE=0` so the calibration could not fail on the numbers it exists to measure.
 - **Approved floors:** 200 overlapping executions, 300 late reports rejected as stale, over 64 seeds x 600 steps.
 

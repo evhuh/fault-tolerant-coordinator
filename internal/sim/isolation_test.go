@@ -115,3 +115,47 @@ func TestHealAllAbandonsHolds(t *testing.T) {
 		t.Errorf("healAll left holds behind: %v", s.heldUntil)
 	}
 }
+
+// A snapshot-phase stall is classified by WHAT THE HOST WAS DOING, because
+// the two readings are different conclusions: one is this program's
+// synchronous snapshot costing more than the threshold allows, which no
+// quieter machine will fix, and the other is the host failing to meet the
+// run's compressed premise.
+func TestDiskStallClassification(t *testing.T) {
+	cases := []struct {
+		name    string
+		phase   string
+		healthy bool
+		want    ViolationKind
+	}{
+		{"snapshot phase, healthy probes", SnapshotPhase, true, KindSnapshotBudget},
+		{"snapshot phase, degraded probes", SnapshotPhase, false, KindHostIO},
+		// persist is disk-bound too, but nothing in this program makes one
+		// append slow, so a healthy host plus a slow append is still the host.
+		{"persist phase, healthy probes", "persist", true, KindHostIO},
+		{"persist phase, degraded probes", "persist", false, KindHostIO},
+		// A finding with no phase in it must not be excused.
+		{"unknown phase, healthy probes", "", true, KindHostIO},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := ClassifyDiskStall(c.phase, c.healthy); got != c.want {
+				t.Errorf("ClassifyDiskStall(%q, healthy=%v) = %q, want %q",
+					c.phase, c.healthy, got, c.want)
+			}
+		})
+	}
+}
+
+// The product limitation is INCONCLUSIVE for its seed and is a timing
+// judgement, so tests that own neither the stall nor the disk ignore it — but
+// it is not an ENVIRONMENT kind, because blaming the host for this one is the
+// mistake the kind exists to stop.
+func TestSnapshotBudgetIsAStallButNotAnEnvironmentFailure(t *testing.T) {
+	if !KindSnapshotBudget.IsStall() {
+		t.Error("KindSnapshotBudget is not IsStall; stall-agnostic tests will treat it as a property failure")
+	}
+	if KindSnapshotBudget.IsEnvironment() {
+		t.Error("KindSnapshotBudget is IsEnvironment; that blames the host for the program's own design")
+	}
+}

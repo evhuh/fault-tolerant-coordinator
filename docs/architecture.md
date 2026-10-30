@@ -530,6 +530,8 @@ It climbs across longer ones. `Encode` is linear at about **6.5ms per MB** (meas
 
 So the Day 10 checkpoint buys scale with **breadth rather than depth**: many seeds at the calibrated 600-step width, not one long run. What that leaves untested is stated plainly: **state growth beyond ~1,500 jobs in a single run is unmeasured**, and nothing here establishes how the system behaves with a state machine an order of magnitude larger.
 
+**The 600-step width is now a measured ceiling, not a cautious guess.** Across two 64-seed checkpoints the worst snapshot went 91ms at 1.43MB under replace semantics and **133ms at 1.60MB under additive isolation, which crossed the 125ms stall threshold** and truncated one seed at step 308. Both on healthy disks. Asynchronous snapshotting is the fix and is the top follow-up; until it lands, raising the step bound buys state size the Ready loop cannot absorb.
+
 Decompressing the clock to buy headroom was considered and rejected: the timing parameters are coupled, and a 1s election timeout against a 300ms lease TTL breaks the Day 8 ordering that an election must resolve inside a lease. Scaling all of them together would also void the worker-slot capacity arithmetic the workload is calibrated against, and with it the overlap floor.
 
 **The product fix is asynchronous snapshotting**, which is what etcd does and what this does not. Until then the ceiling is real and the bound is honest.
@@ -642,7 +644,26 @@ Pooled, that projects to about **428 overlaps and 680 stale** over 64 seeds x 60
 
 **Both sweeps were healthy otherwise.** 16 of 16 seeds completed all 600 steps, 16 of 16 reached quiescence and drained, `0 host-io` and `0 unattributable` stalls in both, worst snapshot 65ms against the 125ms threshold. This answers the open question about the harsher adversary: **held partitions do not starve the drain**, so the 600-step bound needed no revisiting.
 
-The full record is in `results/2026-10-30-calibration/`.
+The full record is in `results/2026-10-30-calibration/`, measured on `e633366`.
+
+### Day 10 is met: the checkpoint PASSED under additive isolation
+
+Run on 2026-10-30 against `e633366`, 64 seeds x 600 steps on the recalibrated floors. **PASS**, 2h47m38s of cumulative run time. The record is in `results/2026-10-30-checkpoint-additive/`.
+
+- **Coverage: 308 overlapping executions against a floor of 200, and 558 stale rejections against 300.** Quotable, over **63 complete seeds; seed 3 truncated at step 308 by the synchronous-snapshot limit**. Both figures sit below the calibration's pooled projection (428 and 680) and above the floors, which is what the lower calibration sweep predicted — floors set to survive that sweep rather than the pooled mean are why this run was not a coin flip.
+- **Zero frozen-clock windows**, the second consecutive checkpoint without one and the first against the harsher adversary. No `invariant`, `convergence`, `readyloop-stall`, `effect-ledger`, `did-not-drain` or `comparison-floor` finding in any of the 64 rows.
+- **Liveness held under held partitions:** 63 of 64 runs reached quiescence and all 63 drained, with no `did-not-drain` finding. This was the open question when isolation became additive, and it is answered.
+- Linearizability: 64 histories, 0 Illegal, 296,674 operations checked, 12% ambiguous. As always, zero Illegal here is NOT the linearizability evidence — the targeted sweeps are, and they remain 8/8 Illegal under local reads against 0/8 behind the ReadIndex barrier.
+
+### A snapshot-phase stall on a healthy host is a product limit, not a host failure
+
+`KindSnapshotBudget` exists because the Day 10 checkpoint produced one stall that the old classifier called `host-io`, which was wrong in a way that mattered: it fired the "the host did not sustain the run's timings" banner and suppressed a perfectly good set of coverage rates, sending the reader off to re-measure something that will recur on every quiet host.
+
+The rule, in `ClassifyDiskStall`: a disk-bound Ready-loop stall **in the snapshot phase**, on a seed whose **bracketing fsync probes stayed inside the gate's budget**, is `snapshot-budget` — inconclusive for that seed, labelled a known product limitation, and excluded from the quotable verdict. Any other disk-bound phase, and any phase at all on a seed whose probes blew their budget, stays `host-io`. A finding with no phase in it stays `host-io` too: the conservative direction, since the alternative is excusing a real host problem as a product limit.
+
+Why the distinction is real rather than cosmetic. `maybeSnapshot` serializes, fsyncs and compacts **inside the Ready loop**, and `Encode` is linear at about 6.5ms/MB, so the cost is a property of this program at a given state size rather than of the machine. Measured twice, both on healthy disks: **91ms at 1.43MB** under replace semantics, **133ms at 1.60MB** under additive isolation, against a **125ms** stall threshold. The second crossed it.
+
+The classification is applied at REPORT time, not at check time, and deliberately: the rule needs the seed's bracketing probes, and the one taken after a seed does not exist while that seed is still running. The live invariant records the conservative kind and the report refines it — which also means a classification rule added after a run can be applied to a record already paid for, as it was here. `KindSnapshotBudget` is `IsStall` but deliberately NOT `IsEnvironment`: blaming the host for the program's own design is the mistake the kind exists to stop.
 
 ### Checkpoint (a)'s coverage numbers
 

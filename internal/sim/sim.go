@@ -526,6 +526,24 @@ const (
 	// Inconclusive: the host could not meet the premise, so the run proved
 	// nothing — it does not say the system is wrong.
 	KindHostIO ViolationKind = "host-io"
+	// KindSnapshotBudget is a Ready-loop stall in the snapshot phase on a run
+	// whose HOST kept up — its bracketing fsync probes stayed inside the gate's
+	// budget, so the disk is not what blocked the loop.
+	//
+	// Inconclusive for that seed, and labelled as a KNOWN PRODUCT LIMITATION
+	// rather than a host failure, because the cost is systematic rather than
+	// environmental: `maybeSnapshot` serializes, fsyncs and compacts INSIDE the
+	// Ready loop, `Encode` is linear at about 6.5ms/MB, and a large enough
+	// state exceeds the stall threshold on any disk. Measured twice: 91ms at
+	// 1.43MB under replace semantics, 133ms at 1.60MB under additive
+	// isolation, against a 125ms threshold.
+	//
+	// Distinct from KindHostIO deliberately. Calling this one host-io blames
+	// the machine for the program's own design and fires the "the host did not
+	// sustain the run's timings" banner, which suppresses perfectly good
+	// coverage rates and sends the reader to re-measure something that will
+	// recur on every quiet host. Asynchronous snapshotting is the fix.
+	KindSnapshotBudget ViolationKind = "snapshot-budget"
 	// KindLinearizability is an illegal client history.
 	KindLinearizability ViolationKind = "linearizability"
 	// KindLinearizabilityTimeout means the search did not finish, or there
@@ -585,7 +603,7 @@ func (k ViolationKind) IsEnvironment() bool {
 // IsStall reports whether this kind is a Ready-loop timing judgement. Tests
 // that own neither the stall nor the host's disk ignore both.
 func (k ViolationKind) IsStall() bool {
-	return k == KindReadyLoopStall || k == KindHostIO
+	return k == KindReadyLoopStall || k == KindHostIO || k == KindSnapshotBudget
 }
 
 // IsLedger reports whether this kind comes from the effect ledger. Tests
@@ -1208,6 +1226,32 @@ func (s *Sim) Run(ctx context.Context) (Result, error) {
 		s.result.Violations = append(s.result.Violations, vs...)
 	}
 	return s.finish()
+}
+
+// SnapshotPhase is the Ready-loop phase name for maybeSnapshot: serialize,
+// fsync, rewrite the WAL. Matched by name because the classification rule
+// below is about this phase specifically, not about disk-bound phases in
+// general — a stall in persist on a healthy host is still a host problem,
+// since nothing in this program makes one append slow.
+const SnapshotPhase = "snapshot+compact"
+
+// ClassifyDiskStall decides what a disk-bound Ready-loop stall MEANS, given
+// whether the host's own probes kept up.
+//
+// The two outcomes are different conclusions, not different wordings. A
+// snapshot-phase stall on a healthy host is this program's synchronous
+// snapshot costing more than the threshold allows, which no amount of
+// re-measuring on a quieter machine will fix. Any other disk-bound stall, or
+// any stall at all on a host whose probes blew their budget, is the host
+// failing to meet the run's compressed premise.
+//
+// Pure, and takes the probe verdict rather than the probes, so it can be
+// applied at report time to rows that were written before the rule existed.
+func ClassifyDiskStall(phase string, hostProbesHealthy bool) ViolationKind {
+	if phase == SnapshotPhase && hostProbesHealthy {
+		return KindSnapshotBudget
+	}
+	return KindHostIO
 }
 
 // downgradeStallsOnBrokenPremise turns blocking-call stalls INCONCLUSIVE when

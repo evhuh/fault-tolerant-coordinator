@@ -1,0 +1,307 @@
+step 5: partition node 3
+step 7: partition LEADER node 2, held until step 10
+step 10: hold expired, healing node(s) [2]
+step 13: partition node 2
+step 14: kill node 3
+step 16: partition LEADER node 1, held until step 19
+step 17: holding partition of [1]
+step 18: partition node 2
+step 19: hold expired, healing node(s) [1]
+step 19: partition node 2
+step 21: heal
+step 25: restart node 3
+step 26: partition LEADER node 1, held until step 29
+step 27: holding partition of [1]
+step 28: partition node 2
+step 29: hold expired, healing node(s) [1]
+step 29: heal
+step 33: partition LEADER node 2, held until step 36
+step 34: partition LEADER node 3, held until step 37
+step 35: holding partition of [2 3]
+step 36: hold expired, healing node(s) [2]
+step 36: partition node 1
+step 37: hold expired, healing node(s) [3]
+step 37: kill node 1
+step 40: partition LEADER node 3, held until step 43
+step 41: holding partition of [3]
+step 42: holding partition of [3]
+step 43: hold expired, healing node(s) [3]
+step 45: partition LEADER node 3, held until step 48
+step 46: holding partition of [3]
+step 48: hold expired, healing node(s) [3]
+step 53: partition node 2
+step 55: partition node 3
+step 63: partition LEADER node 3, held until step 66
+step 64: partition node 3
+step 65: holding partition of [3]
+step 66: hold expired, healing node(s) [3]
+step 78: partition node 3
+step 79: heal
+step 80: restart node 1
+step 83: partition LEADER node 3, held until step 86
+step 84: holding partition of [3]
+step 85: holding partition of [3]
+step 86: hold expired, healing node(s) [3]
+step 89: partition node 2
+step 92: kill node 2
+step 95: partition LEADER node 1, held until step 98
+step 96: holding partition of [1]
+step 97: holding partition of [1]
+step 98: hold expired, healing node(s) [1]
+step 99: partition node 3
+step 100: heal
+step 106: partition LEADER node 1, held until step 109
+step 108: holding partition of [1]
+step 109: hold expired, healing node(s) [1]
+step 109: restart node 2
+step 112: partition node 2
+step 117: partition LEADER node 3, held until step 120
+step 118: partition LEADER node 1, held until step 121
+step 119: holding partition of [1 3]
+step 120: hold expired, healing node(s) [3]
+step 120: holding partition of [1]
+step 121: hold expired, healing node(s) [1]
+step 125: partition node 1
+step 128: kill node 2
+step 131: restart node 2
+step 132: partition LEADER node 3, held until step 135
+step 133: holding partition of [3]
+step 134: partition LEADER node 1, held until step 137
+step 135: hold expired, healing node(s) [3]
+step 135: holding partition of [1]
+step 136: kill node 2
+step 137: hold expired, healing node(s) [1]
+step 137: partition node 1
+step 141: partition node 3
+step 143: restart node 2
+step 145: partition node 1
+step 151: partition LEADER node 3, held until step 154
+step 152: holding partition of [3]
+step 153: kill node 3
+step 154: hold expired, healing node(s) [3]
+step 154: partition LEADER node 2, held until step 157
+step 155: holding partition of [2]
+step 157: hold expired, healing node(s) [2]
+step 158: partition node 2
+step 163: partition LEADER node 2, held until step 166
+step 164: partition node 1
+step 165: partition node 2
+step 166: hold expired, healing node(s) [2]
+step 169: restart node 3
+step 171: partition node 1
+step 176: partition LEADER node 2, held until step 179
+step 177: partition node 1
+step 178: holding partition of [2]
+step 178: heal
+step 179: hold expired, healing node(s) [2]
+step 183: partition node 3
+step 186: partition node 2
+step 188: partition LEADER node 1, held until step 191
+step 189: holding partition of [1]
+step 190: holding partition of [1]
+step 191: hold expired, healing node(s) [1]
+step 192: partition node 3
+step 193: partition node 2
+step 195: kill node 1
+step 197: partition node 2
+step 198: partition LEADER node 3, held until step 201
+step 200: holding partition of [3]
+step 201: hold expired, healing node(s) [3]
+step 202: partition node 2
+step 204: partition node 2
+step 213: restart node 1
+step 214: kill node 1
+step 216: restart node 1
+step 217: kill node 1
+step 218: partition LEADER node 3, held until step 221
+step 219: holding partition of [3]
+step 221: hold expired, healing node(s) [3]
+step 226: partition node 3
+step 227: restart node 1
+step 228: partition node 2
+step 229: heal
+step 237: partition node 2
+step 242: partition LEADER node 3, held until step 245
+step 243: holding partition of [3]
+step 244: partition node 3
+step 245: hold expired, healing node(s) [3]
+step 247: partition LEADER node 1, held until step 250
+step 248: holding partition of [1]
+step 249: partition node 3
+step 250: hold expired, healing node(s) [1]
+step 253: partition LEADER node 3, held until step 256
+step 254: holding partition of [3]
+step 255: holding partition of [3]
+step 256: hold expired, healing node(s) [3]
+step 259: kill node 2
+step 264: partition node 1
+step 266: partition node 3
+step 268: heal
+step 270: partition LEADER node 1, held until step 273
+step 271: partition LEADER node 1, held until step 274
+step 272: holding partition of [1]
+step 273: holding partition of [1]
+step 274: hold expired, healing node(s) [1]
+step 275: partition node 1
+step 277: partition node 1
+step 281: partition LEADER node 1, held until step 284
+step 282: holding partition of [1]
+step 283: partition node 3
+step 284: hold expired, healing node(s) [1]
+step 284: partition node 1
+step 286: partition node 1
+step 287: partition node 3
+step 294: partition node 3
+step 295: heal
+step 298: partition LEADER node 1, held until step 301
+step 299: holding partition of [1]
+step 300: holding partition of [1]
+step 301: hold expired, healing node(s) [1]
+step 302: partition node 3
+step 303: heal
+step 308: partition LEADER node 1, held until step 311
+step 309: holding partition of [1]
+step 311: hold expired, healing node(s) [1]
+step 315: partition node 3
+step 316: heal
+step 319: partition LEADER node 1, held until step 322
+step 320: holding partition of [1]
+step 321: holding partition of [1]
+step 322: hold expired, healing node(s) [1]
+step 323: restart node 2
+step 325: partition node 3
+step 327: partition node 1
+step 329: heal
+step 330: partition node 3
+step 332: partition LEADER node 2, held until step 335
+step 333: holding partition of [2]
+step 335: hold expired, healing node(s) [2]
+step 335: kill node 2
+step 337: partition LEADER node 3, held until step 340
+step 338: partition LEADER node 3, held until step 341
+step 339: restart node 2
+step 340: holding partition of [3]
+step 341: hold expired, healing node(s) [3]
+step 341: partition node 2
+step 344: partition node 3
+step 345: kill node 3
+step 351: partition LEADER node 2, held until step 354
+step 352: partition node 2
+step 353: holding partition of [2]
+step 354: hold expired, healing node(s) [2]
+step 354: partition node 2
+step 358: restart node 3
+step 361: partition node 1
+step 367: partition node 1
+step 370: partition LEADER node 2, held until step 373
+step 371: holding partition of [2]
+step 372: partition node 3
+step 373: hold expired, healing node(s) [2]
+step 373: partition LEADER node 3, held until step 376
+step 374: partition node 1
+step 375: holding partition of [3]
+step 375: heal
+step 376: hold expired, healing node(s) [3]
+step 378: partition LEADER node 3, held until step 381
+step 380: partition node 3
+step 381: hold expired, healing node(s) [3]
+step 381: partition LEADER node 1, held until step 384
+step 383: partition node 2
+step 384: hold expired, healing node(s) [1]
+step 384: partition node 3
+step 386: partition node 2
+step 387: heal
+step 396: partition LEADER node 1, held until step 399
+step 397: holding partition of [1]
+step 398: holding partition of [1]
+step 399: hold expired, healing node(s) [1]
+step 399: partition node 1
+step 400: heal
+step 401: kill node 1
+step 402: partition node 2
+step 403: heal
+step 408: partition node 2
+step 420: partition node 2
+step 425: partition node 3
+step 433: restart node 1
+step 434: partition node 1
+step 436: partition node 2
+step 438: kill node 3
+step 443: restart node 3
+step 445: partition LEADER node 2, held until step 448
+step 447: holding partition of [2]
+step 448: hold expired, healing node(s) [2]
+step 448: partition node 2
+step 449: heal
+step 456: kill node 3
+step 463: partition LEADER node 1, held until step 466
+step 466: hold expired, healing node(s) [1]
+step 471: partition node 2
+step 472: heal
+step 477: partition LEADER node 1, held until step 480
+step 478: holding partition of [1]
+step 480: hold expired, healing node(s) [1]
+step 482: partition LEADER node 1, held until step 485
+step 483: holding partition of [1]
+step 484: holding partition of [1]
+step 485: hold expired, healing node(s) [1]
+step 488: partition LEADER node 1, held until step 491
+step 490: holding partition of [1]
+step 491: hold expired, healing node(s) [1]
+step 491: partition node 1
+step 496: partition LEADER node 1, held until step 499
+step 499: hold expired, healing node(s) [1]
+step 501: partition LEADER node 1, held until step 504
+step 502: holding partition of [1]
+step 503: holding partition of [1]
+step 504: hold expired, healing node(s) [1]
+step 511: restart node 3
+step 512: partition node 3
+step 513: partition LEADER node 1, held until step 516
+step 514: kill node 2
+step 515: holding partition of [1]
+step 516: hold expired, healing node(s) [1]
+step 520: restart node 2
+step 522: partition LEADER node 1, held until step 525
+step 523: partition node 1
+step 524: partition node 3
+step 525: hold expired, healing node(s) [1]
+step 525: heal
+step 527: partition node 1
+step 528: partition node 1
+step 529: partition node 2
+step 530: partition node 2
+step 534: partition node 3
+step 536: kill node 2
+step 538: partition node 3
+step 543: partition node 1
+step 551: restart node 2
+step 555: kill node 2
+step 556: partition node 3
+step 558: partition LEADER node 3, held until step 561
+step 559: partition node 1
+step 560: holding partition of [3]
+step 560: heal
+step 561: hold expired, healing node(s) [3]
+step 562: restart node 2
+step 565: kill node 2
+step 566: restart node 2
+step 567: partition node 1
+step 569: partition node 1
+step 574: partition LEADER node 3, held until step 577
+step 575: holding partition of [3]
+step 576: partition LEADER node 2, held until step 579
+step 577: hold expired, healing node(s) [3]
+step 577: holding partition of [2]
+step 578: holding partition of [2]
+step 579: hold expired, healing node(s) [2]
+step 584: kill node 1
+step 586: restart node 1
+step 590: kill node 2
+step 592: partition LEADER node 3, held until step 595
+step 594: holding partition of [3]
+step 595: hold expired, healing node(s) [3]
+step 597: partition LEADER node 3, held until step 600
+step 598: holding partition of [3]
+step 599: holding partition of [3]
+step 600: hold expired, healing node(s) [3]
