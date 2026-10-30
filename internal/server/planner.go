@@ -6,6 +6,8 @@ import (
 	"github.com/evazheng/fault-tolerant-coordinator/internal/sched"
 	"github.com/evazheng/fault-tolerant-coordinator/internal/state"
 	commandpb "github.com/evazheng/fault-tolerant-coordinator/proto/commandpb"
+
+	"github.com/evazheng/fault-tolerant-coordinator/internal/metrics"
 )
 
 // Planner is the serialization point of the whole design.
@@ -197,6 +199,24 @@ func (p *Planner) Submit(plan *sched.Plan) sched.PlanResult {
 }
 
 func (p *Planner) record(accepted, rejected, planSize int) {
+	// The plan-batching experiment's independent variable, MEASURED rather
+	// than assumed from -max-plan-size: a run configured to batch but offered
+	// too little load to ever find two assignable tasks at once would
+	// otherwise read as a disproof of batching.
+	//
+	// Only non-empty plans are observed. A plan of zero assignments is the
+	// broker having manufactured work that placed nothing, which is a real
+	// phenomenon worth its own counter, but folding it into the size
+	// histogram drags the reported batch size toward zero.
+	if planSize > 0 {
+		metrics.PlanSize.Observe(float64(planSize))
+	}
+	if accepted > 0 {
+		metrics.Assignments.Add(float64(accepted))
+	}
+	if rejected > 0 {
+		metrics.PlanRejections.Add(float64(rejected))
+	}
 	p.statsMu.Lock()
 	defer p.statsMu.Unlock()
 	p.plansSubmitted++

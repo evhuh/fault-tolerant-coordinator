@@ -547,8 +547,9 @@ const (
 	// Distinct from KindHostIO deliberately. Calling this one host-io blames
 	// the machine for the program's own design and fires the "the host did not
 	// sustain the run's timings" banner, which suppresses perfectly good
-	// coverage rates and sends the reader to re-measure something that will
-	// recur on every quiet host. Asynchronous snapshotting is the fix.
+	// coverage rates and sends the reader to re-measure something a quieter
+	// machine cannot remove: every disk has a tail, so a quieter one makes
+	// this rarer rather than impossible. Asynchronous snapshotting is the fix.
 	KindSnapshotBudget ViolationKind = "snapshot-budget"
 	// KindLinearizability is an illegal client history.
 	KindLinearizability ViolationKind = "linearizability"

@@ -8,10 +8,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"net"
+	"net/http"
+	"net/http/pprof"
 	"os"
 	"os/signal"
 	"strconv"
@@ -21,8 +24,10 @@ import (
 
 	"google.golang.org/grpc"
 
+	"github.com/evazheng/fault-tolerant-coordinator/internal/metrics"
 	"github.com/evazheng/fault-tolerant-coordinator/internal/raftnode"
 	"github.com/evazheng/fault-tolerant-coordinator/internal/server"
+	"github.com/evazheng/fault-tolerant-coordinator/internal/state"
 	schedulerpb "github.com/evazheng/fault-tolerant-coordinator/proto/schedulerpb"
 )
 
@@ -40,6 +45,8 @@ func main() {
 	electionTick := flag.Int("election-tick", 10, "election timeout in raft ticks")
 	snapEntries := flag.Uint64("snapshot-entries", 10000, "applied entries between snapshots; low values exercise Restore")
 	snapCatchUp := flag.Uint64("snapshot-catchup-entries", 1000, "entries kept after compaction so a lagging follower can catch up from the log")
+	metricsAddr := flag.String("metrics-addr", "", "Prometheus listen address, e.g. :9090; empty disables it")
+	metricsSample := flag.Duration("metrics-sample", time.Second, "how often queue-depth gauges are resampled from committed state")
 	flag.Parse()
 
 	cfg := server.DefaultConfig()
@@ -89,6 +96,37 @@ func main() {
 	// afterwards.
 	coord := server.New(cfg)
 	svc := server.NewService(coord)
+
+	// METRICS ON THEIR OWN LISTENER, not the gRPC port. A scrape that
+	// contends with the API it is measuring changes the measurement, and
+	// during a benchmark the scraper is the one client guaranteed to be
+	// running.
+	if *metricsAddr != "" {
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", metrics.Handler())
+		// PPROF ON THE SAME PRIVATE LISTENER as the metrics, never on the
+		// client API port. A profile endpoint is a debugging surface, and the
+		// reason it is here at all is that a Ready-loop stall under load
+		// cannot be diagnosed from counters: they say the apply phase blocked
+		// for 600ms, not which function spent the time.
+		mux.HandleFunc("/debug/pprof/", pprof.Index)
+		mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+		mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+		mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+		mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+		ms := &http.Server{Addr: *metricsAddr, Handler: mux}
+		go func() {
+			if err := ms.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				// NOT fatal. Losing instrumentation must not take down a
+				// coordinator that is serving clients correctly.
+				log.Printf("metrics listener: %v", err)
+			}
+		}()
+		defer ms.Close()
+		go sampleGauges(coord, *metricsSample)
+		log.Printf("metrics on %s/metrics and pprof on %s/debug/pprof/, gauges resampled every %s",
+			*metricsAddr, *metricsAddr, *metricsSample)
+	}
 
 	if raftEnabled {
 		rcfg := raftnode.DefaultConfig()
@@ -174,4 +212,27 @@ func parsePeers(spec string) (map[uint64]string, error) {
 		out[id] = v
 	}
 	return out, nil
+}
+
+// sampleGauges refreshes the queue-depth and pending-eval gauges.
+//
+// Reads committed state through the coordinator's own read path, so it sees
+// exactly what a client would and cannot invent a depth the state machine
+// does not have. Runs on every node, not just the leader: a follower's queue
+// depth is a real measurement — it is the same committed state — and a gauge
+// that vanished on failover would look like the queue draining.
+func sampleGauges(coord *server.Coordinator, every time.Duration) {
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for range t.C {
+		var pending, assigned, running int
+		coord.ReadState(func(st *state.StateStore) {
+			counts := st.TaskStateCounts()
+			pending = counts[state.TaskPending]
+			assigned = counts[state.TaskAssigned]
+			running = counts[state.TaskRunning]
+		})
+		ready, blocked := coord.BrokerStats()
+		metrics.Sample(pending, assigned, running, ready+blocked)
+	}
 }

@@ -657,7 +657,7 @@ Run on 2026-10-30 against `e633366`, 64 seeds x 600 steps on the recalibrated fl
 
 ### A snapshot-phase stall on a healthy host is a product limit, not a host failure
 
-`KindSnapshotBudget` exists because the Day 10 checkpoint produced one stall that the old classifier called `host-io`, which was wrong in a way that mattered: it fired the "the host did not sustain the run's timings" banner and suppressed a perfectly good set of coverage rates, sending the reader off to re-measure something that will recur on every quiet host.
+`KindSnapshotBudget` exists because the Day 10 checkpoint produced one stall that the old classifier called `host-io`, which was wrong in a way that mattered: it fired the "the host did not sustain the run's timings" banner and suppressed a perfectly good set of coverage rates, sending the reader off to re-measure something a quieter machine cannot remove — every disk has a tail, so a quieter one makes this rarer rather than impossible.
 
 The rule, in `ClassifyDiskStall`: a disk-bound Ready-loop stall **in the snapshot phase**, on a seed whose **bracketing fsync probes stayed inside the gate's budget**, is `snapshot-budget` — inconclusive for that seed, labelled a known product limitation, and excluded from the quotable verdict. Any other disk-bound phase, and any phase at all on a seed whose probes blew their budget, stays `host-io`. A finding with no phase in it stays `host-io` too: the conservative direction, since the alternative is excusing a real host problem as a product limit.
 

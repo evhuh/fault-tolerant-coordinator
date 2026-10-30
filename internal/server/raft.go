@@ -13,6 +13,7 @@ import (
 
 	"go.etcd.io/raft/v3"
 
+	"github.com/evazheng/fault-tolerant-coordinator/internal/metrics"
 	"github.com/evazheng/fault-tolerant-coordinator/internal/raftnode"
 	"github.com/evazheng/fault-tolerant-coordinator/internal/state"
 	commandpb "github.com/evazheng/fault-tolerant-coordinator/proto/commandpb"
@@ -256,6 +257,8 @@ func (c *Coordinator) applyCommitted(index uint64, data []byte) {
 		return
 	}
 
+	metrics.RaftEntries.WithLabelValues(commandKind(cmd)).Inc()
+
 	c.mu.Lock()
 	res, err := c.store.Apply(cmd)
 	// Inside the lock, next to the mutation, so (state, appliedIndex) is
@@ -306,6 +309,12 @@ func (c *Coordinator) proposeRaft(cmd *commandpb.Command) (state.Result, error) 
 
 	w := c.proposer.register(cmd.ProposalId)
 	defer c.proposer.forget(cmd.ProposalId)
+
+	// COMMIT LATENCY is measured only for proposals that actually committed.
+	// A lost or abandoned proposal would otherwise contribute its full
+	// timeout to the histogram, which turns the fsync cost the plan-batching
+	// experiment is about into a measure of how often leadership moved.
+	proposedAt := time.Now()
 
 	// THE PROPOSAL'S CONTEXT HANGS OFF LEADERSHIP, not off Background.
 	//
@@ -369,6 +378,9 @@ func (c *Coordinator) proposeRaft(cmd *commandpb.Command) (state.Result, error) 
 
 	select {
 	case out := <-w.ch:
+		if out.err == nil {
+			metrics.CommitLatency.Observe(time.Since(proposedAt).Seconds())
+		}
 		return out.result, out.err
 	case <-ctx.Done():
 		// Abandoned, NOT cancelled: the entry may still commit. Every command
@@ -437,6 +449,14 @@ func (c *Coordinator) onLeadershipChanged(isLeader bool) {
 			AtMs: time.Now().UnixMilli(), Term: c.RaftStatus().Term,
 		})
 		c.stallMu.Unlock()
+		// Only a transition TO leadership is a failover: the time from
+		// learning we lead to having rebuilt the broker and resumed. Counting
+		// the step-down side as well would halve the reported latency by
+		// averaging in an event that does no work.
+		if isLeader {
+			metrics.LeaderElections.Inc()
+			metrics.FailoverLatency.Observe(took.Seconds())
+		}
 	}()
 
 	if isLeader {
@@ -720,6 +740,10 @@ func (c *Coordinator) restoredAt(index uint64) {
 // EVIDENCE instead of an unexplained election: the simulator reads it as an
 // invariant violation and fails the run with its seed.
 func (c *Coordinator) onStalled(st raftnode.Stall) {
+	// PHASE-LABELLED, deliberately. An unlabelled stall histogram reports a
+	// snapshot's fsync tail identically to a blocking call in the apply path,
+	// which is the conflation that cost Day 9 an afternoon.
+	metrics.ObserveStall(st.Phase, st.Duration)
 	c.stallMu.Lock()
 	c.stalls = append(c.stalls, st)
 	c.stallMu.Unlock()
@@ -732,6 +756,10 @@ func (c *Coordinator) onStalled(st raftnode.Stall) {
 // it, so what matters is whether the cost is climbing toward the stall
 // threshold, which no single log line can say.
 func (c *Coordinator) onSnapshotted(st raftnode.SnapshotStat) {
+	// Cost AND size together, so a slow snapshot of a small state — a disk
+	// tail, which is what Day 10 found — is distinguishable from a slow
+	// snapshot of a large one.
+	metrics.ObserveSnapshot(st.Bytes, st.Duration)
 	c.stallMu.Lock()
 	c.snapshots = append(c.snapshots, st)
 	c.stallMu.Unlock()
@@ -771,4 +799,30 @@ func (c *Coordinator) Stalls() []raftnode.Stall {
 	c.stallMu.Lock()
 	defer c.stallMu.Unlock()
 	return append([]raftnode.Stall(nil), c.stalls...)
+}
+
+// commandKind names a command's oneof variant for the entry breakdown.
+//
+// A fixed set of strings rather than reflection on the oneof, so the label's
+// cardinality is bounded by this function and an unknown variant is visible
+// as "other" instead of inventing a new time series.
+func commandKind(cmd *commandpb.Command) string {
+	switch cmd.GetKind().(type) {
+	case *commandpb.Command_SubmitJob:
+		return "submit_job"
+	case *commandpb.Command_CreateEval:
+		return "create_eval"
+	case *commandpb.Command_ApplyPlan:
+		return "apply_plan"
+	case *commandpb.Command_CompleteTask:
+		return "complete_task"
+	case *commandpb.Command_FailTask:
+		return "fail_task"
+	case *commandpb.Command_RegisterWorker:
+		return "register_worker"
+	case *commandpb.Command_Tick:
+		return "tick"
+	default:
+		return "other"
+	}
 }

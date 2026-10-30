@@ -1,0 +1,38 @@
+{
+  "label": "smoke: 3 nodes, 4 workers x4, max-plan-size 1000",
+  "started_at": "2026-10-30T12:55:28-04:00",
+  "disclosure": {
+    "cpu": "Apple M3 Pro",
+    "cores": 11,
+    "go_version": "go1.26.5",
+    "os_arch": "darwin/arm64",
+    "coordinator_addrs": [
+      "127.0.0.1:8081",
+      "127.0.0.1:8082",
+      "127.0.0.1:8083"
+    ],
+    "cluster_size": 3,
+    "fsync": "always; WAL synced per batch and every snapshot File.Sync'd, no unsafe mode in this build",
+    "transport": "client load over gRPC; raft peer traffic over HTTP",
+    "harness": "real cmd/coordinator cluster, no simulator and no simnet in the path"
+  },
+  "target_rate": 200,
+  "warmup_ms": 5000,
+  "duration_ms": 20000,
+  "tasks_per_job": 1,
+  "submitted": 4001,
+  "ok": 4001,
+  "failed": 0,
+  "not_leader": 0,
+  "warmup_submitted": 1000,
+  "warmup_ok": 1000,
+  "achieved_rate": 200.05,
+  "p50_ms": 33.087,
+  "p90_ms": 51.999,
+  "p99_ms": 99.327,
+  "p999_ms": 128.511,
+  "max_ms": 143.231,
+  "generator_lag_p99_ms": 0.675,
+  "generator_lag_max_ms": 6.019,
+  "worst_backlog_slots": 2
+}

@@ -1,0 +1,18 @@
+RUN P=1 r1: drain=60.2s planSize=1.00 plans=2000 assigns=2000 completed=2000/2000 rej=368 entries=5278 elections=0
+   entries: complete_task=2008 apply_plan=2000 register_worker=968 tick=302
+RUN P=1 r2: drain=62.1s planSize=1.00 plans=2000 assigns=2000 completed=2000/2000 rej=320 entries=5306 elections=0
+   entries: complete_task=2004 apply_plan=2000 register_worker=992 tick=310
+RUN P=1 r3: drain=93.9s planSize=1.00 plans=2000 assigns=2000 completed=2000/2000 rej=273 entries=5981 elections=0
+   entries: complete_task=2007 apply_plan=2000 register_worker=1504 tick=470
+RUN P=10 r1: drain=16.1s planSize=7.22 plans=277 assigns=2000 completed=2000/2000 rej=362 entries=2618 elections=0
+   entries: complete_task=2004 apply_plan=277 register_worker=257 tick=80
+RUN P=10 r2: drain=18.4s planSize=7.04 plans=284 assigns=2000 completed=2000/2000 rej=407 entries=2677 elections=0
+   entries: complete_task=2005 register_worker=296 apply_plan=284 tick=92
+RUN P=10 r3: drain=18.0s planSize=7.04 plans=284 assigns=2000 completed=2000/2000 rej=411 entries=2666 elections=0
+   entries: complete_task=2003 register_worker=288 apply_plan=284 tick=91
+RUN P=100 r1: drain=19.1s planSize=6.83 plans=293 assigns=2000 completed=2000/2000 rej=606 entries=2707 elections=0
+   entries: complete_task=2006 register_worker=312 apply_plan=293 tick=96
+RUN P=100 r2: drain=18.2s planSize=6.90 plans=290 assigns=2000 completed=2000/2000 rej=708 entries=2678 elections=0
+   entries: complete_task=2001 register_worker=296 apply_plan=290 tick=91
+RUN P=100 r3: drain=19.0s planSize=6.67 plans=300 assigns=2000 completed=2000/2000 rej=591 entries=2703 elections=0
+   entries: complete_task=2003 register_worker=304 apply_plan=300 tick=96

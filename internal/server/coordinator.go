@@ -26,6 +26,8 @@ import (
 	"github.com/evazheng/fault-tolerant-coordinator/internal/sched"
 	"github.com/evazheng/fault-tolerant-coordinator/internal/state"
 	commandpb "github.com/evazheng/fault-tolerant-coordinator/proto/commandpb"
+
+	"github.com/evazheng/fault-tolerant-coordinator/internal/metrics"
 )
 
 // Config carries the timing budget. The defaults are the ones Day 11 has to
@@ -289,6 +291,23 @@ func (c *Coordinator) afterApply(cmd *commandpb.Command, res state.Result) {
 	broker := c.brokerRef()
 	if broker == nil {
 		return // scheduling pipeline not started (tests, or a follower)
+	}
+
+	// METERED HERE, after the leader-only guard, which is what keeps a
+	// 3-node cluster from reporting three times its real throughput:
+	// followers compute the identical Result and return above.
+	if res.TaskOutcome != "" {
+		metrics.TasksTotal.WithLabelValues(res.TaskOutcome).Inc()
+	}
+	// Terminal by attempt budget is a FAILURE, counted the same as a
+	// terminal FailTask: the task will never run again and no effect stands
+	// behind it. Leaving it out would make completions plus failures fall
+	// short of submissions with nothing explaining the gap.
+	for range res.FailedByBudget {
+		metrics.TasksTotal.WithLabelValues(state.TaskOutcomeFailed).Inc()
+	}
+	for _, lagMs := range res.ReclaimLagMs {
+		metrics.WorkerReclaimLatency.Observe(float64(lagMs) / 1000)
 	}
 
 	// (1) Every trigger becomes an evaluation. The id is DERIVED from what

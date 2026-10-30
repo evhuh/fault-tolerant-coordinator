@@ -12,11 +12,11 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
-	"slices"
 	"sort"
 
 	commandpb "github.com/evazheng/fault-tolerant-coordinator/proto/commandpb"
 	schedulerpb "github.com/evazheng/fault-tolerant-coordinator/proto/schedulerpb"
+	"slices"
 )
 
 // Command versions. These describe the MEANING of a command, not its wire
@@ -310,6 +310,20 @@ type Result struct {
 	// won, rather than a loser arriving late. A different case, and lumping
 	// the two together would overstate how often the stale path ran.
 	DuplicateReport bool
+	// TaskOutcome names what this command did to a task's LIFECYCLE, for the
+	// throughput counter: "completed", "failed" (terminally) or "retried".
+	//
+	// Computed identically on every replica like everything else here; only
+	// the leader meters it, which is what keeps a 3-node cluster from
+	// reporting three times its real throughput. Empty for a command that
+	// changed no task's lifecycle, including a stale or duplicate report —
+	// counting those would inflate throughput with work that did not happen.
+	TaskOutcome string
+	// ReclaimLagMs is, per reclaimed task, how far PAST its lease expiry the
+	// committed clock had moved when the reclaim happened. One entry per
+	// task, because one Tick can reclaim many and an average would hide the
+	// worst.
+	ReclaimLagMs []int64
 }
 
 type WorkerState uint8
@@ -833,6 +847,9 @@ func (s *StateStore) applyTick(c *commandpb.Tick) (Result, error) {
 		if workerLost {
 			reason = EvalWorkerLost
 		}
+		// Captured BEFORE the field is cleared below, which is the whole
+		// reason this is a local: reading it afterwards always gives zero.
+		expiredAtMs := t.LeaseExpiryMs
 		s.setTaskWorker(t, "")
 		t.LeaseExpiryMs = 0
 
@@ -851,6 +868,17 @@ func (s *StateStore) applyTick(c *commandpb.Tick) (Result, error) {
 			continue
 		}
 
+		// RECLAIM LAG, in state-machine time rather than wall time.
+		//
+		// The gap between the lease expiring and this Tick noticing is the
+		// quantity the resume claims ("within 3s of a missed heartbeat"), and
+		// it is a function of the tick period and of whether ticks are
+		// committing at all. Measured here because `now` is the committed
+		// clock: wall time on the leader would also include the host's own
+		// delays, which is a different claim.
+		if expiredAtMs > 0 {
+			res.ReclaimLagMs = append(res.ReclaimLagMs, now-expiredAtMs)
+		}
 		// NO BACKOFF HERE, deliberately. The worker died; the task never had
 		// its chance, so delaying the retry only burns the reclaim budget.
 		t.State = TaskPending
@@ -1051,7 +1079,7 @@ func (s *StateStore) applyCompleteTask(c *commandpb.CompleteTask) (Result, error
 	t.LastError = ""
 
 	s.recomputeJobState(t.JobID)
-	return Result{JobID: t.JobID}, nil
+	return Result{JobID: t.JobID, TaskOutcome: TaskOutcomeCompleted}, nil
 }
 
 // 6. FailTask
@@ -1086,6 +1114,7 @@ func (s *StateStore) applyFailTask(c *commandpb.FailTask) (Result, error) {
 	t.LeaseExpiryMs = 0
 
 	if c.GetRetryable() && t.Attempt < t.Spec.MaxAttempts {
+		res.TaskOutcome = TaskOutcomeRetried
 		t.State = TaskPending
 		// The task RAN and failed, which may be a crash loop — back off before
 		// trying again. Lease expiry deliberately does NOT do this: there the
@@ -1099,6 +1128,7 @@ func (s *StateStore) applyFailTask(c *commandpb.FailTask) (Result, error) {
 			Attempt: t.Attempt,
 		})
 	} else {
+		res.TaskOutcome = TaskOutcomeFailed
 		t.State = TaskFailed
 		t.ExitCode = c.GetExitCode()
 	}
@@ -1335,6 +1365,33 @@ func (s *StateStore) CorruptForTesting(taskID string) {
 	if t, ok := s.tasks[taskID]; ok {
 		t.State = TaskPending // worker and lease deliberately left behind
 	}
+}
+
+// The three task lifecycle outcomes a throughput counter distinguishes.
+// "retried" is separate from the other two deliberately: completions rising
+// alongside retries is a very different system from completions rising alone,
+// and a single "done" counter cannot tell them apart.
+const (
+	TaskOutcomeCompleted = "completed"
+	TaskOutcomeFailed    = "failed"
+	TaskOutcomeRetried   = "retried"
+)
+
+// TaskStateCounts counts tasks in each non-terminal state.
+//
+// SAMPLED from committed state rather than tracked incrementally, so the
+// gauge cannot drift out of agreement with the state machine. An incremented
+// counter and a state machine are two sources of truth, and the Day 10
+// lesson about counters that only ever counted failures applies here too.
+func (s *StateStore) TaskStateCounts() map[TaskState]int {
+	out := make(map[TaskState]int, 3)
+	for _, t := range s.tasks {
+		switch t.State {
+		case TaskPending, TaskAssigned, TaskRunning:
+			out[t.State]++
+		}
+	}
+	return out
 }
 
 // setTaskWorker moves a task between workers and keeps tasksByWorker exact.
