@@ -620,6 +620,10 @@ What this does to the numbers already taken, stated plainly rather than quietly:
 - **The overlap and stale-rejection floors are VOID.** They were calibrated at 0.85 and 1.17 per 100 run-steps against an adversary that cancelled its own partitions; additive isolation is a strictly harsher adversary, and a floor carried across that change would be a number pretending to be a measurement.
 - **Recalibration comes before the next checkpoint**, on the same two-sweep basis as the first calibration, and the new floors carry their n and seed range like every other quoted rate.
 
+**The experiment this change waited behind is done.** The snapshot-reporting fix was measured over 64 seeds under the OLD replace semantics first, because changing the adversary at the same time would have confounded the only question that run existed to answer. It returned zero frozen-clock windows and is recorded in `results/2026-10-29-checkpoint-a/`. Additive isolation is next, and the floors it needs are recalibrated rather than carried.
+
+**The coverage numbers from that run are floors-met, not quotable.** 299 overlapping executions against a floor of 160 and 467 stale rejections against a floor of 200, but seed 54 took a 175ms host-I/O stall, which trips the rule that a rate measured on a host that did not sustain the run's timings is re-measured before being quoted. They are superseded by the additive-isolation checkpoint, which is where quotable coverage comes from.
+
 ### Drop reasons are counted apart
 
 A message can fail to arrive for three unrelated reasons, and folding them together produces a "drop rate" that is mostly messages to a switched-off node:
@@ -722,7 +726,11 @@ No `PendingSnapshot` timeout is needed: both outcomes call `BecomeProbe`, so pro
 
 **What is claimed, and what is not.** The mechanism is proven and the fix is verified by `TestDroppedSnapshotDoesNotParkAFollower`, which fails without the report and passes with it. It MATCHES the shape of all five frozen-clock windows the Day 10 checkpoint recorded — one leader, one term, no leadership transitions, nominal quorum, proposals lost for seconds — but those windows were captured before the raft progress table was instrumented, so **none of them shows a follower in `StateSnapshot`** and the attribution is unproven. A 24-seed hunt with full instrumentation then found no windows at all, which at a ~6% per-run rate is a one-in-four outcome and settles nothing.
 
-The evidence that would settle it is a post-fix 64-seed checkpoint under the *same* adversary, before the partition semantics change: the pre-fix rate was 4 of 64, so zero windows across 64 seeds is roughly a 2% outcome by chance.
+**What the post-fix run then settled, and how far it goes.** That experiment has now been run: 64 seeds x 600 steps on `29644d1` under the unchanged REPLACE adversary, so the fix was the only variable. **Zero frozen-clock windows**, against 4 of 64 before the fix. Every finding across all 64 rows was INCONCLUSIVE, of three kinds only — `linearizability-coverage` (64, expected by construction), `ledger-coverage` (6) and `host-io` (1) — with no `invariant`, `convergence`, `readyloop-stall`, `effect-ledger` or `did-not-drain` finding anywhere in the run. Seed 54 ended at step 343 of 600 on a 175ms host-I/O stall, so the basis is 63.6 full seeds rather than 64 and zero is a **~1.7%** outcome by chance.
+
+So the claim is: the mechanism is proven, the fix is verified by a deterministic reproduction, and **the failure did not recur across 64 post-fix seeds under the same adversary.** That is a RATE argument, not a captured progress table. No instrumented window was ever recorded showing a follower parked in `StateSnapshot` during a checkpoint, and none ever will be now, so the five original windows remain formally unattributed. What is settled is that the failure mode the checkpoint kept hitting is gone, and that the mechanism able to produce it is fixed.
+
+Fixed in `29644d1`. The full record is in `results/2026-10-29-checkpoint-a/`, and the running order is in the roadmap's "Day 10 — HANDOFF" section.
 
 ### A proposal's context hangs off leadership
 

@@ -1,0 +1,326 @@
+step 1: kill node 3
+step 5: heal
+step 6: heal
+step 7: partition node 1
+step 9: heal
+step 12: partition node 1
+step 13: partition LEADER node 2, held for 3 steps
+step 15: holding partition (2 steps left)
+step 16: holding partition (1 steps left)
+step 19: holding partition (0 steps left)
+step 23: partition node 1
+step 26: heal
+step 29: partition LEADER node 2, held for 3 steps
+step 32: holding partition (2 steps left)
+step 33: holding partition (1 steps left)
+step 34: restart node 3
+step 35: holding partition (0 steps left)
+step 38: partition LEADER node 1, held for 3 steps
+step 39: holding partition (2 steps left)
+step 40: holding partition (1 steps left)
+step 41: kill node 2
+step 42: holding partition (0 steps left)
+step 45: partition node 3
+step 51: heal
+step 52: partition LEADER node 3, held for 3 steps
+step 53: holding partition (2 steps left)
+step 54: partition node 3
+step 55: holding partition (1 steps left)
+step 56: holding partition (0 steps left)
+step 60: partition node 3
+step 63: heal
+step 64: restart node 2
+step 68: partition LEADER node 3, held for 3 steps
+step 69: holding partition (2 steps left)
+step 70: kill node 1
+step 71: restart node 1
+step 72: holding partition (1 steps left)
+step 73: kill node 3
+step 74: partition node 2
+step 75: holding partition (0 steps left)
+step 77: heal
+step 78: heal
+step 80: heal
+step 83: partition LEADER node 1, held for 3 steps
+step 84: partition node 2
+step 86: holding partition (2 steps left)
+step 87: holding partition (1 steps left)
+step 88: holding partition (0 steps left)
+step 89: heal
+step 91: restart node 3
+step 93: partition node 3
+step 95: partition LEADER node 1, held for 3 steps
+step 96: holding partition (2 steps left)
+step 97: holding partition (1 steps left)
+step 98: kill node 2
+step 99: partition node 1
+step 101: holding partition (0 steps left)
+step 102: partition node 3
+step 105: partition node 3
+step 106: heal
+step 112: partition LEADER node 3, held for 3 steps
+step 113: holding partition (2 steps left)
+step 115: holding partition (1 steps left)
+step 116: holding partition (0 steps left)
+step 119: heal
+step 125: restart node 2
+step 126: kill node 3
+step 128: heal
+step 134: heal
+step 135: partition node 1
+step 138: partition LEADER node 1, held for 3 steps
+step 139: holding partition (2 steps left)
+step 140: holding partition (1 steps left)
+step 141: holding partition (0 steps left)
+step 150: partition node 1
+step 152: partition LEADER node 1, held for 3 steps
+step 154: restart node 3
+step 155: partition LEADER node 2, held for 3 steps
+step 156: holding partition (2 steps left)
+step 157: partition node 3
+step 158: holding partition (1 steps left)
+step 160: holding partition (0 steps left)
+step 164: kill node 2
+step 167: partition LEADER node 3, held for 3 steps
+step 168: partition node 1
+step 169: holding partition (2 steps left)
+step 170: restart node 2
+step 171: holding partition (1 steps left)
+step 172: partition LEADER node 3, held for 3 steps
+step 173: holding partition (2 steps left)
+step 174: holding partition (1 steps left)
+step 175: holding partition (0 steps left)
+step 176: kill node 2
+step 179: restart node 2
+step 181: heal
+step 184: kill node 1
+step 185: heal
+step 187: restart node 1
+step 188: kill node 1
+step 189: partition node 3
+step 190: partition node 2
+step 191: heal
+step 192: partition node 2
+step 193: heal
+step 197: restart node 1
+step 200: partition node 1
+step 201: kill node 1
+step 202: partition LEADER node 3, held for 3 steps
+step 203: holding partition (2 steps left)
+step 204: holding partition (1 steps left)
+step 205: holding partition (0 steps left)
+step 206: partition node 2
+step 207: heal
+step 209: partition LEADER node 3, held for 3 steps
+step 210: partition LEADER node 3, held for 3 steps
+step 211: holding partition (2 steps left)
+step 212: holding partition (1 steps left)
+step 213: restart node 1
+step 214: partition node 3
+step 215: holding partition (0 steps left)
+step 216: kill node 2
+step 219: heal
+step 220: partition node 1
+step 221: partition LEADER node 1, held for 3 steps
+step 223: holding partition (2 steps left)
+step 224: restart node 2
+step 225: partition LEADER node 3, held for 3 steps
+step 226: partition LEADER node 3, held for 3 steps
+step 227: holding partition (2 steps left)
+step 228: kill node 2
+step 230: holding partition (1 steps left)
+step 231: holding partition (0 steps left)
+step 235: partition LEADER node 1, held for 3 steps
+step 236: holding partition (2 steps left)
+step 240: holding partition (1 steps left)
+step 242: holding partition (0 steps left)
+step 245: heal
+step 246: partition node 1
+step 249: heal
+step 251: partition node 1
+step 254: partition node 1
+step 260: restart node 2
+step 261: partition LEADER node 1, held for 3 steps
+step 262: holding partition (2 steps left)
+step 263: partition node 1
+step 264: holding partition (1 steps left)
+step 265: partition node 1
+step 266: partition node 3
+step 267: holding partition (0 steps left)
+step 269: partition LEADER node 2, held for 3 steps
+step 270: holding partition (2 steps left)
+step 271: holding partition (1 steps left)
+step 272: kill node 3
+step 275: holding partition (0 steps left)
+step 277: heal
+step 279: partition LEADER node 1, held for 3 steps
+step 280: holding partition (2 steps left)
+step 281: restart node 3
+step 282: holding partition (1 steps left)
+step 283: partition LEADER node 2, held for 3 steps
+step 284: partition node 2
+step 285: kill node 1
+step 286: holding partition (2 steps left)
+step 288: holding partition (1 steps left)
+step 292: partition node 2
+step 293: holding partition (0 steps left)
+step 294: partition node 3
+step 298: partition node 3
+step 299: heal
+step 302: partition LEADER node 2, held for 3 steps
+step 305: holding partition (2 steps left)
+step 306: holding partition (1 steps left)
+step 307: holding partition (0 steps left)
+step 308: heal
+step 310: heal
+step 312: partition node 2
+step 314: restart node 1
+step 315: partition LEADER node 3, held for 3 steps
+step 316: holding partition (2 steps left)
+step 317: holding partition (1 steps left)
+step 318: holding partition (0 steps left)
+step 320: partition LEADER node 2, held for 3 steps
+step 322: holding partition (2 steps left)
+step 323: kill node 2
+step 324: holding partition (1 steps left)
+step 325: holding partition (0 steps left)
+step 326: heal
+step 328: partition node 3
+step 330: partition node 1
+step 334: heal
+step 337: partition node 1
+step 339: partition node 1
+step 340: partition node 1
+step 341: restart node 2
+step 346: partition node 2
+step 349: partition node 1
+step 351: partition LEADER node 2, held for 3 steps
+step 352: holding partition (2 steps left)
+step 353: partition LEADER node 3, held for 3 steps
+step 355: partition node 3
+step 356: holding partition (2 steps left)
+step 357: kill node 3
+step 358: holding partition (1 steps left)
+step 359: holding partition (0 steps left)
+step 365: restart node 3
+step 366: heal
+step 368: partition node 1
+step 369: kill node 2
+step 372: heal
+step 375: restart node 2
+step 377: partition node 1
+step 379: kill node 3
+step 380: partition node 2
+step 388: partition LEADER node 1, held for 3 steps
+step 389: partition node 1
+step 390: holding partition (2 steps left)
+step 391: holding partition (1 steps left)
+step 392: partition node 2
+step 393: holding partition (0 steps left)
+step 396: heal
+step 405: partition LEADER node 1, held for 3 steps
+step 407: holding partition (2 steps left)
+step 408: restart node 3
+step 410: partition node 2
+step 411: kill node 2
+step 412: holding partition (1 steps left)
+step 413: holding partition (0 steps left)
+step 415: partition LEADER node 1, held for 3 steps
+step 416: holding partition (2 steps left)
+step 417: holding partition (1 steps left)
+step 418: holding partition (0 steps left)
+step 419: heal
+step 422: restart node 2
+step 423: partition node 2
+step 424: partition LEADER node 1, held for 3 steps
+step 426: kill node 2
+step 427: partition LEADER node 3, held for 3 steps
+step 428: holding partition (2 steps left)
+step 429: holding partition (1 steps left)
+step 430: holding partition (0 steps left)
+step 432: restart node 2
+step 433: kill node 2
+step 443: partition node 1
+step 445: partition node 3
+step 451: partition LEADER node 3, held for 3 steps
+step 454: partition node 1
+step 455: holding partition (2 steps left)
+step 456: holding partition (1 steps left)
+step 457: holding partition (0 steps left)
+step 461: heal
+step 462: partition LEADER node 3, held for 3 steps
+step 463: partition node 1
+step 464: restart node 2
+step 465: holding partition (2 steps left)
+step 467: partition LEADER node 3, held for 3 steps
+step 468: partition node 1
+step 469: partition node 1
+step 470: holding partition (2 steps left)
+step 471: holding partition (1 steps left)
+step 472: kill node 2
+step 473: partition node 3
+step 475: restart node 2
+step 476: holding partition (0 steps left)
+step 477: kill node 2
+step 480: heal
+step 482: heal
+step 483: partition node 3
+step 484: partition LEADER node 3, held for 3 steps
+step 486: holding partition (2 steps left)
+step 487: holding partition (1 steps left)
+step 488: holding partition (0 steps left)
+step 492: partition node 3
+step 493: partition node 3
+step 497: restart node 2
+step 499: partition node 2
+step 500: kill node 3
+step 501: heal
+step 503: partition node 2
+step 504: restart node 3
+step 505: partition node 2
+step 506: partition LEADER node 1, held for 3 steps
+step 509: holding partition (2 steps left)
+step 510: holding partition (1 steps left)
+step 511: holding partition (0 steps left)
+step 512: kill node 2
+step 513: heal
+step 515: heal
+step 519: restart node 2
+step 520: partition node 3
+step 521: partition node 1
+step 524: kill node 1
+step 525: partition node 3
+step 530: restart node 1
+step 531: heal
+step 533: partition node 1
+step 536: kill node 2
+step 538: partition node 1
+step 539: heal
+step 546: heal
+step 547: partition node 3
+step 554: partition LEADER node 1, held for 3 steps
+step 555: holding partition (2 steps left)
+step 556: holding partition (1 steps left)
+step 558: holding partition (0 steps left)
+step 562: partition LEADER node 1, held for 3 steps
+step 564: holding partition (2 steps left)
+step 565: holding partition (1 steps left)
+step 566: holding partition (0 steps left)
+step 571: restart node 2
+step 572: kill node 2
+step 573: restart node 2
+step 575: heal
+step 576: partition node 2
+step 577: partition node 3
+step 579: heal
+step 581: heal
+step 582: partition LEADER node 1, held for 3 steps
+step 583: kill node 2
+step 584: partition node 1
+step 585: holding partition (2 steps left)
+step 587: holding partition (1 steps left)
+step 588: restart node 2
+step 590: holding partition (0 steps left)
+step 591: heal
+step 596: partition node 2
+step 599: kill node 2
