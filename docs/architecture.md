@@ -779,6 +779,34 @@ So the claim is: the mechanism is proven, the fix is verified by a deterministic
 
 Fixed in `29644d1`. The full record is in `results/2026-10-29-checkpoint-a/`, and the running order is in the roadmap's "Day 10 — HANDOFF" section.
 
+### An oracle written from the same model as the code inherits its blind spots
+
+`TestTasksByWorkerIndexMatchesAFullScan` compares the maintained worker index against a full scan of every task, after every step of a random command sequence. It is the right shape of test and it passed a defect.
+
+The index kept every COMPLETED task forever, because `applyCompleteTask` sets `WorkerID` as provenance and never clears it. The oracle did not catch it because the oracle was written from the same mental model as the implementation: both asked "which tasks have `WorkerID == w`", and neither asked "and are they still running". Two implementations of the same wrong idea agree perfectly.
+
+What found it was an **independent oracle** — a benchmark that knew nothing about the index and only knew that a task should stop being attributed to a dead worker. It timed out, and the timeout's captured state said the rest.
+
+So, as a rule: **where an independent oracle exists, prefer it to a reimplementation of the thing under test.** This project has one and it is good — the effect ledger reads the workers' own result tree and compares it against what the coordinator committed, with no shared code and no shared assumptions. Re-execution of finished work, which is precisely what an index offering terminal tasks would cause, shows up there as executions exceeding committed effects. A differential test against a second implementation is still worth having; it is just worth knowing what it cannot see.
+
+The narrower lesson, recorded because it is checkable: when a derived index is added, its invariant has to name **every** field it depends on. This one depended on `WorkerID` and on `State`, the comment said only `WorkerID`, and the test asserted only what the comment said.
+
+### Measure the mechanism before theorizing about it
+
+A rule for diagnosis, earned three times in this project and most expensively during Day 11.
+
+**When something does not work, print the state that would distinguish the explanations, before changing anything.** A plausible theory costs a build, a run and a wait; printing the state costs one command. The theories feel cheaper because they arrive first.
+
+The Day 11 reclaim benchmark timed out on every trial. Two changes were made on plausible theories before anything was measured — the detection logic, then process tracking — and the symptom survived both, because neither was the cause. What resolved it was printing the worker's lease every 500ms and noticing it advancing when no process was alive to advance it. That one observation named the cause immediately: `pkill -f "ftc-bench/worker"` matched nothing, because the harness launches `./worker` from that directory and the pattern never appears in the command line, so stale workers from earlier runs kept heartbeating under the same ids. `register_worker` entries climbed 39 to 60 in the four seconds after "killing all workers".
+
+The same pattern appears in the earlier entries here, which is why this is a rule rather than an anecdote:
+
+- Day 9's stall detector reported a 3.42s fsync as "a blocking call on the loop's own goroutine". The phase was in the data; nobody looked at it.
+- Day 10's frozen-clock windows produced four wrong attributions in sequence — leadership churn, broker rebuild, snapshot serialization, `Snapshot()` contention — each discarded by a measurement that took minutes. The fifth attempt instrumented the raft progress table and found the parked follower.
+- Day 11's apply stalls were blamed on three per-apply scans by reasoning about which code was O(n). A CPU profile cleared all three and named a per-RPC scan instead.
+
+**The corollary: make a failure explain itself.** The reclaim harness now captures the leader's full view, the queue depths and the task counters at the moment of a timeout, so the next timeout arrives with its own diagnosis attached rather than requiring a rerun with print statements bolted on. That capture is what turned the second failure — which looked identical to the first — into a one-line finding: a task held by a LOST worker while every queue depth read zero, which is only possible if the task is terminal.
+
 ### No O(state) work under the apply lock on an RPC path
 
 **The rule: an RPC handler must not do work proportional to total state while holding `c.mu`.** `Coordinator.read` takes the same mutex `applyCommitted` takes to apply committed entries, so an RPC that scans the whole store under it does not merely answer slowly — it stops the Ready loop, and a Ready loop stopped for longer than an election timeout costs leadership.

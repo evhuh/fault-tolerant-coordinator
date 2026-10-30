@@ -443,6 +443,17 @@ type StateStore struct {
 	// inside Apply at every transition that changes a task's WorkerID, which
 	// makes it deterministic on every replica like everything else here.
 	//
+	// INVARIANT: tasksByWorker[w] holds the ids whose Task.WorkerID == w AND
+	// whose state is non-terminal.
+	//
+	// The state half is not decoration. applyCompleteTask SETS WorkerID as
+	// provenance — which worker ran this — and never clears it, so an index
+	// keyed on WorkerID alone retains every completed task forever: an
+	// unbounded leak in an always-on coordinator, and a TasksHeldBy whose
+	// cost grows with completion count rather than with concurrency. The
+	// full scan this replaced was immune because it filtered on state.
+	// Day 11's reclaim benchmark found it by timing out.
+	//
 	// It exists because answering "which task does worker W hold" used to
 	// sort EVERY task id in the store. That sort ran on the RequestTask long
 	// poll, under the apply lock, 256 pollers at a time: measured as 540-695ms
@@ -858,6 +869,7 @@ func (s *StateStore) applyTick(c *commandpb.Tick) (Result, error) {
 		// scheduler a task no ApplyPlan can ever satisfy.
 		if t.Attempt >= t.Spec.MaxAttempts {
 			t.State = TaskFailed
+			s.unindexTask(t)
 			t.LastError = fmt.Sprintf("lease expired on attempt %d of %d (%s)",
 				t.Attempt, t.Spec.MaxAttempts, reason)
 			// Reported, because this is the one terminal path no effect
@@ -1072,6 +1084,7 @@ func (s *StateStore) applyCompleteTask(c *commandpb.CompleteTask) (Result, error
 	}
 
 	t.State = TaskComplete
+	s.unindexTask(t)
 	t.ResultRef = c.GetResultRef()
 	t.ExitCode = c.GetExitCode()
 	s.setTaskWorker(t, c.GetWorkerId())
@@ -1130,6 +1143,7 @@ func (s *StateStore) applyFailTask(c *commandpb.FailTask) (Result, error) {
 	} else {
 		res.TaskOutcome = TaskOutcomeFailed
 		t.State = TaskFailed
+		s.unindexTask(t)
 		t.ExitCode = c.GetExitCode()
 	}
 
@@ -1403,6 +1417,8 @@ func (s *StateStore) TaskStateCounts() map[TaskState]int {
 // compares against a full scan after every step.
 func (s *StateStore) setTaskWorker(t *Task, workerID string) {
 	if t.WorkerID == workerID {
+		// Same worker, but a terminal transition may still need to drop it
+		// from the index — see unindexTask, which the terminal paths call.
 		return
 	}
 	if old := t.WorkerID; old != "" {
@@ -1417,7 +1433,7 @@ func (s *StateStore) setTaskWorker(t *Task, workerID string) {
 		}
 	}
 	t.WorkerID = workerID
-	if workerID == "" {
+	if workerID == "" || terminal(t.State) {
 		return
 	}
 	set := s.tasksByWorker[workerID]
@@ -1428,6 +1444,24 @@ func (s *StateStore) setTaskWorker(t *Task, workerID string) {
 	set[t.ID] = struct{}{}
 }
 
+// unindexTask drops a task from the worker index WITHOUT clearing its
+// WorkerID, which stays as provenance: a completed task records which worker
+// ran it, and callers rely on that.
+//
+// Called on every terminal transition. The property test's oracle computes
+// the same invariant from a full scan, so a terminal path that forgets this
+// shows up as a mismatch rather than as a slow leak.
+func (s *StateStore) unindexTask(t *Task) {
+	set := s.tasksByWorker[t.WorkerID]
+	if set == nil {
+		return
+	}
+	delete(set, t.ID)
+	if len(set) == 0 {
+		delete(s.tasksByWorker, t.WorkerID)
+	}
+}
+
 // rebuildTasksByWorker recomputes the index from the tasks map.
 //
 // Called after a snapshot restore, which replaces the maps wholesale. Derived
@@ -1436,7 +1470,7 @@ func (s *StateStore) setTaskWorker(t *Task, workerID string) {
 func (s *StateStore) rebuildTasksByWorker() {
 	s.tasksByWorker = make(map[string]map[string]struct{}, len(s.workers))
 	for id, t := range s.tasks {
-		if t.WorkerID == "" {
+		if t.WorkerID == "" || terminal(t.State) {
 			continue
 		}
 		set := s.tasksByWorker[t.WorkerID]

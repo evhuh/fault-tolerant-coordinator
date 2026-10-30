@@ -15,10 +15,17 @@ import (
 // This is the oracle: whatever the maintained index claims, a scan of every
 // task has to agree with it. Keeping the oracle this dumb is the point —
 // anything clever here could share a bug with the thing under test.
+//
+// TERMINAL TASKS ARE EXCLUDED, which is the invariant and not a detail.
+// applyCompleteTask sets WorkerID as provenance and never clears it, so an
+// index keyed on WorkerID alone keeps every completed task forever: an
+// unbounded leak, and a held-task list that reports finished work as held.
+// The first version of this oracle omitted the state half and therefore
+// agreed with a leaking index.
 func fullScanByWorker(s *StateStore) map[string][]string {
 	out := map[string][]string{}
 	for id, t := range s.tasks {
-		if t.WorkerID == "" {
+		if t.WorkerID == "" || terminal(t.State) {
 			continue
 		}
 		out[t.WorkerID] = append(out[t.WorkerID], id)
@@ -296,4 +303,46 @@ func storeWithTasks(t *testing.T, n int) *StateStore {
 		t.Fatalf("setup failed: w-probe holds nothing at n=%d", n)
 	}
 	return s
+}
+
+// A COMPLETED task must leave the index while keeping its WorkerID.
+//
+// The regression this pins: tasksByWorker retained every completed task, so
+// the map grew without bound and TasksHeldBy reported finished work as held.
+// Day 11's reclaim benchmark hit it as a timeout — the harness waited for a
+// task to stop being attributed to a dead worker, and it never did.
+func TestTerminalTasksLeaveTheIndexButKeepTheirWorker(t *testing.T) {
+	s := New()
+	mustApply(t, s, withCapacity(registerWorkerCmd("w-1", 0, 100000), 2))
+	mustApply(t, s, submitJobCmd("j-1", "c", "r", nTaskIDs(2)...))
+	ids := s.sortedTaskIDs()
+	mustApply(t, s, applyPlanCmd("e-1", []assign{
+		{taskID: ids[0], workerID: "w-1", attempt: 1, leaseMs: 100000},
+		{taskID: ids[1], workerID: "w-1", attempt: 1, leaseMs: 100000},
+	}))
+	if got := s.TasksHeldBy("w-1"); len(got) != 2 {
+		t.Fatalf("after dispatch the worker holds %v, want 2 tasks", got)
+	}
+
+	mustApply(t, s, completeTaskCmd(ids[0], "w-1", 1, "ref"))
+	if got := s.TasksHeldBy("w-1"); !slices.Equal(got, []string{ids[1]}) {
+		t.Errorf("after completing %s the worker holds %v, want only %s — a completed task "+
+			"left in the index is an unbounded leak", ids[0], got, ids[1])
+	}
+	// PROVENANCE SURVIVES. The completed task still records which worker ran
+	// it; only the index membership goes.
+	done, ok := s.Task(ids[0])
+	if !ok || done.WorkerID != "w-1" {
+		t.Errorf("completed task %s lost its WorkerID (%q); provenance must survive", ids[0], done.WorkerID)
+	}
+	if _, found := s.AssignedTaskFor("w-1"); !found {
+		t.Error("the remaining assigned task is no longer findable")
+	}
+
+	// Terminal FAILURE, the other path.
+	mustApply(t, s, failTaskCmd(ids[1], "w-1", 1, false))
+	if got := s.TasksHeldBy("w-1"); len(got) != 0 {
+		t.Errorf("after a terminal failure the worker still holds %v", got)
+	}
+	assertIndexMatchesScan(t, s, 0, "after terminal transitions")
 }
