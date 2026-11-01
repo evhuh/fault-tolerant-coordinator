@@ -184,7 +184,28 @@ type Handler struct {
 
 // Stall is one observed Ready-loop stall, with the phase it was in.
 type Stall struct {
+	// Duration is the blocked time. Whether it is the REAL blocked time
+	// depends on Completed — see that field, and read a Completed=false
+	// duration as a floor rather than a measurement.
 	Duration time.Duration
+	// ID identifies the stalled batch, so the at-detection report and the
+	// completed report can be correlated by a consumer that keeps both.
+	ID int64
+	// Completed says whether Duration is the batch's FULL blocked time.
+	//
+	// The detector polls at threshold/2 and reports once per stall, so its
+	// first report fires at somewhere between threshold and 1.5x threshold
+	// however long the stall eventually runs: at a 500ms threshold, every
+	// reported duration landed in 500-748ms with a 501ms median, which is
+	// the poll interval showing through and not a property of the stalls. A
+	// six-second stall was reported as roughly 500ms.
+	//
+	// So there are two reports per stall. Completed=false is the EARLY
+	// WARNING, emitted at detection, and it matters because a stall that
+	// never ends — a genuine hang — never produces the second one.
+	// Completed=true is emitted when the batch finishes and carries the real
+	// duration, and it is the only one worth feeding a latency histogram.
+	Completed bool
 	// Phase is which part of the batch was running, e.g. "snapshot+compact"
 	// or "leadership-change". Naming it is what makes a stall investigable.
 	Phase string
@@ -271,6 +292,17 @@ type Node struct {
 	// select waiting for work, and a watchdog that could not tell the two
 	// apart would fire constantly. Only time spent INSIDE a batch counts.
 	processingSince atomic.Int64
+	// reportedStall holds the processingSince value of a batch the watchdog
+	// has already reported, so handleReady's defer knows to emit the
+	// completed duration for it. Zero means nothing outstanding.
+	reportedStall atomic.Int64
+	// reportedPhase is the phase the watchdog SAW the batch stalled in.
+	//
+	// The completion report cannot read n.phase, because handleReady's
+	// phaseIdle defer is registered after the reporting one and therefore
+	// runs before it: the completed report would otherwise always say
+	// "idle" and lose the only field that makes a stall investigable.
+	reportedPhase atomic.Int32
 
 	fatalOnce sync.Once
 	fatalErr  error
@@ -526,14 +558,20 @@ func (n *Node) watchStalls() {
 			}
 			if elapsed := time.Since(time.Unix(0, since)); elapsed > threshold {
 				reportedFor = since
+				// Handed to handleReady's defer so the batch reports its
+				// COMPLETED duration when it finishes.
 				ph := n.phase.Load()
 				where := phaseName(ph)
-				log.Printf("raftnode: node %d READY LOOP STALLED for %s in %s (threshold %s) — "+
-					"something on that goroutine is blocking on work the goroutine itself serves",
-					n.cfg.ID, elapsed.Round(time.Millisecond), where, threshold)
+				n.reportedPhase.Store(ph)
+				n.reportedStall.Store(since)
+				log.Printf("raftnode: node %d READY LOOP STALLED for at least %s in %s "+
+					"(threshold %s, detected on a %s poll so this is a FLOOR) — something on "+
+					"that goroutine is blocking on work the goroutine itself serves",
+					n.cfg.ID, elapsed.Round(time.Millisecond), where, threshold, threshold/2)
 				if n.h.Stalled != nil {
 					n.h.Stalled(Stall{
-						Duration: elapsed, Phase: where, IOBound: ioBoundPhase(ph),
+						ID: since, Duration: elapsed, Phase: where,
+						IOBound: ioBoundPhase(ph), Completed: false,
 					})
 				}
 			}
@@ -782,8 +820,28 @@ func (n *Node) send(m *raftpb.Message) {
 // ever-growing stall for a loop that was not running at all. A phantom
 // violation is worse than none: it trains you to ignore the detector.
 func (n *Node) handleReady(rd raft.Ready) bool {
-	n.processingSince.Store(time.Now().UnixNano())
-	defer n.processingSince.Store(0)
+	startedAt := time.Now()
+	since := startedAt.UnixNano()
+	n.processingSince.Store(since)
+	defer func() {
+		n.processingSince.Store(0)
+		// THE REAL DURATION, if the watchdog flagged this batch. The
+		// at-detection report above is censored by the poll interval; this
+		// is the number a histogram should see.
+		if n.reportedStall.CompareAndSwap(since, 0) {
+			took := time.Since(startedAt)
+			ph := n.reportedPhase.Load()
+			log.Printf("raftnode: node %d ready batch COMPLETED after %s in %s "+
+				"(the earlier report was a floor)",
+				n.cfg.ID, took.Round(time.Millisecond), phaseName(ph))
+			if n.h.Stalled != nil {
+				n.h.Stalled(Stall{
+					ID: since, Duration: took, Phase: phaseName(ph),
+					IOBound: ioBoundPhase(ph), Completed: true,
+				})
+			}
+		}
+	}()
 	n.phase.Store(phaseSoftState)
 	defer n.phase.Store(phaseIdle)
 

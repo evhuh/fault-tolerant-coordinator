@@ -740,11 +740,28 @@ func (c *Coordinator) restoredAt(index uint64) {
 // EVIDENCE instead of an unexplained election: the simulator reads it as an
 // invariant violation and fails the run with its seed.
 func (c *Coordinator) onStalled(st raftnode.Stall) {
-	// PHASE-LABELLED, deliberately. An unlabelled stall histogram reports a
-	// snapshot's fsync tail identically to a blocking call in the apply path,
-	// which is the conflation that cost Day 9 an afternoon.
-	metrics.ObserveStall(st.Phase, st.Duration)
+	// TWO REPORTS PER STALL, and only the second is a real duration.
+	//
+	// The at-detection report is censored by the watchdog's poll interval —
+	// every one landed in 500-748ms whatever the true blockage — so feeding
+	// it to a histogram makes the upper buckets unreachable by construction.
+	// The completed report carries the batch's full blocked time.
+	//
+	// The early warning is still kept in the ring, because a stall that never
+	// ends never produces a completed report and a genuine hang must not be
+	// invisible. When the completion arrives it REPLACES that entry by ID, so
+	// counts stay exact and durations become true.
+	if st.Completed {
+		metrics.ObserveStall(st.Phase, st.Duration)
+	}
 	c.stallMu.Lock()
+	for i := range c.stalls {
+		if c.stalls[i].ID == st.ID && st.Completed {
+			c.stalls[i] = st // the real duration replaces the floor
+			c.stallMu.Unlock()
+			return
+		}
+	}
 	c.stalls = append(c.stalls, st)
 	c.stallMu.Unlock()
 }

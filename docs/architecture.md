@@ -791,6 +791,52 @@ So, as a rule: **where an independent oracle exists, prefer it to a reimplementa
 
 The narrower lesson, recorded because it is checkable: when a derived index is added, its invariant has to name **every** field it depends on. This one depended on `WorkerID` and on `State`, the comment said only `WorkerID`, and the test asserted only what the comment said.
 
+### Every artifact an analyzer reads lives in the run-stamped directory
+
+The provenance rules already say a report must print the run id and the timestamps of the rows it read. This extends them to **everything an analysis touches, logs included**, and adds a refusal.
+
+**The rule.** One directory per run, named with the run id. The coordinator logs, worker logs, metric scrapes, per-trial rows, host probes and the config record all go in it. An analyzer reads only from that directory, and **refuses an input that does not carry the current run's id** rather than quietly including it.
+
+**What it cost to learn.** The benchmark harness opened coordinator logs in append mode in a SHARED directory, so one file accumulated four runs. A stall analysis then divided a four-run stall count (316) by a one-run restart count (55) and reported "~18 stalls per restart" against a directly measured 1. Scoped properly the answer was 0.3-0.5. The inputs were sound; the REPORTED ANALYSIS was wrong because it mixed runs.
+
+That is the same failure as the stale-log read earlier in Day 11, which produced a report describing a previous run. The fix then was to stamp the output directory and print provenance; this completes it by stamping the INPUTS too, because an analyzer that reads a shared log has no provenance to print.
+
+**Concretely, a run directory holds:** `RUN_ID` (the id, the config that deviates from shipped — `-snapshot-entries` above all — and the workload), `coord-N.log`, `worker-N.log`, `rows.jsonl`, the bracketing host probes, and the final metric scrapes. Append mode is fine inside it, since the directory is the scope.
+
+### A reported stall duration is a LOWER BOUND, not the blocked time
+
+`watchStalls` polls on a ticker at `threshold/2` and reports **once per stall** — the `reportedFor == since` guard exists so a multi-second stall does not bury its own first report. The consequence is that the `Duration` it hands to `Handler.Stalled` is **elapsed time at the moment of DETECTION, not at the stall's end**.
+
+So every duration this detector has ever reported is quantized into `[threshold, 1.5 x threshold]` by the poll interval, and is a floor on the real blockage:
+
+- At the production 500ms threshold, reported durations cluster at **500-748ms with a 501ms median** — which is the poll interval showing through, not a property of the stalls.
+- A stall that actually lasted six seconds is reported as roughly 500ms, once.
+
+**Read every quoted stall duration as ">= threshold".** Where this document says "562-739ms in apply" or "540-695ms", those mean "at least 500ms, detected within a poll of crossing it". The *aggregate* blocked time in the restart case — 6.3 seconds — is NOT a sum of reported stall durations; it comes from polling the applied task count until it caught up, which measures the real window.
+
+**FIXED, by reporting twice.** `Stall` now carries an `ID` and a `Completed` flag:
+
+- **`Completed=false`** is the at-detection report, kept deliberately as an EARLY WARNING. A stall that never ends — a genuine hang — never produces the second report, so dropping this one would make the worst case silent.
+- **`Completed=true`** is emitted from `handleReady`'s defer when the blocked batch finishes, and carries the real duration. `raft_ready_stall_seconds` is fed only from this one, so the histogram's buckets are reachable again.
+
+The completed report **replaces** the early one by `ID` in the coordinator's ring rather than appending, so a consumer counting stalls still gets the true count alongside the true duration. The phase travels in `reportedPhase` because `handleReady`'s `phaseIdle` defer is registered after the reporting one and therefore runs first — reading `n.phase` at completion time would have reported every stall as "idle".
+
+Pinned by `TestReadyLoopStallReportsItsCompletedDuration` in `server`, which runs a REAL Ready loop and blocks it inside apply through the `OnApply` hook. That matters: the raftnode unit test can only drive the reporting plumbing by hand and still passes with the completion deleted, while the cluster test fails with "got 1 early warning(s) only, so every reported duration is a censored floor".
+
+**Everything quoted before this fix is a floor.** The durations below are at-detection values and are marked as such; they mean "at least the threshold, detected within one poll of crossing it", not the blocked time.
+
+### Restart replay runs inside the Ready loop, and the detector sees it
+
+A restarted node applies its committed backlog through `rd.CommittedEntries` **in the Ready loop**, the same goroutine that processes raft messages. So until it has caught up it cannot vote or ack promptly, and the cluster runs a node short while it works.
+
+Measured on a 4-5MB uncompacted log, ~23,500 entries behind: the HTTP listener was serving in **50ms** while `newRaft` reported `commit: 23490, applied: 0`, and applying back to ~19,800 task records took **6.3 seconds**, progressing incrementally.
+
+**The stall detector is not blind to this** — it fired 3, 5 and 4 times across the three nodes during that window, each reported at **562-739ms in `apply`** — which per the section above is a floor, not the blocked time, and the range is the detector's poll interval showing through. Under the shipped threshold the same stalls are reported at 500-748ms (median 501ms) and number 0.3-0.5 per restart rather than 3-5. `MaxSizePerMsg` bounds how much arrives per Ready, so the shape is a continuous run of sub-second stalls rather than one six-second stall. That matters: each is under the 1s election timeout, so no single one deposes anyone, and the damage is the aggregate unavailability rather than any individual stall.
+
+The stalls are reported correctly, and they are **a known product limitation, not an expected cost to be waved through**: for several seconds after a restart this coordinator cannot vote or acknowledge. A cluster that restarts a node has one fewer usable voter for the whole of that window, which is a liveness property with a real cost — it is what degraded failover from 1127ms to 4690ms over 55 trials with compaction disabled. Under the shipped `-snapshot-entries 10000` the same workload degraded only 12% (1384ms to 1554ms over 55 trials), because a restarting node replays at most the post-snapshot tail: measured at 2357ms for ~2,900 entries against 6.3s for ~23,500, with one stall instead of 3-5. The limitation is BOUNDED by compaction, not removed by it.
+
+What they are NOT is the concurrency bug `KindReadyLoopStall` exists to catch, which is a goroutine blocking on work it serves itself. Both deserve to be visible and they want different responses, so a future classifier should distinguish "apply stall while catching up a backlog" from "apply stall in steady state", the way `KindSnapshotBudget` distinguishes a snapshot's fsync tail from a slow disk. Until it does, a restart-replay stall must be read as the limitation below rather than as either a defect or a non-event.
+
 ### Measure the mechanism before theorizing about it
 
 A rule for diagnosis, earned three times in this project and most expensively during Day 11.
@@ -813,7 +859,7 @@ The same pattern appears in the earlier entries here, which is why this is a rul
 
 Day 11's benchmark found one. `Service.heldTask`, answering "which task does worker W hold", called `StateStore.TaskIDs()` — which allocates and SORTS every task id in the store — and then scanned the result linearly. It ran on every pass of the `RequestTask` long poll, with 256 pollers (8 workers x concurrency 32).
 
-Measured on a real 3-node cluster at 10,000 tasks: **Ready-loop stalls of 540-695ms in the `apply` phase** on multiple nodes, **7-9 leadership changes per 30-second window**, commit latency **322-696ms**, and almost nothing completing. The CPU profile is the thing that named it: 18% CPU over 20s with 59% of samples in `pthread_cond_signal`/`pthread_cond_wait`, and the only application function present was `heldTask` at 16% cumulative, reaching `sortedTaskIDs` through `pdqsortOrdered`. It was not a CPU problem; it was **lock hold time serializing against apply**. Three plausible per-apply culprits — `applyRegisterWorker`'s scan per heartbeat, `recomputeJobState` per completion, and the tick scans — were all checked against the profile and none appeared (`applyTick` at 0.83%).
+Measured on a real 3-node cluster at 10,000 tasks: **Ready-loop stalls reported at 540-695ms in the `apply` phase** on multiple nodes (at-detection floors: the real blocked time was longer, see "A reported stall duration is a LOWER BOUND"), **7-9 leadership changes per 30-second window**, commit latency **322-696ms**, and almost nothing completing. The CPU profile is the thing that named it: 18% CPU over 20s with 59% of samples in `pthread_cond_signal`/`pthread_cond_wait`, and the only application function present was `heldTask` at 16% cumulative, reaching `sortedTaskIDs` through `pdqsortOrdered`. It was not a CPU problem; it was **lock hold time serializing against apply**. Three plausible per-apply culprits — `applyRegisterWorker`'s scan per heartbeat, `recomputeJobState` per completion, and the tick scans — were all checked against the profile and none appeared (`applyTick` at 0.83%).
 
 The fix is a worker->tasks index, `StateStore.tasksByWorker`:
 
@@ -833,7 +879,7 @@ Verified two ways. `TestTasksByWorkerIndexMatchesAFullScan` walks 40 random comm
 
 Before the fix the cost grew 12.3x and 70.4x with the state; after it, it is flat.
 
-**What the fix bought, measured on the same real cluster.** The 10,000-task scenario that produced 540-695ms apply stalls and 7-9 leadership changes per window now runs clean, and the degradation that remains is gradual rather than a cliff:
+**What the fix bought, measured on the same real cluster.** The 10,000-task scenario that produced apply stalls reported at 540-695ms (floors) and 7-9 leadership changes per window now runs clean, and the degradation that remains is gradual rather than a cliff:
 
 | tasks in store | stalls | leadership changes | commit latency | assignments/s |
 |---|---|---|---|---|
@@ -858,7 +904,7 @@ So the honest statement of scale is: **correct and stall-free to at least 150,00
 
 `node.Propose` blocks until raft ACCEPTS the entry, and the goroutine that accepts it is the Ready loop. A proposal still in flight when leadership is lost is therefore waiting on the loop that is inside `revokeLeadership`, waiting for the scheduler worker that is waiting for the proposal. `failAll` does not break it: that releases registered *waiters*, and such a caller never reached its waiter.
 
-With the context derived from `context.Background()` the cycle broke only when the proposal timeout fired. Day 10's calibration measured it as **131ms and 187ms Ready-loop stalls** in the leadership-change phase, on a healthy disk, against the simulator's 250ms timeout — and at the 5s production default the same bug is a node that processes no raft messages for five seconds on every leadership change.
+With the context derived from `context.Background()` the cycle broke only when the proposal timeout fired. Day 10's calibration measured it as Ready-loop stalls reported at **>=131ms and >=187ms** (at-detection floors) in the leadership-change phase, on a healthy disk, against the simulator's 250ms timeout — and at the 5s production default the same bug is a node that processes no raft messages for five seconds on every leadership change.
 
 The propose context now derives from the leader context, so revocation cancels it immediately and `Propose` returns `context.Canceled`, which was already classified as `ErrProposalLost` — abandoned, may still commit, safe to retry, which is exactly what such a proposal is.
 
@@ -970,7 +1016,7 @@ in seconds. Two kinds of duration resist it, and both bit:
   mutex that the 5ms coverage sampler holds while it reads committed state;
   without `-race` that cost microseconds, and with `-race` the sampler's own
   work exceeded its interval, held the mutex essentially continuously, and
-  starved the Ready loop for **8 to 31 seconds**.
+  starved the Ready loop for **8 to 31 seconds** (measured by the simulator's apply-gap sampling, not by the censored at-detection report).
 
   The stall invariant caught it and named it correctly — "stalled 18.33s in
   apply (blocking call) — a blocking call on the loop's own goroutine" —

@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1199,4 +1200,99 @@ func flagsLine(line string) bool {
 		}
 	}
 	return false
+}
+
+// A STALL IN A REAL READY LOOP REPORTS ITS COMPLETED DURATION.
+//
+// The raftnode unit test can only drive the reporting plumbing by hand, which
+// means it passes with the completion report deleted from handleReady. This
+// one runs a genuine Ready loop, blocks it inside apply via the OnApply hook,
+// and asserts the completion arrives — so deleting the report fails HERE.
+//
+// Why it matters: the watchdog polls at threshold/2 and reports once per
+// stall, so its report lands between threshold and 1.5x threshold however
+// long the stall runs. Measured on a real 3-node cluster at a 500ms
+// threshold, every reported duration fell in 500-748ms with a 501ms median —
+// the poll interval, not the stalls. Without the completed report, every
+// quoted stall duration is a floor and raft_ready_stall_seconds cannot reach
+// its upper buckets.
+func TestReadyLoopStallReportsItsCompletedDuration(t *testing.T) {
+	const blockFor = 900 * time.Millisecond
+
+	var once sync.Once
+	cfg := DefaultConfig()
+	cfg.Sched.Workers = 2
+	cfg.Sched.LeaseTTLMs = cfg.LeaseTTL.Milliseconds()
+	// Block ONE apply, well past the stall threshold. OnApply runs on the
+	// Ready loop's goroutine, which is exactly the blockage under test.
+	cfg.OnApply = func(*commandpb.Command, state.Result) {
+		once.Do(func() { time.Sleep(blockFor) })
+	}
+
+	coord := New(cfg)
+	rcfg := raftnode.DefaultConfig()
+	rcfg.ID = 1
+	rcfg.Peers = map[uint64]string{1: fmt.Sprintf("http://127.0.0.1:%d", freePort(t))}
+	rcfg.DataDir = t.TempDir()
+	rcfg.TickInterval = 20 * time.Millisecond
+	rcfg.ElectionTick = 10
+	rcfg.HeartbeatTick = 1
+	// 200ms threshold, so a 900ms block is comfortably past the 1.5x censor
+	// (300ms) that the at-detection report cannot exceed.
+	rcfg.StallThreshold = 200 * time.Millisecond
+	rcfg.SnapshotEntries = 1_000_000 // no snapshotting in this test
+	if err := coord.StartRaft(rcfg); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer coord.StopRaft()
+
+	deadline := time.Now().Add(15 * time.Second)
+	var early, complete []raftnode.Stall
+	for time.Now().Before(deadline) {
+		early, complete = nil, nil
+		for _, s := range coord.Stalls() {
+			if s.Completed {
+				complete = append(complete, s)
+			} else {
+				early = append(early, s)
+			}
+		}
+		if len(complete) > 0 {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+
+	if len(complete) == 0 {
+		t.Fatalf("no COMPLETED stall report after blocking apply for %v; got %d early "+
+			"warning(s) only, so every reported duration is a censored floor",
+			blockFor, len(early))
+	}
+	got := complete[0]
+	if got.Duration < blockFor {
+		t.Errorf("completed report says %v, but apply was blocked for at least %v",
+			got.Duration, blockFor)
+	}
+	if got.Phase != "apply" {
+		t.Errorf("completed report phase = %q, want %q", got.Phase, "apply")
+	}
+	// EXACTLY ONE record for this stall. The completion REPLACES the early
+	// warning by id rather than appending, so a consumer counting stalls gets
+	// the true count and the true duration. Two records here would double
+	// count every stall in the simulator's invariants.
+	//
+	// That the early warning is emitted at all — which is what keeps a stall
+	// that never ends from being silent, since such a stall produces no
+	// completion — is pinned by TestStallReportsItsCompletedDuration in
+	// raftnode, where both reports are observed at the handler.
+	n := 0
+	for _, s := range coord.Stalls() {
+		if s.ID == got.ID {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Errorf("stall id %d appears %d times in Stalls(); the completion must replace "+
+			"the early warning, not add to it", got.ID, n)
+	}
 }

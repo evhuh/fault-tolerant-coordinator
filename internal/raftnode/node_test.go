@@ -2,6 +2,7 @@ package raftnode
 
 import (
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -259,5 +260,95 @@ func TestStallDistinguishesDiskFromBlockingCall(t *testing.T) {
 	logic := Stall{Duration: 200 * time.Millisecond, Phase: "apply"}
 	if !strings.Contains(logic.String(), "blocking call") {
 		t.Errorf("logic stall %q does not name its cause", logic.String())
+	}
+}
+
+// A STALL REPORTS ITS COMPLETED DURATION, not just the censored floor the
+// watchdog saw when it fired.
+//
+// The detector polls at threshold/2 and reports once per stall, so its first
+// report lands between threshold and 1.5x threshold however long the stall
+// actually runs. Measured on a real cluster at a 500ms threshold: every
+// reported duration fell in 500-748ms with a 501ms median, which is the poll
+// interval showing through — a six-second stall was reported as roughly
+// 500ms, and raft_ready_stall_seconds could never reach its upper buckets.
+//
+// So there are two reports, and this pins the second one.
+func TestStallReportsItsCompletedDuration(t *testing.T) {
+	const threshold = 20 * time.Millisecond
+	const blocked = 10 * threshold // comfortably past 1.5x, which is the censor
+
+	var mu sync.Mutex
+	var got []Stall
+	n := &Node{
+		cfg:   Config{TickInterval: 2 * time.Millisecond, ElectionTick: 10},
+		clk:   clock.Real{},
+		stopc: make(chan struct{}),
+		done:  make(chan struct{}),
+	}
+	n.h = Handler{Stalled: func(s Stall) {
+		mu.Lock()
+		got = append(got, s)
+		mu.Unlock()
+	}}
+
+	go n.watchStalls()
+	defer close(n.stopc)
+
+	// Drive one batch by hand, the way handleReady does: mark the start,
+	// block past the threshold, then run the completion report.
+	startedAt := time.Now()
+	since := startedAt.UnixNano()
+	n.processingSince.Store(since)
+	n.phase.Store(phaseApply)
+	time.Sleep(blocked)
+	// What handleReady's defer does.
+	n.processingSince.Store(0)
+	if n.reportedStall.CompareAndSwap(since, 0) {
+		n.h.Stalled(Stall{
+			ID: since, Duration: time.Since(startedAt),
+			Phase: phaseName(n.reportedPhase.Load()), Completed: true,
+		})
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	var early, complete []Stall
+	for _, s := range got {
+		if s.Completed {
+			complete = append(complete, s)
+		} else {
+			early = append(early, s)
+		}
+	}
+	if len(early) != 1 {
+		t.Fatalf("expected exactly 1 early-warning report, got %d (%v)", len(early), got)
+	}
+	if len(complete) != 1 {
+		t.Fatalf("expected exactly 1 completed report, got %d — without it every quoted "+
+			"stall duration is a floor and the latency histogram cannot reach its upper "+
+			"buckets", len(complete))
+	}
+	// The early warning is censored by construction: it cannot exceed 1.5x
+	// the threshold however long the stall ran.
+	if early[0].Duration > threshold*2 {
+		t.Errorf("early report %v exceeded the poll censor; the test is not measuring what it thinks",
+			early[0].Duration)
+	}
+	// The completed report must carry the REAL blocked time.
+	if complete[0].Duration < blocked {
+		t.Errorf("completed report says %v, but the batch was blocked for at least %v",
+			complete[0].Duration, blocked)
+	}
+	if complete[0].ID != early[0].ID {
+		t.Errorf("the two reports carry different ids (%d vs %d), so a consumer cannot "+
+			"correlate them", early[0].ID, complete[0].ID)
+	}
+	// The phase must survive to the completed report. handleReady resets the
+	// phase to idle in a defer registered after the reporting one, so reading
+	// n.phase at completion time would always say "idle".
+	if complete[0].Phase != "apply" {
+		t.Errorf("completed report lost the stalled phase: got %q, want %q",
+			complete[0].Phase, "apply")
 	}
 }
