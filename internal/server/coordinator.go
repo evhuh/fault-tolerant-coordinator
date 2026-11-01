@@ -95,9 +95,21 @@ type Config struct {
 
 func DefaultConfig() Config {
 	return Config{
-		LeaseTTL:       2000 * time.Millisecond, // 4 missed heartbeats at H=500ms
-		TickPeriod:     200 * time.Millisecond,
-		CommandVersion: state.CommandVersionClaimedRenewal,
+		LeaseTTL:   2000 * time.Millisecond, // 4 missed heartbeats at H=500ms
+		TickPeriod: 200 * time.Millisecond,
+		// PROPOSING THE NEW VERSION IS WHAT TURNS THE GUARD ON.
+		//
+		// Every version-gated rule reads the ENTRY's version, so a build that
+		// still proposes the old one applies the old rules and the new rule
+		// is dead code. The payload-hash guard was written, tested at the
+		// state-machine level, and did nothing over gRPC until this moved —
+		// the end-to-end test caught it.
+		//
+		// Safe to raise only because an older build REFUSES an entry above
+		// what it understands instead of guessing: a mixed-version cluster
+		// gets a loud, local halt rather than a silent divergence. See
+		// ErrCommandVersionTooNew.
+		CommandVersion: state.CommandVersionPayloadHashedSession,
 		Sched:          sched.DefaultConfig(),
 		ReadMode:       ReadIndexBarrier,
 		ReadTimeout:    2 * time.Second,

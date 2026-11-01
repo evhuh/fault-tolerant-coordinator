@@ -106,6 +106,14 @@ message Session {
   string request_id = 2;
   string job_id     = 3;
   int64  created_ms = 4;
+  // Fingerprint of what the client asked for, so a reused idempotency key
+  // carrying different work is an error rather than a replayed answer.
+  //
+  // ADDED AFTER FIELDS 1-4 WERE ALREADY IN SNAPSHOTS, so a new number and
+  // additive by construction: an old build ignores it, and a session
+  // restored without it reads as empty, which the state machine treats as
+  // "do not judge" rather than as a mismatch.
+  string payload_hash = 5;
 }
 
 message Snapshot {

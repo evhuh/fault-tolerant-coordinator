@@ -635,11 +635,19 @@ func (x *Eval) GetCreatedMs() int64 {
 // a system that looks completely healthy and duplicates a job the first time a
 // client retries across the restore.
 type Session struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	ClientId      string                 `protobuf:"bytes,1,opt,name=client_id,json=clientId,proto3" json:"client_id,omitempty"`
-	RequestId     string                 `protobuf:"bytes,2,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
-	JobId         string                 `protobuf:"bytes,3,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
-	CreatedMs     int64                  `protobuf:"varint,4,opt,name=created_ms,json=createdMs,proto3" json:"created_ms,omitempty"`
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	ClientId  string                 `protobuf:"bytes,1,opt,name=client_id,json=clientId,proto3" json:"client_id,omitempty"`
+	RequestId string                 `protobuf:"bytes,2,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
+	JobId     string                 `protobuf:"bytes,3,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
+	CreatedMs int64                  `protobuf:"varint,4,opt,name=created_ms,json=createdMs,proto3" json:"created_ms,omitempty"`
+	// Fingerprint of what the client asked for, so a reused idempotency key
+	// carrying different work is an error rather than a replayed answer.
+	//
+	// ADDED AFTER FIELDS 1-4 WERE ALREADY IN SNAPSHOTS, so a new number and
+	// additive by construction: an old build ignores it, and a session
+	// restored without it reads as empty, which the state machine treats as
+	// "do not judge" rather than as a mismatch.
+	PayloadHash   string `protobuf:"bytes,5,opt,name=payload_hash,json=payloadHash,proto3" json:"payload_hash,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -700,6 +708,13 @@ func (x *Session) GetCreatedMs() int64 {
 		return x.CreatedMs
 	}
 	return 0
+}
+
+func (x *Session) GetPayloadHash() string {
+	if x != nil {
+		return x.PayloadHash
+	}
+	return ""
 }
 
 type Snapshot struct {
@@ -838,14 +853,15 @@ const file_snapshot_proto_rawDesc = "" +
 	"\bpriority\x18\x03 \x01(\x05R\bpriority\x12:\n" +
 	"\ftriggered_by\x18\x04 \x01(\x0e2\x17.snapshot.v1.EvalReasonR\vtriggeredBy\x12\x1d\n" +
 	"\n" +
-	"created_ms\x18\x05 \x01(\x03R\tcreatedMs\"{\n" +
+	"created_ms\x18\x05 \x01(\x03R\tcreatedMs\"\x9e\x01\n" +
 	"\aSession\x12\x1b\n" +
 	"\tclient_id\x18\x01 \x01(\tR\bclientId\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x02 \x01(\tR\trequestId\x12\x15\n" +
 	"\x06job_id\x18\x03 \x01(\tR\x05jobId\x12\x1d\n" +
 	"\n" +
-	"created_ms\x18\x04 \x01(\x03R\tcreatedMs\"\x94\x02\n" +
+	"created_ms\x18\x04 \x01(\x03R\tcreatedMs\x12!\n" +
+	"\fpayload_hash\x18\x05 \x01(\tR\vpayloadHash\"\x94\x02\n" +
 	"\bSnapshot\x12\x18\n" +
 	"\aversion\x18\x01 \x01(\rR\aversion\x12\x15\n" +
 	"\x06now_ms\x18\x02 \x01(\x03R\x05nowMs\x12$\n" +

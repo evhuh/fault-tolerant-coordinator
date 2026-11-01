@@ -1,5 +1,24 @@
 package sim
 
+// THE MODEL ASSUMES IDEMPOTENCY KEYS ARE UNIQUE PER LOGICAL SUBMISSION.
+//
+// Since CommandVersionPayloadHashedSession the state machine rejects a reused
+// (clientID, requestID) whose payload differs, with ErrRequestIDReused. That
+// transition is NOT modelled here, and does not need to be while the recorded
+// workload holds: every client generates its own keys and never reuses one
+// for different work, so the rejection is unreachable in a recorded history.
+//
+// Stated rather than left implicit because the assumption is load-bearing. If
+// a future workload deliberately reuses keys — a test of the dedup path, say,
+// or a client replaying someone else's requests — the model would see a
+// submit that returned an error while creating nothing, classify it through
+// classifySubmit as a DEFINITIVE rejection (InvalidArgument), and that is
+// already the correct reading. What it would NOT capture is the ordering
+// constraint that makes it correct: the rejection is a function of an EARLIER
+// submission under the same key, so a checker reordering those two operations
+// could declare a legal history illegal. Modelling that needs the session map
+// in the model state, which is a real extension and not a line.
+
 // The sequential specification the recorded history is checked against.
 //
 // # What is modelled, and why only this

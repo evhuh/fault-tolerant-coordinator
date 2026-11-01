@@ -822,9 +822,9 @@ The fix is `{prefix}-job-{seq}`: the work item's identity and nothing else. The 
 
 **Verification belongs with it**, because a key bug is silent by construction — the server answers success either way. `cmd/loadgen -verify=new-jobs` snapshots existing job ids, then requires every returned id to be newly created and to carry the requested task count. Two weaker designs were tried and discarded: counting tasks inside the returned jobs passes a dedup (the original jobs do have the right count), and a cluster-wide count delta assumes this process is the only writer — a concurrent submitter either inflates it into a false failure or masks a dedup — and it will break outright once terminal tasks are collected, since the count can then fall while work is being created. Job identity is immune to all three.
 
-#### PROPOSED, not implemented: reject a reused id whose payload differs
+#### IMPLEMENTED: a reused id whose payload differs is rejected
 
-The guard that would have made this an immediate error rather than a silent no-op.
+The guard that turns a silent no-op into an immediate error. Shipped at `CommandVersionPayloadHashedSession = 4`.
 
 **The change.** Store a hash of the request payload alongside each dedup session. On a repeat `(clientID, requestID)`:
 
@@ -833,16 +833,30 @@ The guard that would have made this an immediate error rather than a silent no-o
 
 The hash covers what the client asked for — the task specs and priority — and deliberately not leader-assigned fields like job id, task ids or `created_ms`, which differ on every proposal and would make every retry look like a conflict.
 
-**Why it catches today's bug.** The harness submitted a 6-task job under an id first used for a 1-task job. Same id, different payload, so the second call would have failed loudly at the first top-up instead of quietly creating nothing for 100 trials.
+**Why it catches the bug that motivated it.** The harness submitted a 6-task job under an id first used for a 1-task job. Same id, different payload, so the second call now fails loudly at the first top-up instead of quietly creating nothing for 100 trials.
 
-**Command-version implications, which are the reason this is a proposal and not a patch.** The hash has to live in the committed state, because the dedup cache is committed state and every replica must reach the same verdict:
+**The payload, defined exactly.** The hash covers the TASK SPECS — command, args, timeout, max attempts — and the priority. It EXCLUDES every leader-assigned field: job id, task ids and `created_ms`. Those differ on every proposal of the same logical request, so including them would make each retry look like a conflict and break the very mechanism the guard protects. `TestReusedKeyWithSamePayloadReplaysTheOriginalResponse` pins that by retrying with a different job id, as a real retry would.
+
+It is hashed by writing fields in a fixed order with explicit lengths, NOT by marshalling the proto: `proto.Marshal` makes no determinism guarantee across builds, and this value lives in committed state that every replica must agree on byte for byte.
+
+**Command-version implications, which are why it needed a version rather than a patch.** The hash has to live in the committed state, because the dedup cache is committed state and every replica must reach the same verdict:
 
 1. **`session` gains a field**, so `proto/snapshot.proto`'s session entry gains one too. A snapshot written by a new build and restored by an old one must still work: the field is additive with a new number, and an old build ignores it. Safe in that direction.
 2. **The APPLY decision changes**, which is the part that needs a version. A new build rejects a reused id with a differing payload; an old build accepts it and returns the original job. Two replicas at different builds applying the same entry would then produce DIFFERENT state — exactly the divergence the version gate exists to prevent. So this needs `CommandVersionPayloadHashedSession = 4` — `CommandVersionCurrent` is `ClaimedRenewal` = 3 today — with `applySubmitJob` gated on the command's version: entries below 4 keep the old permissive behaviour forever, entries at 4 enforce the check.
 3. **Replay of a pre-upgrade log must be identical**, so the gate is on the entry's version and not on the build's. A log containing a version-3 SubmitJob that reused an id must still replay as "returned the original job", or restoring from that log diverges from the cluster that wrote it. The Day 7 pre-fix-log replay test is the shape this needs.
 4. **Sessions restored from a snapshot written before the change** have no hash. Treat a missing hash as "unknown, do not judge": replay the remembered Result as today rather than rejecting, because a false rejection breaks a legitimate retry across an upgrade. The guard then becomes effective for sessions created after the upgrade, which is the honest scope.
 
-**What it does not fix.** A client that reuses an id with an IDENTICAL payload still silently gets the old job — which is correct for a retry and indistinguishable from one. A harness wanting genuinely new work still has to vary its ids; the guard catches the common case where the payload moved, not the case where it did not.
+**It is a behaviour change for callers, and one existing test was wrong.** A client that previously retried under the same key with a slightly DIFFERENT request got the original job back; it now gets an error. That is the intended behaviour — such a call was never a retry — but it is worth stating because it turns a silent success into a visible failure, which is the whole point and also a compatibility break for anyone relying on the old leniency.
+
+`TestWholeClusterRestartsFromDiskWithStateIntact` was relying on it: its post-restart "retry" sent ONE task where the original sent two, so the guard rejected it. The test was fixed to resend the request it is retrying, which is what a retry means. Worth noticing that the guard found this rather than a reviewer.
+
+**What it does not fix.** A client that reuses an id with an IDENTICAL payload still silently gets the old job — correct for a retry and indistinguishable from one. A harness wanting genuinely new work still has to vary its ids, which is why `cmd/loadgen` verifies that the jobs it is handed back are new; the guard catches the case where the payload moved, not the case where it did not.
+
+**The guard shipped inert, and the end-to-end test is what found it.** `DefaultConfig` still proposed `CommandVersionClaimedRenewal`, and every version-gated rule reads the ENTRY's version — so the coordinator applied the old rules and the guard did nothing over gRPC while five state-machine tests passed. `CommandVersion` now tracks `CommandVersionCurrent`, and `TestDefaultConfigProposesTheCurrentCommandVersion` makes the next bump unable to land inert. It is an equality check, not `>=`: a default ABOVE current would propose entries this build's own state machine refuses, which is worse than lagging.
+
+**So the Day 10 checkpoints never exercised this guard.** They ran before the bump, on version-3 entries, and their workloads generate unique idempotency keys anyway — so the rejection path was unreachable twice over. Their results are unaffected, and they are not evidence about this rule. The evidence is the tests below plus the gRPC round-trip.
+
+**Verified by seven tests**, each confirmed to fail without the guard or the bump: a retry with an identical payload replays the original response and creates no second job; a reused id with more tasks, and separately with a different command, is rejected wrapping `ErrRequestIDReused`; a version-3 entry replays permissively and a later version-4 retry against that hashless session still replays rather than rejecting; an entry above `CommandVersionCurrent` still halts with `ErrCommandVersionTooNew` and creates nothing; and the hash survives a snapshot restore, without which the guard would evaporate on every restart. Over the wire: a reused key comes back `InvalidArgument` from a real cluster while an honest retry still replays, and `client.Pool.Do` calls its function exactly once for that code rather than retrying a key that can never work.
 
 ### An oracle written from the same model as the code inherits its blind spots
 

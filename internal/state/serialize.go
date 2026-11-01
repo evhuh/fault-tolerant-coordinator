@@ -103,6 +103,9 @@ func (s *StateStore) Encode() ([]byte, error) {
 			RequestId: k.requestID,
 			JobId:     sess.result.JobID,
 			CreatedMs: sess.createdMs,
+			// Empty for sessions created before the field existed, which is
+			// exactly what the restore side reads as "do not judge".
+			PayloadHash: sess.payloadHash,
 		})
 	}
 
@@ -178,8 +181,9 @@ func (s *StateStore) Restore(data []byte) error {
 	sessions := make(map[sessionKey]session, len(snap.GetSessions()))
 	for _, sess := range snap.GetSessions() {
 		sessions[sessionKey{clientID: sess.GetClientId(), requestID: sess.GetRequestId()}] = session{
-			result:    Result{JobID: sess.GetJobId()},
-			createdMs: sess.GetCreatedMs(),
+			result:      Result{JobID: sess.GetJobId()},
+			createdMs:   sess.GetCreatedMs(),
+			payloadHash: sess.GetPayloadHash(),
 		}
 	}
 

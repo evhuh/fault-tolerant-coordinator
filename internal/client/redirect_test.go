@@ -190,3 +190,29 @@ func TestDoRotatesOnTimeout(t *testing.T) {
 		t.Errorf("tried %v, want both seeds — a timing-out node must not be retried forever", distinct)
 	}
 }
+
+// A DEFINITIVE rejection must NOT be retried.
+//
+// Pool.Do retries NOT_LEADER and unreachable, because both mean "you are
+// talking to the wrong node". InvalidArgument means the request itself is
+// wrong, and state.ErrRequestIDReused arrives that way: a reused idempotency
+// key created nothing and will never work, so retrying it is pure load and
+// would mask the caller's bug.
+func TestDoDoesNotRetryADefinitiveRejection(t *testing.T) {
+	p := NewPool([]string{"127.0.0.1:1"})
+	defer p.Close()
+
+	calls := 0
+	err := p.Do(func(schedulerpb.SchedulerClient) error {
+		calls++
+		return status.Error(codes.InvalidArgument,
+			"submit job: request id reused for different work")
+	})
+	if err == nil {
+		t.Fatal("Do swallowed a definitive rejection")
+	}
+	if calls != 1 {
+		t.Errorf("Do called fn %d times for an InvalidArgument; a definitive rejection must "+
+			"be attempted exactly once", calls)
+	}
+}

@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/evazheng/fault-tolerant-coordinator/internal/client"
 	"github.com/evazheng/fault-tolerant-coordinator/internal/raftnode"
@@ -864,9 +866,19 @@ func TestWholeClusterRestartsFromDiskWithStateIntact(t *testing.T) {
 	// Dedup must survive too: the sessions map is in the snapshot, and
 	// forgetting it would be silent — everything looks healthy and a retry
 	// quietly creates a second job.
+	//
+	// THE PAYLOAD MUST MATCH. This retry used to send ONE task where the
+	// original sent two, which is a reused idempotency key carrying different
+	// work rather than a retry — and since
+	// CommandVersionPayloadHashedSession the state machine rejects exactly
+	// that. The guard caught the test, not the other way round: a real retry
+	// resends the request it is retrying.
 	resp, err := revived.svc.SubmitJob(context.Background(), &schedulerpb.SubmitJobRequest{
 		ClientId: "c", RequestId: "r-0", // the very first request, replayed
-		Tasks: []*schedulerpb.TaskSpec{{Command: "/bin/true", MaxAttempts: 3}},
+		Tasks: []*schedulerpb.TaskSpec{
+			{Command: "/bin/true", MaxAttempts: 3},
+			{Command: "/bin/true", MaxAttempts: 3},
+		},
 	})
 	if err != nil {
 		t.Fatalf("retry after restart: %v", err)
@@ -1294,5 +1306,45 @@ func TestReadyLoopStallReportsItsCompletedDuration(t *testing.T) {
 	if n != 1 {
 		t.Errorf("stall id %d appears %d times in Stalls(); the completion must replace "+
 			"the early warning, not add to it", got.ID, n)
+	}
+}
+
+// A REUSED IDEMPOTENCY KEY comes back as a DEFINITIVE gRPC rejection.
+//
+// The code matters beyond tidiness: the linearizability recorder classifies
+// nil and InvalidArgument as definitive and everything else as UNKNOWN, and
+// client.Pool.Do retries only NOT_LEADER and unreachable. A reused key
+// created nothing and will never work, so it has to land in the definitive
+// bucket or callers retry it forever and the history records an outcome the
+// client could not have known.
+func TestReusedRequestIDIsADefinitiveRejectionOverGRPC(t *testing.T) {
+	c := newCluster(t, 1)
+	leader := c.leader(10 * time.Second)
+
+	spec := []*schedulerpb.TaskSpec{{Command: "/bin/noop", TimeoutMs: 1000, MaxAttempts: 3}}
+	req := &schedulerpb.SubmitJobRequest{ClientId: "c-1", RequestId: "r-1", Tasks: spec}
+	if _, err := leader.svc.SubmitJob(context.Background(), req); err != nil {
+		t.Fatalf("first submit: %v", err)
+	}
+
+	// Same key, different work.
+	bigger := &schedulerpb.SubmitJobRequest{ClientId: "c-1", RequestId: "r-1", Tasks: append(
+		append([]*schedulerpb.TaskSpec{}, spec...), spec...)}
+	_, err := leader.svc.SubmitJob(context.Background(), bigger)
+	if err == nil {
+		t.Fatal("a reused key with a different payload was accepted over gRPC")
+	}
+	if got := status.Code(err); got != codes.InvalidArgument {
+		t.Errorf("code = %s, want %s — the recorder treats anything else as UNKNOWN and "+
+			"Pool.Do would retry a key that can never work", got, codes.InvalidArgument)
+	}
+
+	// And an honest retry still replays, over the same surface.
+	resp, err := leader.svc.SubmitJob(context.Background(), req)
+	if err != nil {
+		t.Errorf("an identical retry was rejected: %v", err)
+	}
+	if resp.GetJobId() == "" {
+		t.Error("retry returned no job id")
 	}
 }

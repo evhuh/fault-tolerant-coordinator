@@ -9,6 +9,9 @@ Every mutation enters through Apply, and Apply accepts exactly the seven command
 package state
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"hash/fnv"
@@ -57,6 +60,16 @@ const (
 	// build would have produced. Those differ concretely — a task that was
 	// stranded RUNNING then is reclaimed now.
 	CommandVersionClaimedRenewal uint32 = 3
+	// CommandVersionPayloadHashedSession makes a REUSED idempotency key with a
+	// DIFFERENT payload an error instead of a replayed answer.
+	//
+	// Versioned because it changes the APPLY DECISION. A new build rejects
+	// where an old build returns the original job, so two replicas at
+	// different builds applying the same entry would reach different state —
+	// the divergence the version gate exists to prevent. Entries below this
+	// version keep the permissive behaviour FOREVER, so a log written before
+	// the upgrade replays exactly as the cluster that wrote it behaved.
+	CommandVersionPayloadHashedSession uint32 = 4
 	// CommandVersionCurrent is the newest version this build understands.
 	//
 	// Entries ABOVE it are refused, not guessed at — see
@@ -65,7 +78,7 @@ const (
 	// renewal change above had to go without: the build before this one has
 	// no case for version 3, so it quietly applies its own rule and diverges.
 	// A build that stops instead cannot do that.
-	CommandVersionCurrent = CommandVersionClaimedRenewal
+	CommandVersionCurrent = CommandVersionPayloadHashedSession
 )
 
 // ErrCommandVersionTooNew marks an entry written by a NEWER build than this
@@ -414,6 +427,20 @@ type sessionKey struct {
 type session struct {
 	result    Result
 	createdMs int64
+	// payloadHash fingerprints WHAT THE CLIENT ASKED FOR, so a reused
+	// idempotency key carrying different work is an error rather than a
+	// replayed answer for work that was never created.
+	//
+	// Empty means "do not judge": sessions restored from a snapshot written
+	// before this field existed have no hash, and a retry across that upgrade
+	// must still replay rather than be rejected. The guard is therefore
+	// effective only for sessions created after the upgrade, which is the
+	// honest scope.
+	//
+	// Written ONLY for entries at CommandVersionPayloadHashedSession or
+	// above. An older entry must produce identical state on an old build and
+	// a new one, and an old build cannot write this field.
+	payloadHash string
 }
 
 type StateStore struct {
@@ -527,7 +554,7 @@ func (s *StateStore) Apply(cmd *commandpb.Command) (Result, error) {
 	}
 	switch k := cmd.GetKind().(type) {
 	case *commandpb.Command_SubmitJob:
-		return s.applySubmitJob(k.SubmitJob)
+		return s.applySubmitJob(k.SubmitJob, cmd.GetVersion())
 	case *commandpb.Command_CreateEval:
 		return s.applyCreateEval(k.CreateEval)
 	case *commandpb.Command_ApplyPlan:
@@ -551,7 +578,7 @@ func (s *StateStore) Apply(cmd *commandpb.Command) (Result, error) {
 	(2) Validate
 	(3) Mutate: Create the job, create N PENDING tasks at Attemp: 0. record the session
 */
-func (s *StateStore) applySubmitJob(c *commandpb.SubmitJob) (Result, error) {
+func (s *StateStore) applySubmitJob(c *commandpb.SubmitJob, version uint32) (Result, error) {
 	if c == nil {
 		return Result{}, fmt.Errorf("submit job: nil payload")
 	}
@@ -564,6 +591,23 @@ func (s *StateStore) applySubmitJob(c *commandpb.SubmitJob) (Result, error) {
 	dedupable := key.clientID != "" && key.requestID != ""
 	if dedupable {
 		if prev, ok := s.sessions[key]; ok {
+			// SAME KEY, DIFFERENT WORK is a client error, not a retry.
+			//
+			// Gated on the ENTRY's version, never the build's, so replaying
+			// an older log reaches the state the cluster actually had. And
+			// skipped when the remembered session carries no hash, which is
+			// every session restored from a pre-upgrade snapshot: rejecting
+			// there would break a legitimate retry across the upgrade.
+			if version >= CommandVersionPayloadHashedSession && prev.payloadHash != "" {
+				if h := submitPayloadHash(c); h != prev.payloadHash {
+					return Result{}, fmt.Errorf(
+						"%w: client %q request %q was already used for different work "+
+							"(payload %s, now %s); an idempotency key must identify one "+
+							"logical submission, so this is a reused key rather than a retry",
+						ErrRequestIDReused, key.clientID, key.requestID,
+						prev.payloadHash[:8], h[:8])
+				}
+			}
 			return prev.result, nil
 		}
 	}
@@ -617,7 +661,11 @@ func (s *StateStore) applySubmitJob(c *commandpb.SubmitJob) (Result, error) {
 	})
 	if dedupable {
 		// Store the response WITHOUT triggers: a retry must return the original answer, but must not cause the eval to be created a second time
-		s.sessions[key] = session{result: Result{JobID: job.ID}, createdMs: s.nowMs}
+		sess := session{result: Result{JobID: job.ID}, createdMs: s.nowMs}
+		if version >= CommandVersionPayloadHashedSession {
+			sess.payloadHash = submitPayloadHash(c)
+		}
+		s.sessions[key] = sess
 	}
 	return res, nil
 }
@@ -1512,4 +1560,48 @@ func (s *StateStore) AssignedTaskFor(workerID string) (Task, bool) {
 		return *t, true
 	}
 	return Task{}, false
+}
+
+// ErrRequestIDReused means one idempotency key was used for two different
+// submissions. The caller's bug, not a retry: see "Two rules for an
+// idempotency key" in docs/architecture.md.
+var ErrRequestIDReused = errors.New("request id reused for different work")
+
+// submitPayloadHash fingerprints WHAT THE CLIENT ASKED FOR.
+//
+// Covers the task specs and the priority. Deliberately EXCLUDES every
+// leader-assigned field — job id, task ids, created_ms — because those differ
+// on every proposal of the same logical request, so including them would make
+// each retry look like a conflict and break the mechanism this guard protects.
+//
+// Built by writing fields in a fixed order with explicit lengths rather than
+// by marshalling the proto. proto.Marshal makes no determinism guarantee
+// across builds, and this hash lives in committed state that every replica
+// must agree on byte for byte.
+func submitPayloadHash(c *commandpb.SubmitJob) string {
+	h := sha256.New()
+	writeField := func(parts ...string) {
+		for _, p := range parts {
+			var n [8]byte
+			binary.BigEndian.PutUint64(n[:], uint64(len(p)))
+			h.Write(n[:])
+			h.Write([]byte(p))
+		}
+	}
+	writeNum := func(v int64) {
+		var n [8]byte
+		binary.BigEndian.PutUint64(n[:], uint64(v))
+		h.Write(n[:])
+	}
+	writeNum(int64(c.GetPriority()))
+	writeNum(int64(len(c.GetTasks())))
+	for _, te := range c.GetTasks() {
+		spec := te.GetSpec()
+		writeField(spec.GetCommand())
+		writeNum(int64(len(spec.GetArgs())))
+		writeField(spec.GetArgs()...)
+		writeNum(spec.GetTimeoutMs())
+		writeNum(int64(spec.GetMaxAttempts()))
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }

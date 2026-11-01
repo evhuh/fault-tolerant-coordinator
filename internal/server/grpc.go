@@ -71,6 +71,19 @@ func (s *Service) proposeError(err error, what string) error {
 		return s.notLeader()
 	case errors.Is(err, ErrProposalLost):
 		return status.Errorf(codes.Unavailable, "%s: proposal lost, retry", what)
+	case errors.Is(err, state.ErrRequestIDReused):
+		// DEFINITIVE: nothing was created, and retrying cannot help because
+		// the key itself is the problem.
+		//
+		// InvalidArgument deliberately, and listed explicitly rather than
+		// left to the default below. AlreadyExists reads better in isolation
+		// but would be WRONG here: the linearizability recorder classifies
+		// nil and InvalidArgument as definitive and everything else as
+		// UNKNOWN, so a new code would make a rejection that created nothing
+		// look like an outcome the client cannot know — and client.Pool.Do
+		// retries only NOT_LEADER and unreachable, so a definitive code is
+		// also what stops a caller from retrying a key that will never work.
+		return status.Errorf(codes.InvalidArgument, "%s: %v", what, err)
 	default:
 		return status.Errorf(codes.InvalidArgument, "%s: %v", what, err)
 	}
