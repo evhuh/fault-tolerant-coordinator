@@ -34,6 +34,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"runtime"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -59,11 +60,37 @@ func main() {
 	maxBacklog := flag.Float64("max-backlog", 2, "abort if undispatched slots exceed this many seconds of offered rate")
 	out := flag.String("out", "", "write the result as JSON to this path")
 	label := flag.String("label", "", "a name for this run, recorded in the result")
+	verify := flag.String("verify", "new-jobs",
+		"prefill verification: new-jobs (every returned job id must be newly created and carry "+
+			"the requested tasks), ids (distinct job ids only, cheap), or off")
 	prefill := flag.Int("prefill", 0, "submit this many jobs as fast as possible, then exit; no rate, no measurement")
+	// A PER-PROCESS NONCE, because request ids are deduped SERVER-SIDE and
+	// that is a feature within a run and a trap across runs.
+	//
+	// The coordinator caches (clientID, requestID) so a retried SubmitJob
+	// returns the original job instead of creating a second one. The ids here
+	// are deterministic — clientID plus a sequence that restarts at 0 every
+	// process — so a second invocation of this tool submitted the SAME ids
+	// and got the FIRST run's job back: "1 of 1 jobs submitted", zero new
+	// tasks. A benchmark harness topping up a backlog between trials
+	// therefore stopped adding work after its first call, silently.
+	//
+	// Measured consequence: 70 of 100 reclaim trials had nothing to kill, and
+	// 68 of 100 failover trials had nothing to dispatch. Both looked like
+	// system degradation and were a harness no-op.
+	//
+	// Pin it explicitly to get the old behaviour, which is what a test of the
+	// dedup path wants.
+	clientPrefix := flag.String("client-prefix", "",
+		"client id prefix; defaults to a per-process nonce so repeated runs are not deduped")
 	flag.Parse()
 
 	if *rate <= 0 {
 		log.Fatal("-rate must be positive")
+	}
+	prefix := *clientPrefix
+	if prefix == "" {
+		prefix = fmt.Sprintf("lg-%d", time.Now().UnixNano())
 	}
 	// THE COMMAND IS RESOLVED BEFORE ANY LOAD IS OFFERED. /bin/true does not
 	// exist on every host — it does not exist on this one — and a benchmark
@@ -101,11 +128,96 @@ func main() {
 	//
 	// So: submit the backlog with NO workers connected, then start the pool.
 	if *prefill > 0 {
-		n := prefillJobs(ctx, pool, cmdPath, splitAddrs(*taskArgs), *taskTimeout,
-			*prefill, *tasksPerJob, *submitters, *timeout)
-		log.Printf("prefill: %d of %d jobs submitted", n, *prefill)
+		var existing map[string]struct{}
+		if *verify == "new-jobs" {
+			var err error
+			if existing, err = jobIDSet(ctx, pool, *timeout); err != nil {
+				log.Fatalf("snapshotting existing job ids: %v", err)
+			}
+		}
+		n, jobIDs := prefillJobs(ctx, pool, cmdPath, splitAddrs(*taskArgs), *taskTimeout,
+			*prefill, *tasksPerJob, *submitters, *timeout, prefix)
+		unique := len(jobIDs)
+		log.Printf("prefill: %d of %d jobs submitted, %d distinct job id(s)", n, *prefill, unique)
 		if n < *prefill {
 			os.Exit(1)
+		}
+		// SUBMISSION IS NOT THE SAME AS WORK CREATED. A reused
+		// (clientID, requestID) returns the ORIGINAL job, so every call after
+		// the first can report success and create nothing.
+		//
+		// Measured before this check existed: a harness topping up a backlog
+		// between trials silently stopped adding work, and 70 of 100 reclaim
+		// trials plus 68 of 100 failover trials were lost to it while every
+		// prefill reported "submitted" and exited 0.
+		//
+		// Two checks, cheapest first. Distinct job ids catch the dedup case
+		// on the client alone; the task count catches a job that came back
+		// with fewer tasks than asked for, which distinct ids cannot see.
+		if unique < *prefill {
+			log.Printf("FAILED: %d job(s) submitted but only %d distinct job id(s) came back — "+
+				"the rest were deduped against an earlier submission and created NO new work. "+
+				"Request ids must be unique across client restarts; see -client-prefix.",
+				n, unique)
+			os.Exit(1)
+		}
+		wantTasks := *prefill * *tasksPerJob
+		if *verify == "new-jobs" {
+			// EVERY RETURNED JOB MUST BE NEW, and must carry what was asked
+			// for. This is per-job identity rather than an aggregate, and
+			// that is the point.
+			//
+			// Counting tasks inside the returned jobs does not work: a
+			// deduped submission hands back the ORIGINAL job ids, and those
+			// jobs do have the right task count, so the check passes while
+			// nothing was created. Measured — two identical prefills under a
+			// pinned -client-prefix both reported "verified: 10 task(s),
+			// wanted 10" and the second created nothing.
+			//
+			// A cluster-wide COUNT DELTA fixes that case and breaks two
+			// others. It assumes this process is the only writer in the
+			// window, so a concurrent submitter — the benchmark harness
+			// topping up, or any other client — either inflates the delta
+			// into a false failure or fills it in and MASKS a dedup. And it
+			// will break outright once terminal tasks are collected, because
+			// then the count can fall while work is being created. Job
+			// identity is immune to both.
+			newJobs, reused, badCount := 0, []string{}, []string{}
+			for _, id := range jobIDs {
+				if _, old := existing[id]; old {
+					reused = append(reused, id)
+					continue
+				}
+				newJobs++
+				n, err := jobTaskCount(ctx, pool, id, *timeout)
+				if err != nil {
+					log.Fatalf("verifying job %s: %v", id, err)
+				}
+				if n != *tasksPerJob {
+					badCount = append(badCount, fmt.Sprintf("%s has %d task(s)", id, n))
+				}
+			}
+			log.Printf("prefill verified: %d of %d returned job id(s) are new, %d task(s) each, "+
+				"wanted %d jobs x %d tasks = %d", newJobs, len(jobIDs), *tasksPerJob,
+				*prefill, *tasksPerJob, wantTasks)
+			if len(reused) > 0 {
+				log.Printf("FAILED: %d of %d returned job id(s) already existed before this "+
+					"prefill (%v) — those submissions were deduped against an earlier run and "+
+					"created NO new work, while reporting success. This is the failure mode "+
+					"that cost 138 benchmark trials. Request ids must be unique across client "+
+					"restarts; see -client-prefix.", len(reused), len(jobIDs), reused[:min(3, len(reused))])
+				os.Exit(1)
+			}
+			if len(badCount) > 0 {
+				log.Printf("FAILED: %d job(s) came back with the wrong task count (%v); the "+
+					"numbers from this run would describe a different workload",
+					len(badCount), badCount[:min(3, len(badCount))])
+				os.Exit(1)
+			}
+			if newJobs != *prefill {
+				log.Printf("FAILED: wanted %d new job(s), got %d", *prefill, newJobs)
+				os.Exit(1)
+			}
 		}
 		return
 	}
@@ -122,6 +234,7 @@ func main() {
 		timeout:        *timeout,
 		maxBacklog:     int64(*maxBacklog * *rate),
 		label:          *label,
+		clientPrefix:   prefix,
 		submitterCount: *submitters,
 		seeds:          seeds,
 		// 1µs to 60s at 3 significant figures. The floor is below anything
@@ -166,6 +279,7 @@ type run struct {
 	label          string
 	submitterCount int
 	seeds          []string
+	clientPrefix   string
 
 	mu      sync.Mutex
 	latency *hdr.Histogram // intended send -> response, the honest latency
@@ -371,7 +485,7 @@ func (r *run) dispatch(ctx context.Context, start time.Time, interval time.Durat
 }
 
 func (r *run) submitLoop(ctx context.Context, id int, slots <-chan slot, measureFrom time.Time) {
-	clientID := fmt.Sprintf("loadgen-%d", id)
+	clientID := fmt.Sprintf("%s-%d", r.clientPrefix, id)
 	for s := range slots {
 		sentAt := time.Now()
 		r.backlog.Add(-1)
@@ -529,16 +643,29 @@ func splitAddrs(s string) []string {
 // prefillJobs submits as fast as the cluster will accept, with no schedule and
 // no latency measurement: the only output that matters is how many landed.
 func prefillJobs(ctx context.Context, pool *client.Pool, command string, args []string,
-	taskTimeout time.Duration, jobs, tasksPerJob, submitters int, timeout time.Duration) int {
+	taskTimeout time.Duration, jobs, tasksPerJob, submitters int, timeout time.Duration,
+	prefix string) (submitted int, jobIDs []string) {
 
 	var ok atomic.Int64
+	var mu sync.Mutex
+	seen := map[string]struct{}{}
 	work := make(chan int, submitters*2)
 	var wg sync.WaitGroup
 	for i := 0; i < submitters; i++ {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			clientID := fmt.Sprintf("prefill-%d", id)
+			// The CLIENT id identifies this submitter; the REQUEST id must
+			// identify the logical work item and nothing else.
+			//
+			// It used to be "{clientID}-{seq}", which folds in the submitter
+			// INDEX — so which goroutine happened to grab a sequence number
+			// decided the request id, and the same prefill run twice produced
+			// different ids whenever the race went the other way. That makes
+			// dedup behaviour nondeterministic: a retry intended to dedup
+			// might create a second job, and a test of the dedup path passes
+			// or fails on a scheduling accident.
+			clientID := fmt.Sprintf("%s-prefill-%d", prefix, id)
 			specs := make([]*schedulerpb.TaskSpec, tasksPerJob)
 			for j := range specs {
 				specs[j] = &schedulerpb.TaskSpec{Command: command, Args: args,
@@ -547,11 +674,16 @@ func prefillJobs(ctx context.Context, pool *client.Pool, command string, args []
 			for seq := range work {
 				rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
 				err := pool.Do(func(c schedulerpb.SchedulerClient) error {
-					_, err := c.SubmitJob(rctx, &schedulerpb.SubmitJobRequest{
+					resp, err := c.SubmitJob(rctx, &schedulerpb.SubmitJobRequest{
 						ClientId:  clientID,
-						RequestId: fmt.Sprintf("%s-%d", clientID, seq),
+						RequestId: fmt.Sprintf("%s-job-%d", prefix, seq),
 						Tasks:     specs,
 					})
+					if err == nil && resp != nil {
+						mu.Lock()
+						seen[resp.GetJobId()] = struct{}{}
+						mu.Unlock()
+					}
 					return err
 				})
 				cancel()
@@ -567,10 +699,60 @@ func prefillJobs(ctx context.Context, pool *client.Pool, command string, args []
 		case <-ctx.Done():
 			close(work)
 			wg.Wait()
-			return int(ok.Load())
+			return int(ok.Load()), keys(seen)
 		}
 	}
 	close(work)
 	wg.Wait()
-	return int(ok.Load())
+	return int(ok.Load()), keys(seen)
+}
+
+func keys(m map[string]struct{}) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// jobIDSet snapshots the job ids the cluster already holds.
+//
+// There is no ids-only RPC, so this is a ListJobs with no limit and the
+// response carries every job with its tasks. Expensive on a large cluster,
+// which is why -verify=ids exists for the cheap client-side check.
+func jobIDSet(ctx context.Context, pool *client.Pool, timeout time.Duration) (map[string]struct{}, error) {
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
+	defer cancel()
+	out := map[string]struct{}{}
+	err := pool.Do(func(c schedulerpb.SchedulerClient) error {
+		resp, err := c.ListJobs(rctx, &schedulerpb.ListJobsRequest{})
+		if err != nil {
+			return err
+		}
+		clear(out)
+		for _, j := range resp.GetJobs() {
+			out[j.GetJobId()] = struct{}{}
+		}
+		return nil
+	})
+	return out, err
+}
+
+// jobTaskCount reports how many tasks one job carries.
+func jobTaskCount(ctx context.Context, pool *client.Pool, jobID string,
+	timeout time.Duration) (int, error) {
+
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
+	defer cancel()
+	n := 0
+	err := pool.Do(func(c schedulerpb.SchedulerClient) error {
+		resp, err := c.GetJob(rctx, &schedulerpb.GetJobRequest{JobId: jobID})
+		if err != nil {
+			return err
+		}
+		n = len(resp.GetJob().GetTasks())
+		return nil
+	})
+	return n, err
 }

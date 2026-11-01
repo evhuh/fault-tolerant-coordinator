@@ -779,6 +779,71 @@ So the claim is: the mechanism is proven, the fix is verified by a deterministic
 
 Fixed in `29644d1`. The full record is in `results/2026-10-29-checkpoint-a/`, and the running order is in the roadmap's "Day 10 — HANDOFF" section.
 
+### Every Day 11 number states its -snapshot-entries
+
+**A quoted figure comes from the shipped configuration, or the deviation is stated in the same sentence.** This is not pedantry: the snapshot threshold decides whether the raft log compacts, and the log decides how long a restarted node spends applying before it can vote. The failover numbers moved by an order of magnitude on that flag alone.
+
+The shipped default is **`-snapshot-entries 10000`**. Where a Day 11 measurement deviates, it was deliberate and it is recorded here:
+
+| measurement | `-snapshot-entries` | why, and what it costs |
+|---|---|---|
+| Plan-batching sweep (drain time at P=1/10/100) | **500,000** | Set so no snapshot occurs inside a measurement window, after a 20,000-job prefill grew state to 5.9MB and snapshotting it synchronously cost leadership 9 times in 30s. The arm is a fixed-backlog drain with no node restarts, so uncompacted-log replay never arises. |
+| 10k / 50k / 150k boundary runs | **500,000** | Same reason. No restarts in these runs either. |
+| Read-path scaling (`AssignedTaskFor`, 72-119ns) | n/a | A unit test over an in-memory store; no raft, no log. |
+| Worker reclaim latency (100 trials) | **500,000** | Workers restart, coordinators do not, so the log never replays. The flag does not bear on this measurement. |
+| Leader failover, bounded (98 trials, p50 1303ms) | **500,000** | Deviation MATTERS here, which is why the cluster is rebuilt from empty every 10 trials: that keeps the log short and makes the number "failover at a stated state size" rather than failover against an ever-growing log. |
+| Leader failover, unbounded (superseded) | **500,000** | The deviation IS the finding: zero snapshots, so each restart replays everything, and dispatch degraded 1127ms to 4690ms over 55 trials. |
+| Leader failover, shipped default | **10,000** | The control for the above. |
+
+The honest reading of the bounded failover figure is therefore: **p50 1303ms at a median 990 task records, with compaction effectively disabled and the cluster rebuilt every 10 trials.** A production cluster at the shipped threshold with a long-lived log is a different measurement, which is why it was run separately rather than assumed equivalent.
+
+### requestIDs must be globally unique across client restarts
+
+**The contract: a `(clientID, requestID)` pair identifies one logical submission for all time, not one per process lifetime.** Use a UUID, or a value derived from the work itself. Do NOT use a counter that restarts with the process.
+
+`applyRegisterWorker`'s sibling, `applySubmitJob`, remembers the Result it produced for each `(clientID, requestID)` and replays it on a repeat. That is what makes `SubmitJob` safe to retry through a failover, and it is the behaviour the effect-ledger work depends on. The cost is that a client which reuses an id gets the OLD job back and creates nothing, while receiving a success response carrying a job id.
+
+Day 11's benchmark harness did exactly that. `cmd/loadgen -prefill` built ids as `prefill-<submitter>-<seq>` with `seq` restarting at 0 each invocation, so every top-up after the first returned the first run's job: "1 of 1 jobs submitted", zero new tasks, exit 0. The dedup cache is swept on a 10-minute TTL, so the failure cleared periodically and came back — which is why it presented as clusters of bad trials rather than a flat failure. It cost **70 of 100 reclaim trials and 68 of 100 failover trials**, and was misread twice as system degradation before the state was printed.
+
+`cmd/loadgen` now derives a per-process nonce (`-client-prefix` pins it for anyone testing the dedup path deliberately) and, separately, **verifies that submissions created work**: it counts distinct job ids returned and exits non-zero when fewer come back than jobs submitted. Retries within a run still dedup, which is the point; runs no longer dedup against each other.
+
+#### Two rules for an idempotency key
+
+A `(clientID, requestID)` pair is an idempotency key, and both halves of this have now been violated in this repo and paid for.
+
+**(a) Globally unique across clients AND restarts.** Not per-process. A counter that restarts with the process produces the same key for different work, and the server will faithfully return the first submission's result. Use a UUID, or derive it from the work itself. `cmd/loadgen` got this wrong and lost 70 of 100 reclaim trials and 68 of 100 failover trials to it, each prefill reporting "submitted" and exiting 0 while creating nothing.
+
+**(b) Derived from the LOGICAL WORK ITEM, never from who picked it up.** `prefillJobs` built its key as `{prefix}-prefill-{submitterIndex}-{seq}`, folding in which of several goroutines happened to pull a sequence number off the work channel. Two consequences, and the second is the serious one:
+
+- The same prefill run twice produced DIFFERENT keys whenever the race went the other way, so a test of the dedup path passed or failed on a scheduling accident. It did: the first run of that test reported "2 of 2 returned job id(s) are new" and passed, because no dedup had occurred.
+- More importantly, **dedup became nondeterministic for real callers**. A retry meant to be idempotent can land under a different key and create a second job, which is exactly the duplicate the mechanism exists to prevent. A key that depends on scheduling is not an idempotency key.
+
+The fix is `{prefix}-job-{seq}`: the work item's identity and nothing else. The general rule is that the key must be a function of WHAT is being asked for, computable by any caller holding the same request, and independent of which process, goroutine or worker transmits it.
+
+**Verification belongs with it**, because a key bug is silent by construction — the server answers success either way. `cmd/loadgen -verify=new-jobs` snapshots existing job ids, then requires every returned id to be newly created and to carry the requested task count. Two weaker designs were tried and discarded: counting tasks inside the returned jobs passes a dedup (the original jobs do have the right count), and a cluster-wide count delta assumes this process is the only writer — a concurrent submitter either inflates it into a false failure or masks a dedup — and it will break outright once terminal tasks are collected, since the count can then fall while work is being created. Job identity is immune to all three.
+
+#### PROPOSED, not implemented: reject a reused id whose payload differs
+
+The guard that would have made this an immediate error rather than a silent no-op.
+
+**The change.** Store a hash of the request payload alongside each dedup session. On a repeat `(clientID, requestID)`:
+
+- identical hash → replay the remembered Result, exactly as today. This is the retry path and must not change.
+- different hash → **reject** with a distinct error (`ALREADY_EXISTS` / `ErrRequestIDReused`) instead of returning the original job.
+
+The hash covers what the client asked for — the task specs and priority — and deliberately not leader-assigned fields like job id, task ids or `created_ms`, which differ on every proposal and would make every retry look like a conflict.
+
+**Why it catches today's bug.** The harness submitted a 6-task job under an id first used for a 1-task job. Same id, different payload, so the second call would have failed loudly at the first top-up instead of quietly creating nothing for 100 trials.
+
+**Command-version implications, which are the reason this is a proposal and not a patch.** The hash has to live in the committed state, because the dedup cache is committed state and every replica must reach the same verdict:
+
+1. **`session` gains a field**, so `proto/snapshot.proto`'s session entry gains one too. A snapshot written by a new build and restored by an old one must still work: the field is additive with a new number, and an old build ignores it. Safe in that direction.
+2. **The APPLY decision changes**, which is the part that needs a version. A new build rejects a reused id with a differing payload; an old build accepts it and returns the original job. Two replicas at different builds applying the same entry would then produce DIFFERENT state — exactly the divergence the version gate exists to prevent. So this needs `CommandVersionPayloadHashedSession = 4` — `CommandVersionCurrent` is `ClaimedRenewal` = 3 today — with `applySubmitJob` gated on the command's version: entries below 4 keep the old permissive behaviour forever, entries at 4 enforce the check.
+3. **Replay of a pre-upgrade log must be identical**, so the gate is on the entry's version and not on the build's. A log containing a version-3 SubmitJob that reused an id must still replay as "returned the original job", or restoring from that log diverges from the cluster that wrote it. The Day 7 pre-fix-log replay test is the shape this needs.
+4. **Sessions restored from a snapshot written before the change** have no hash. Treat a missing hash as "unknown, do not judge": replay the remembered Result as today rather than rejecting, because a false rejection breaks a legitimate retry across an upgrade. The guard then becomes effective for sessions created after the upgrade, which is the honest scope.
+
+**What it does not fix.** A client that reuses an id with an IDENTICAL payload still silently gets the old job — which is correct for a retry and indistinguishable from one. A harness wanting genuinely new work still has to vary its ids; the guard catches the common case where the payload moved, not the case where it did not.
+
 ### An oracle written from the same model as the code inherits its blind spots
 
 `TestTasksByWorkerIndexMatchesAFullScan` compares the maintained worker index against a full scan of every task, after every step of a random command sequence. It is the right shape of test and it passed a defect.
