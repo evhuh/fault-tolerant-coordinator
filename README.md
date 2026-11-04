@@ -375,5 +375,7 @@ CPU contention is specifically *not* implicated: scheduler overshoot overlapped 
 | `internal/raftnode` | the Ready loop, WAL, snapshots, stall detection |
 | `internal/server` | gRPC service, raft wiring, coordinator lifecycle |
 | `proto/` | three independently versioned schemas: API, log commands, snapshots |
+| `docs/writeup.md` | the four problems that were actually hard, read once, start to finish |
 | `docs/architecture.md` | the design, decision by decision, with what each one cost |
+| `docs/roadmap.md` | how it was built, day by day, including what each day got wrong |
 | `results/` | every quoted number, with its rows, its harness and its run-stamped README |
