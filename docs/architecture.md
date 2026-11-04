@@ -882,6 +882,22 @@ That is the same failure as the stale-log read earlier in Day 11, which produced
 
 **Concretely, a run directory holds:** `RUN_ID` (the id, the config that deviates from shipped — `-snapshot-entries` above all — and the workload), `coord-N.log`, `worker-N.log`, `rows.jsonl`, the bracketing host probes, and the final metric scrapes. Append mode is fine inside it, since the directory is the scope.
 
+### The one ready-loop-stall red was attributed by RATE, not by mechanism
+
+Worth recording because the conclusion is weaker than it looks, and a later reader should not upgrade it.
+
+`TestSeedSweep` failed on seed 4 with `VIOLATION [ready-loop-stall] ... stalled 534ms in apply` **2 times in 9 runs**, on a host that had been running benchmarks for about six hours. On a rested host it then passed **40 of 40** across an interleaved A/B — seed 4 alone and the full sweep, with the stall completion report enabled and disabled, one for one, ten each. At the observed 2/9 rate, 0 failures in the 20 sweep runs is a **0.65%** outcome (0.7778^20).
+
+**So the red is attributed to host degradation by RATE COMPARISON. No mechanism was found, and none is claimed.** What was ruled out, each by measurement rather than argument:
+
+- **Not the stall-duration change.** 0 of 20 with it enabled against 0 of 20 disabled, interleaved so drift hit both arms equally. And no consumer compares a stall's duration to a bound — the invariant branches on `IOBound` and uses the duration only in message text — so longer true durations cannot convert a tolerated stall into a failure.
+- **Not an in-process leak.** Goroutines return to 2 between seeds and heap plateaus at 5MB; twelve of twenty sweep runs show no transient at all across sixteen seeds.
+- **Not CPU contention specifically.** This is the honest limit of the attribution: scheduler overshoot was **242µs on the failing host and 139-274µs on the passing one**, so the ranges OVERLAP and CPU contention is not implicated by the data. The clear differences were **fsync mean 5.9ms versus 3.85ms or below**, and roughly six hours of sustained prior load.
+
+In 40 clean runs not a single stall was detected — not a violation, not a tolerated one. **The failure is unreproduced on a healthy host rather than explained**, and that is the strongest available statement.
+
+A classifier that downgraded an apply stall when the host's own CPU probe was out of budget was considered and is **recorded as an idea only, not planned work**: the overlap above means the evidence does not support building it, and a classifier that excuses stalls on a guess would blind the detector to the concurrency bug it exists to catch.
+
 ### A reported stall duration is a LOWER BOUND, not the blocked time
 
 `watchStalls` polls on a ticker at `threshold/2` and reports **once per stall** — the `reportedFor == since` guard exists so a multi-second stall does not bury its own first report. The consequence is that the `Duration` it hands to `Handler.Stalled` is **elapsed time at the moment of DETECTION, not at the stall's end**.

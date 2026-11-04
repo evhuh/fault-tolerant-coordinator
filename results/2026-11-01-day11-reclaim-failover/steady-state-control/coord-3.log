@@ -1,0 +1,36 @@
+2026/10/31 13:21:36 metrics on 127.0.0.1:9093/metrics and pprof on 127.0.0.1:9093/debug/pprof/, gauges resampled every 1s
+raft 2026/10/31 13:21:36 INFO: 3 switched to configuration voters=()
+raft 2026/10/31 13:21:36 INFO: 3 became follower at term 0
+raft 2026/10/31 13:21:36 INFO: newRaft 3 [peers: [], term: 0, commit: 0, applied: 0, lastindex: 0, lastterm: 0]
+raft 2026/10/31 13:21:36 INFO: 3 became follower at term 1
+raft 2026/10/31 13:21:36 INFO: 3 switched to configuration voters=(1)
+raft 2026/10/31 13:21:36 INFO: 3 switched to configuration voters=(1 2)
+raft 2026/10/31 13:21:36 INFO: 3 switched to configuration voters=(1 2 3)
+2026/10/31 13:21:36 coordinator: listening on 127.0.0.1:8083 [raft id=3] (lease=2s tick=200ms schedulers=4 max-plan=100)
+raft 2026/10/31 13:21:36 INFO: 3 switched to configuration voters=(1 2 3)
+raft 2026/10/31 13:21:36 INFO: 3 switched to configuration voters=(1 2 3)
+raft 2026/10/31 13:21:36 INFO: 3 switched to configuration voters=(1 2 3)
+raft 2026/10/31 13:21:37 INFO: 3 is starting a new election at term 1
+raft 2026/10/31 13:21:37 INFO: 3 became pre-candidate at term 1
+raft 2026/10/31 13:21:37 INFO: 3 [logterm: 1, index: 3] sent MsgPreVote request to 1 at term 1
+raft 2026/10/31 13:21:37 INFO: 3 [logterm: 1, index: 3] sent MsgPreVote request to 2 at term 1
+raft 2026/10/31 13:21:37 INFO: 3 received MsgPreVoteResp from 3 at term 1
+raft 2026/10/31 13:21:37 INFO: 3 has received 1 MsgPreVoteResp votes and 0 vote rejections
+raft 2026/10/31 13:21:37 INFO: 3 received MsgPreVoteResp from 1 at term 1
+raft 2026/10/31 13:21:37 INFO: 3 has received 2 MsgPreVoteResp votes and 0 vote rejections
+raft 2026/10/31 13:21:37 INFO: 3 became candidate at term 2
+raft 2026/10/31 13:21:37 INFO: 3 [logterm: 1, index: 3] sent MsgVote request to 1 at term 2
+raft 2026/10/31 13:21:37 INFO: 3 [logterm: 1, index: 3] sent MsgVote request to 2 at term 2
+raft 2026/10/31 13:21:37 INFO: 3 received MsgVoteResp from 3 at term 2
+raft 2026/10/31 13:21:37 INFO: 3 has received 1 MsgVoteResp votes and 0 vote rejections
+raft 2026/10/31 13:21:37 INFO: 3 received MsgVoteResp from 1 at term 2
+raft 2026/10/31 13:21:37 INFO: 3 has received 2 MsgVoteResp votes and 0 vote rejections
+raft 2026/10/31 13:21:37 INFO: 3 became leader at term 2
+raft 2026/10/31 13:21:37 INFO: raft.node: 3 elected leader 3 at term 2
+2026/10/31 13:21:37 coordinator: became leader, establishing leadership
+2026/10/31 13:24:03 raftnode: node 3 snapshotted at index 10000 (1124873 bytes), log compacted to 9000
+2026/10/31 13:26:22 raftnode: node 3 snapshotted at index 20000 (2225973 bytes), log compacted to 19000
+2026/10/31 13:28:46 raftnode: node 3 snapshotted at index 30001 (3365853 bytes), log compacted to 29001
+2026/10/31 13:31:07 raftnode: node 3 snapshotted at index 40001 (4474953 bytes), log compacted to 39001
+2026/10/31 13:31:52 coordinator: shutting down
+2026/10/31 13:31:52 coordinator: lost leadership, revoking

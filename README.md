@@ -62,3 +62,17 @@ A payload that needs single-execution semantics must be idempotent on `FTC_TASK_
 
 The simulator measures both halves of this and reports them, because a run that never overlapped did not test the claim at all: see `Ledger.Overlaps` (executions that ran simultaneously) and `Ledger.StaleRejected` (late reports that reached a coordinator and were discarded).
 A zero in either is reported as INCONCLUSIVE rather than as a pass.
+
+### Idempotency keys: the caller's half of the contract
+
+`SubmitJob` takes a `(client_id, request_id)` pair, and the coordinator remembers the response it produced for one. That is what makes the call safe to retry through a failover. Two rules make it work, and both are the caller's responsibility.
+
+**The key must be globally unique across clients AND restarts.** Not per-process. A counter that restarts with the process produces the same key for different work, and the coordinator will faithfully return the first submission's answer. Use a UUID, or derive the key from the work itself.
+
+**The key must be derived from the logical work item, never from who sends it.** A key that folds in a worker index, a goroutine id or a connection makes dedup depend on scheduling: the same retry can land under a different key and create a second job, which is the duplicate the mechanism exists to prevent.
+
+**Reuse with a different payload is rejected.** Since the payload-hashed-session command version, submitting different work under a key that was already used returns **`InvalidArgument`** (`request id reused for different work`). The payload is the task specs and the priority; job ids, task ids and timestamps are assigned by the leader per proposal and are deliberately NOT part of it, which is why a genuine retry — one that arrives with a fresh job id — still replays correctly.
+
+**A retry must resend the identical request.** Changing the task list, the command, the args, the timeout, the attempt cap or the priority makes it a different submission, and under the same key that is an error rather than a retry.
+
+**This is a behaviour change.** Earlier builds silently returned the original job for any reuse, so a caller that retried with a slightly different request got a success and work that was never created. The rejection is definitive — nothing was created, and retrying cannot help — so clients should treat it as a bug in their key generation rather than something to back off and repeat.

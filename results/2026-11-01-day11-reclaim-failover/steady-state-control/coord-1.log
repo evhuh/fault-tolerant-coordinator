@@ -1,0 +1,22 @@
+2026/10/31 13:21:36 metrics on 127.0.0.1:9091/metrics and pprof on 127.0.0.1:9091/debug/pprof/, gauges resampled every 1s
+raft 2026/10/31 13:21:36 INFO: 1 switched to configuration voters=()
+raft 2026/10/31 13:21:36 INFO: 1 became follower at term 0
+raft 2026/10/31 13:21:36 INFO: newRaft 1 [peers: [], term: 0, commit: 0, applied: 0, lastindex: 0, lastterm: 0]
+raft 2026/10/31 13:21:36 INFO: 1 became follower at term 1
+raft 2026/10/31 13:21:36 INFO: 1 switched to configuration voters=(1)
+raft 2026/10/31 13:21:36 INFO: 1 switched to configuration voters=(1 2)
+raft 2026/10/31 13:21:36 INFO: 1 switched to configuration voters=(1 2 3)
+2026/10/31 13:21:36 coordinator: listening on 127.0.0.1:8081 [raft id=1] (lease=2s tick=200ms schedulers=4 max-plan=100)
+raft 2026/10/31 13:21:36 INFO: 1 switched to configuration voters=(1 2 3)
+raft 2026/10/31 13:21:36 INFO: 1 switched to configuration voters=(1 2 3)
+raft 2026/10/31 13:21:36 INFO: 1 switched to configuration voters=(1 2 3)
+raft 2026/10/31 13:21:37 INFO: 1 [logterm: 1, index: 3, vote: 0] cast MsgPreVote for 3 [logterm: 1, index: 3] at term 1
+raft 2026/10/31 13:21:37 INFO: 1 [term: 1] received a MsgVote message with higher term from 3 [term: 2]
+raft 2026/10/31 13:21:37 INFO: 1 became follower at term 2
+raft 2026/10/31 13:21:37 INFO: 1 [logterm: 1, index: 3, vote: 0] cast MsgVote for 3 [logterm: 1, index: 3] at term 2
+raft 2026/10/31 13:21:37 INFO: raft.node: 1 elected leader 3 at term 2
+2026/10/31 13:24:03 raftnode: node 1 snapshotted at index 10005 (1125133 bytes), log compacted to 9005
+2026/10/31 13:26:22 raftnode: node 1 snapshotted at index 20006 (2226358 bytes), log compacted to 19006
+2026/10/31 13:28:46 raftnode: node 1 snapshotted at index 30007 (3366203 bytes), log compacted to 29007
+2026/10/31 13:31:08 raftnode: node 1 snapshotted at index 40007 (4475083 bytes), log compacted to 39007
+2026/10/31 13:31:52 coordinator: shutting down
