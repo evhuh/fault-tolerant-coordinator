@@ -53,11 +53,3 @@ Two measurement notes the scripts print inline:
 
 - **t=0 for reclaim is the last heartbeat RECEIVED**, derived as `lease_expiry_ms - 2000ms` from committed state *after* the kill. Read before the kill it is stale by up to one heartbeat interval, which overstated this figure by 606ms in the Day 11 trials.
 - **Everything is polled**, at 10ms, so every number carries ±10ms. Reclaim and redispatch can land in the same poll iteration, because reassignment follows release by roughly 15ms.
-
-## Two things that bit me writing these
-
-**`sched_assignments_total` is leader-only and per-process.** A follower never increments it, and a new leader starts at zero, because the counter lives in the process rather than in the log. The first version read it from "any live node" and compared against a pre-kill baseline — which can never fire, so the demo reported no dispatch for twenty seconds while the survivor was dispatching fine.
-
-**Node 1's metrics port is not a safe default** in a demo that kills a coordinator: node 1 may be the corpse, every read silently returns empty, and the final accounting reported "0 tasks terminal" about a cluster that had finished the job correctly. `live_metrics` asks for a node that answers.
-
-Both are the same class of error as the `pkill -f` miss recorded in `docs/architecture.md` — **measure the mechanism before theorizing about it**, and print the state you are branching on.
