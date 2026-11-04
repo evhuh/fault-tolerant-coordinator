@@ -1,1 +1,7 @@
 .DS_store
+
+# `make bin` output, and everything a running cluster or demo writes.
+bin/
+demos/run/
+raft-*/
+data-*/

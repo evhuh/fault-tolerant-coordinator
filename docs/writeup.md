@@ -173,12 +173,5 @@ An index maintained inside `Apply` took the call to a flat 72ns.
 The rule is "no O(state) work under the apply lock on an RPC path", but the better lesson is the second one: my property test for that index shared a blind spot with the index itself, since both asked "which tasks have `WorkerID == w`" and neither asked "and are they still running".
 An oracle written from the same mental model as the code inherits its errors.
 
-### What I'd lead with
-
-Correct and stall-free to at least 150,000 tasks, usefully fast to about 50,000.
-Failover is ~1.4s p50 on the shipped configuration, and that figure is **bounded by log compaction, not made safe by it**: a restarting node applies its backlog inside the Ready loop and can neither vote nor acknowledge for the whole window — 6.3 seconds for 23,500 entries with compaction disabled.
-Snapshots are synchronous and expose the Ready loop to disk tail latency.
-Every "max" is an observed worst case from a finite trial count on one host, never a bound.
-One simulator red remains attributed to host degradation by rate comparison, with no mechanism found and none claimed.
-
+The limits worth stating out loud — what the system is good to, and where each number stops being true — are in [`roadmap.md`](roadmap.md) under "how to talk about this project".
 A system whose limits you can state precisely is worth more than one whose author believes it has none.

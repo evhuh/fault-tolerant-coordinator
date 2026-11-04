@@ -1106,7 +1106,7 @@ The long version above is the interview backing for it, and `README.md` is the b
 
 **Two phrasings to be ready to defend**, since the compression hides a caveat each.
 
-- *"leader failover reaches first redispatch in 1.44s p50"* — that is the **shipped** `-snapshot-entries 10000`, and the figure is sensitive to it: with compaction effectively disabled and state allowed to grow, the same workload degraded to 17s. The honest one-line answer is "bounded by compaction, not removed by it", and the mechanism is restart replay inside the Ready loop.
+- *"leader failover reaches first redispatch in 1.44s p50"* — that is the **shipped** `-snapshot-entries 10000`, and the figure is sensitive to it. The controlled comparison: with compaction off, failover degraded **4.2× (1127 → 4690ms) over the 55-trial reproduction**; under the shipped default, **+12% (1384 → 1554ms) over 55 trials**. The honest one-line answer is "bounded by compaction, not removed by it", and the mechanism is restart replay inside the Ready loop. Note that the **45-trial no-reset run is the flat one** (986–2062ms, ratio 1.07) — it is the evidence that restart cycles alone degrade nothing, so it is the wrong run to cite for the 4.2×.
 - *"zero duplicate commits across 64 runs"* — the committed-effect claim covers all 64; the **no-lost-task** claim covers the 63 that drained to quiescence. If someone asks "across 64 runs of what?", the answer is 600 steps each, 2h47m of cumulative run time, 128,830 committed effects over 151,161 executions.
 
 
@@ -1130,6 +1130,17 @@ And measurement and verification discipline: open-loop load, percentiles over av
 
 **Questions to answer cold:**
 Why not two-phase commit? Why can't you get true exactly-once? What happens if a worker completes a task but the leader dies before the completion commits? Why is the eval broker derived rather than replicated? What does optimistic concurrency buy you, and when does it lose? What's your write throughput bounded by? Why 3 nodes rather than 5? What breaks first as workers scale? What does Porcupine *not* prove?
+
+**The limits, stated first rather than extracted.**
+Moved here from the writeup, because this is the paragraph to open with when someone asks how good the system actually is.
+
+> Correct and stall-free to at least 150,000 tasks, usefully fast to about 50,000.
+> Failover is ~1.4s p50 on the shipped configuration, and that figure is **bounded by log compaction, not made safe by it**: a restarting node applies its backlog inside the Ready loop and can neither vote nor acknowledge for the whole window — 6.3 seconds for 23,500 entries with compaction disabled.
+> Snapshots are synchronous and expose the Ready loop to disk tail latency.
+> Every "max" is an observed worst case from a finite trial count on one host, never a bound.
+> One simulator red remains attributed to host degradation by rate comparison, with no mechanism found and none claimed.
+
+Leading with that is stronger than being walked to it, and it earns the numbers that come after.
 
 ---
 

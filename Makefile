@@ -1,4 +1,4 @@
-.PHONY: proto test race vet build sweeps repro fsync-gate release-check
+.PHONY: proto test race vet build bin sweeps repro fsync-gate release-check demos
 
 # Regenerate both schemas. Run from proto/ so `source:` in the generated headers stays stable; --go_opt=module strips the package prefix so files land in proto/commandpb and proto/schedulerpb rather than a nested tree
 PROTO_MODULE := github.com/evazheng/fault-tolerant-coordinator/proto
@@ -11,6 +11,17 @@ proto:
 
 build:
 	go build ./...
+
+# `build` compiles and throws the binaries away, which is what you want in CI
+# and useless if you intend to RUN anything. `bin` is the one the README and
+# the demos use, because a documented command that cannot work is worse than
+# no documentation.
+BINARIES := coordinator worker schedctl loadgen fsyncprobe
+
+bin:
+	@mkdir -p bin
+	@for b in $(BINARIES); do go build -o bin/$$b ./cmd/$$b || exit 1; done
+	@ls bin
 
 test:
 	go test ./...

@@ -121,46 +121,41 @@ Full design notes, including the command set, the task state machine and every d
 ## Running it
 
 ```sh
-make build
+make bin   # `make build` only compiles; `make bin` writes ./bin/<binary>
 
 # a 3-node cluster, raft on 7001-7003, gRPC on 8081-8083, metrics on 9091-9093
 for i in 1 2 3; do
-  ./coordinator -id $i \
+  ./bin/coordinator -id $i \
     -peers '1=http://127.0.0.1:7001,2=http://127.0.0.1:7002,3=http://127.0.0.1:7003' \
     -api-peers '1=127.0.0.1:8081,2=127.0.0.1:8082,3=127.0.0.1:8083' \
     -addr :808$i -metrics-addr 127.0.0.1:909$i -data-dir ./raft-$i >coord-$i.log 2>&1 &
 done
 
-./worker -id w-1 -coordinator 127.0.0.1:8081,127.0.0.1:8082,127.0.0.1:8083 -concurrency 8 &
+./bin/worker -id w-1 -coordinator 127.0.0.1:8081,127.0.0.1:8082,127.0.0.1:8083 -concurrency 8 &
 
-./schedctl -coordinator 127.0.0.1:8081 submit -n 100 -- /bin/true
-./schedctl -coordinator 127.0.0.1:8081 status <jobID>
-./schedctl -coordinator 127.0.0.1:8081 list
+./bin/schedctl -coordinator 127.0.0.1:8081 submit -n 100 -- /bin/echo hello
+# the command is executed by the worker, so give a path that exists on it:
+# macOS has /usr/bin/true, not /bin/true
+./bin/schedctl -coordinator 127.0.0.1:8081 status <jobID>
+./bin/schedctl -coordinator 127.0.0.1:8081 list
 ```
 
 Any coordinator address will do for a client or a worker: a non-leader answers `NOT_LEADER` with the leader's address and the client follows the redirect.
 
 ### The two failure demos
 
-**Leader dies mid-flight.** Submit a backlog, find the leader, kill it, watch a survivor resume dispatching.
+Both are scripted, run against the real cluster, and **check what they claim** rather than narrating it — see [demos/](demos/).
 
 ```sh
-./loadgen -addrs 127.0.0.1:8081,127.0.0.1:8082,127.0.0.1:8083 -prefill 200 -tasks-per-job 10
-grep -l "became leader" coord-*.log | tail -1      # or curl the metrics port for is_leader
-kill -9 <leader pid>
-curl -s 127.0.0.1:9092/metrics | grep sched_assignments_total   # climbs on the new leader
+./demos/up.sh 3 4 && TASKS=24 ./demos/failover.sh && ./demos/down.sh
+./demos/up.sh 2 2 && ./demos/reclaim.sh && ./demos/down.sh
 ```
 
-**A worker dies mid-task.** Kill it and watch the lease expire, the task redispatch, and exactly one result commit.
+**Failover** submits a backlog, names the leader, `SIGKILL`s it, times the survivor's election and first dispatch, then asserts that every submitted task reached a terminal state exactly once.
+**Reclaim** waits until a worker is *RUNNING* a task (not merely assigned), asserts a free slot exists elsewhere, `SIGKILL`s the worker, and times lease expiry → reclaim → redispatch as attempt 2 from the last heartbeat received.
 
-```sh
-curl -s 127.0.0.1:9091/debug/workers | jq '.workers[] | {worker_id, held}'
-kill -9 <worker pid>
-# within ~2.25s: lease expiry, reclaim, redispatch to another worker
-curl -s 127.0.0.1:9091/debug/tasks | jq '.jobs'
-```
-
-Both are also driven non-interactively by the harnesses in [results/2026-11-01-day11-reclaim-failover/](results/2026-11-01-day11-reclaim-failover/), which is where the numbers below come from.
+Each is one trial on one host and says so; the distributions are in [results/2026-11-01-day11-reclaim-failover/](results/2026-11-01-day11-reclaim-failover/), which is also where the numbers below come from.
+`vhs demos/failover.tape` records a GIF of either.
 
 ---
 
@@ -375,6 +370,7 @@ CPU contention is specifically *not* implicated: scheduler overshoot overlapped 
 | `internal/raftnode` | the Ready loop, WAL, snapshots, stall detection |
 | `internal/server` | gRPC service, raft wiring, coordinator lifecycle |
 | `proto/` | three independently versioned schemas: API, log commands, snapshots |
+| `demos/` | the two failure demos, their harness, and the VHS tapes that record them |
 | `docs/writeup.md` | the four problems that were actually hard, read once, start to finish |
 | `docs/architecture.md` | the design, decision by decision, with what each one cost |
 | `docs/roadmap.md` | how it was built, day by day, including what each day got wrong |
