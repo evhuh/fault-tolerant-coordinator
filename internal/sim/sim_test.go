@@ -4,7 +4,10 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
+	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -298,7 +301,25 @@ func TestSeedSweep(t *testing.T) {
 	// configuration it structurally cannot be: the window never opens by
 	// chance. Only the targeted sweeps speak to linearizability.
 	var checked, unchecked, illegal int
+	// IN-PROCESS DRIFT, LOGGED PER SEED.
+	//
+	// This sweep runs sixteen clusters back to back in ONE process, so a
+	// cluster that does not fully shut down leaves its goroutines and timers
+	// behind and the later seeds run against a busier runtime. That is not a
+	// slow host, it is this test leaking, and the two have identical
+	// symptoms: an apply stall late in the sweep, classified as a blocking
+	// call because no disk stall accompanied it.
+	//
+	// Seed 4 failed on a ready-loop-stall at 2 of 9 runs with no mechanism
+	// in the code, and a rising series here would say the cause is in
+	// process rather than on the machine. Logged rather than asserted,
+	// because the threshold at which drift matters is not yet known.
+	var goroutineSeries, heapSeries []string
 	for seed := int64(1); seed <= seedSweepRuns; seed++ {
+		var ms runtime.MemStats
+		runtime.ReadMemStats(&ms)
+		goroutineSeries = append(goroutineSeries, fmt.Sprintf("%d", runtime.NumGoroutine()))
+		heapSeries = append(heapSeries, fmt.Sprintf("%.0f", float64(ms.HeapInuse)/(1<<20)))
 		cfg := quickConfig(seed, 8)
 		res, err := New(cfg, dirsFor(t, cfg.Nodes)).Run(context.Background())
 		if res.Lin.Verdict == porcupine.Illegal {
@@ -350,6 +371,8 @@ func TestSeedSweep(t *testing.T) {
 			"convergence, never linearizability coverage",
 			seedSweepRuns, checked, seedSweepMinChecked, checked, unchecked, illegal)
 	}
+	t.Logf("GOROUTINES at the start of each seed: %s", strings.Join(goroutineSeries, " "))
+	t.Logf("HEAP IN USE (MB) at the start of each seed: %s", strings.Join(heapSeries, " "))
 	t.Logf("sweep of %d seeds (invariants + convergence): %d checked, %d unchecked, %d illegal — "+
 		"this is NOT linearizability evidence; see the targeted sweeps",
 		seedSweepRuns, checked, unchecked, illegal)
@@ -570,5 +593,52 @@ func TestStallIsNotAttributableWhenTheHostBrokeThePremise(t *testing.T) {
 	kept, _, _ := downgradeStallsOnBrokenPremise([]Violation{inv, hostIO})
 	if kept[0].Inconclusive {
 		t.Errorf("a state invariant was downgraded by a slow disk: %+v", kept[0])
+	}
+}
+
+// ONE SEED, named by the environment, classified exactly as TestSeedSweep
+// classifies it.
+//
+// It exists for an A/B: TestSeedSweep's seed 4 failed on a ready-loop-stall
+// at 2 of 9 runs with no mechanism anyone could name, and the question is
+// whether it fails in ISOLATION or only alongside the other fifteen seeds'
+// load. Answering that needs the same code path as the sweep, not a
+// differently-configured approximation — hence quickConfig(seed, 8) and the
+// same switch below.
+//
+// Skipped unless FTC_ONE_SEED is set, so it costs nothing in the normal run.
+func TestOneSeedFromEnv(t *testing.T) {
+	raw := os.Getenv("FTC_ONE_SEED")
+	if raw == "" {
+		t.Skip("set FTC_ONE_SEED=<n> to run a single seed with the sweep's classification")
+	}
+	seed, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		t.Fatalf("FTC_ONE_SEED=%q: %v", raw, err)
+	}
+
+	var ms runtime.MemStats
+	runtime.ReadMemStats(&ms)
+	t.Logf("before seed %d: goroutines=%d heapInUse=%.0fMB",
+		seed, runtime.NumGoroutine(), float64(ms.HeapInuse)/(1<<20))
+
+	cfg := quickConfig(seed, 8)
+	res, runErr := New(cfg, dirsFor(t, cfg.Nodes)).Run(context.Background())
+
+	runtime.ReadMemStats(&ms)
+	t.Logf("after seed %d: goroutines=%d heapInUse=%.0fMB",
+		seed, runtime.NumGoroutine(), float64(ms.HeapInuse)/(1<<20))
+
+	switch {
+	case onlyLinearizabilityCoverage(res):
+		t.Logf("seed %d: checked", seed)
+	case inconclusiveOnly(res):
+		t.Logf("seed %d inconclusive, not a finding: %v", seed, res.Violations)
+	case runErr != nil:
+		t.Errorf("seed %d FAILED: %v", seed, runErr)
+	case len(res.Violations) > 0:
+		t.Errorf("seed %d: %v", seed, res.Violations)
+	default:
+		t.Logf("seed %d: checked", seed)
 	}
 }

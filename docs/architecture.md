@@ -4,7 +4,7 @@ Target architecture for the fault-tolerant coordinator.
 Green nodes are implemented; orange nodes are not yet built.
 Update the `classDef` assignments at the bottom of the diagram as days complete.
 
-**Status: end of Day 8.** Day 9 (Porcupine) is next; see the roadmap's "Day 8 — completed" section for the handover summary.
+**Status: end of Day 11.** Days 9 (Porcupine), 10 (the at-scale checkpoint) and 11 (benchmarks and instrumentation) are complete; Day 12 is the writeup. Every node in the diagram below is implemented. See the roadmap's "Day 11 — COMPLETE: handoff" section for the running order, and `README.md` for the measured numbers with their caveats.
 
 ```mermaid
 flowchart LR

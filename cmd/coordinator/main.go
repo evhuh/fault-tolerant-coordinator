@@ -18,6 +18,7 @@ import (
 	"net/http/pprof"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -128,7 +129,80 @@ func main() {
 		// never be mistaken for an API. It reports the committed clock
 		// alongside the leases, because a lease expiry means nothing without
 		// the clock it is compared against.
+		// /debug/tasks is the companion to /debug/workers, and exists for the
+		// same reason: a benchmark that cannot see why it failed has to be
+		// re-run with print statements, which is how two diagnoses in this
+		// project cost a cycle each.
+		//
+		// A SUMMARY, not a dump. Per-job counts by state plus how many tasks
+		// are one attempt from their budget, because "the harness had nothing
+		// to kill" and "every task had exhausted its attempts" look identical
+		// from outside and have different fixes.
+		mux.HandleFunc("/debug/tasks", func(w http.ResponseWriter, r *http.Request) {
+			type jobView struct {
+				JobID      string `json:"job_id"`
+				Pending    int    `json:"pending"`
+				Assigned   int    `json:"assigned"`
+				Running    int    `json:"running"`
+				Complete   int    `json:"complete"`
+				Failed     int    `json:"failed"`
+				NearBudget int    `json:"near_budget"`
+				Backoff    int    `json:"in_backoff"`
+			}
+			out := struct {
+				NowMs        int64     `json:"now_ms"`
+				IsLeader     bool      `json:"is_leader"`
+				EvalsReady   int       `json:"evals_ready"`
+				EvalsBlocked int       `json:"evals_blocked"`
+				Jobs         []jobView `json:"jobs"`
+			}{IsLeader: coord.IsLeader()}
+			out.EvalsReady, out.EvalsBlocked = coord.BrokerStats()
+			byJob := map[string]*jobView{}
+			coord.ReadState(func(st *state.StateStore) {
+				out.NowMs = st.NowMs()
+				for _, id := range st.TaskIDs() {
+					t, ok := st.Task(id)
+					if !ok {
+						continue
+					}
+					j := byJob[t.JobID]
+					if j == nil {
+						j = &jobView{JobID: t.JobID}
+						byJob[t.JobID] = j
+					}
+					switch t.State {
+					case state.TaskPending:
+						j.Pending++
+						if t.NotBeforeMs > st.NowMs() {
+							j.Backoff++
+						}
+					case state.TaskAssigned:
+						j.Assigned++
+					case state.TaskRunning:
+						j.Running++
+					case state.TaskComplete:
+						j.Complete++
+					case state.TaskFailed:
+						j.Failed++
+					}
+					if !terminalState(t.State) && t.Attempt+1 >= t.Spec.MaxAttempts {
+						j.NearBudget++
+					}
+				}
+			})
+			for _, j := range byJob {
+				out.Jobs = append(out.Jobs, *j)
+			}
+			sort.Slice(out.Jobs, func(i, k int) bool { return out.Jobs[i].JobID < out.Jobs[k].JobID })
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(out)
+		})
 		mux.HandleFunc("/debug/workers", func(w http.ResponseWriter, r *http.Request) {
+			type heldView struct {
+				TaskID  string `json:"task_id"`
+				State   string `json:"state"`
+				Attempt int32  `json:"attempt"`
+			}
 			type workerView struct {
 				ID            string   `json:"worker_id"`
 				State         string   `json:"state"`
@@ -136,6 +210,12 @@ func main() {
 				LeaseExpiryMs int64    `json:"lease_expiry_ms"`
 				Capacity      int32    `json:"capacity"`
 				HeldTaskIDs   []string `json:"held_task_ids"`
+				// Held carries each task's STATE, because ASSIGNED and
+				// RUNNING are different facts: a worker that has been handed
+				// a task has not necessarily started it, and a reclaim
+				// benchmark that kills the first case measures a dispatch
+				// race rather than a lease expiry.
+				Held []heldView `json:"held"`
 			}
 			out := struct {
 				NowMs    int64        `json:"now_ms"`
@@ -150,10 +230,21 @@ func main() {
 					if !ok {
 						continue
 					}
+					heldIDs := st.TasksHeldBy(id)
+					held := make([]heldView, 0, len(heldIDs))
+					for _, tid := range heldIDs {
+						t, ok := st.Task(tid)
+						if !ok {
+							continue
+						}
+						held = append(held, heldView{
+							TaskID: tid, State: t.State.String(), Attempt: t.Attempt,
+						})
+					}
 					out.Workers = append(out.Workers, workerView{
 						ID: wk.ID, State: wk.State.String(),
 						RegisteredMs: wk.RegisteredMs, LeaseExpiryMs: wk.LeaseExpiryMs,
-						Capacity: wk.Capacity, HeldTaskIDs: st.TasksHeldBy(id),
+						Capacity: wk.Capacity, HeldTaskIDs: heldIDs, Held: held,
 					})
 				}
 			})
@@ -301,4 +392,11 @@ func isLoopback(host string) bool {
 	}
 	ip := net.ParseIP(host)
 	return ip != nil && ip.IsLoopback()
+}
+
+// terminalState mirrors the state machine's notion of terminal for the debug
+// summary. Duplicated rather than exported from state, because a debug
+// endpoint must not be a reason to widen that package's API.
+func terminalState(s state.TaskState) bool {
+	return s == state.TaskComplete || s == state.TaskFailed
 }
