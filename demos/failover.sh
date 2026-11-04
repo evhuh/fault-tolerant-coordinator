@@ -67,7 +67,9 @@ say "== 5. the job finishes on the survivors =="
 deadline=$(( $(date +%s) + 180 ))
 while [ "$(date +%s)" -lt "$deadline" ]; do
   line=$("$BIN/schedctl" -coordinator "$COORDS" status "$JOB" 2>/dev/null | head -1)
-  printf '\r%-100s' "$line"
+  # Redraw in place on a terminal; print nothing when redirected, because a
+  # carriage return in a captured log smears every poll onto one line.
+  [ -t 1 ] && printf '\r%-100s' "$line"
   inflight=$(printf '%s\n' "$line" | python3 -I -c "
 import re,sys
 s = sys.stdin.read()
@@ -77,7 +79,7 @@ print(sum(int(v) for v in m.values()) if m else 1)
   [ "${inflight:-1}" -eq 0 ] && break
   sleep 1
 done
-printf '\n'
+[ -t 1 ] && printf '\n'
 "$BIN/schedctl" -coordinator "$COORDS" status "$JOB" | head -1
 
 # The accounting claim, checked rather than asserted: every task terminal, and

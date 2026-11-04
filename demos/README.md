@@ -3,10 +3,12 @@
 Both run against a **real 3-node cluster** — three `cmd/coordinator` processes, raft over HTTP, workers over gRPC, no simulator in the path.
 Each one kills a process with `SIGKILL` and then checks what it claims rather than narrating it.
 
-| | shows | script | tape |
-|---|---|---|---|
-| **Failover** | leader dies mid-flight, a survivor resumes the queue, every task accounted for | `failover.sh` | `failover.tape` |
-| **Reclaim** | worker dies mid-task, its lease expires, the task redispatches as attempt 2 | `reclaim.sh` | `reclaim.tape` |
+| | shows | script |
+|---|---|---|
+| **Failover** | leader dies mid-flight, a survivor resumes the queue, every task accounted for | `failover.sh` |
+| **Reclaim** | worker dies mid-task, its lease expires, the task redispatches as attempt 2 | `reclaim.sh` |
+
+A captured run of each is pasted into the top-level [README](../README.md#the-two-failure-demos) as **text**, because the output is the evidence and a code block can be read, searched, diffed and quoted.
 
 ## Running them by hand
 
@@ -24,22 +26,16 @@ TASKS=24 ./demos/failover.sh
 Everything a run writes lands in `demos/run/` (WALs, worker data, logs, pidfiles), which is gitignored and deleted by `down.sh`.
 `./demos/down.sh --keep-logs` keeps the logs and deletes only the state.
 
-## Recording the GIFs
+## Capturing output to paste
 
 ```sh
-brew install vhs            # also installs ttyd and ffmpeg
-vhs demos/failover.tape     # writes demos/failover.gif
-vhs demos/reclaim.tape      # writes demos/reclaim.gif
+./demos/up.sh 3 4 && TASKS=24 ./demos/failover.sh 2>&1 | sed 's/\x1b\[[0-9;]*m//g'
 ```
 
-Run `vhs` from the **repository root**, not from `demos/` — the tapes `cd` to the git root themselves, and the `Output` paths are repo-relative.
+The `sed` strips the colour escapes, which are emitted only onto a terminal anyway.
+`failover.sh`'s progress line redraws with `\r` on a terminal and prints nothing when redirected, so a captured run has one line per stage rather than every poll smeared onto one.
 
-The tapes need **vhs ≥ 0.7** for `Wait`, which holds the recording until the shell prompt returns.
-A fixed `Sleep` would be the alternative, and it is worse in both directions: too short truncates the demo on a slow run, too long pads every GIF with dead air.
-Build and cluster startup are inside `Hide` blocks, so the recording opens on the demo itself.
-
-Expect roughly 40–70 seconds of real time per GIF, which is a large file.
-If you need them smaller, cut `TASKS` in `failover.tape` rather than speeding up playback — a demo whose timings are visibly wrong undercuts the numbers it is there to support.
+Only the task count varies between runs of the failover demo; keep `TASKS` small enough that the run finishes in well under a minute.
 
 ## What the demos do and do not establish
 

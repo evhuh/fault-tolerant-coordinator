@@ -146,16 +146,55 @@ Any coordinator address will do for a client or a worker: a non-leader answers `
 
 Both are scripted, run against the real cluster, and **check what they claim** rather than narrating it — see [demos/](demos/).
 
-```sh
-./demos/up.sh 3 4 && TASKS=24 ./demos/failover.sh && ./demos/down.sh
-./demos/up.sh 2 2 && ./demos/reclaim.sh && ./demos/down.sh
+#### Leader dies mid-flight
+
+Submits a backlog, names the leader, `SIGKILL`s it, times the survivor's election and first dispatch, then asserts every submitted task reached a terminal state exactly once.
+
+```
+$ ./demos/up.sh 3 4 && TASKS=24 ./demos/failover.sh
+== 1. submit 24 tasks ==
+job job-7fdaa9ae6623a426
+== 2. who leads, and what is in flight ==
+leader           node 2
+assignments      20 dispatched by node 2
+job-7fdaa9ae pending=4 assigned=8 running=3 complete=9
+== 3. SIGKILL node 2 ==
+killed node 2 (pid 32126) — the cluster is now 2 of 3
+== 4. waiting for a survivor to lead and dispatch ==
+new leader       node 1 after 1073ms
+first dispatch   1109ms after the kill (±10ms, polled)
+== 5. the job finishes on the survivors ==
+job-7fdaa9ae6623a426  COMPLETE  tasks=24  pending=0 assigned=0 running=0 complete=24 failed=0
+24 task(s) terminal, 24 submitted — nothing lost, nothing duplicated
 ```
 
-**Failover** submits a backlog, names the leader, `SIGKILL`s it, times the survivor's election and first dispatch, then asserts that every submitted task reached a terminal state exactly once.
-**Reclaim** waits until a worker is *RUNNING* a task (not merely assigned), asserts a free slot exists elsewhere, `SIGKILL`s the worker, and times lease expiry → reclaim → redispatch as attempt 2 from the last heartbeat received.
+*One trial on one host, pasted as it ran.* The distribution is **p50 1441ms / p95 2090ms / max 2584ms over 55 trials** in [results/2026-11-01-day11-reclaim-failover/](results/2026-11-01-day11-reclaim-failover/); a single 1109ms observation is not the number to quote.
 
-Each is one trial on one host and says so; the distributions are in [results/2026-11-01-day11-reclaim-failover/](results/2026-11-01-day11-reclaim-failover/), which is also where the numbers below come from.
-`vhs demos/failover.tape` records a GIF of either.
+#### A worker dies mid-task
+
+Waits until a worker is *RUNNING* a task rather than merely assigned, asserts a free slot exists elsewhere, `SIGKILL`s it, and times lease expiry → reclaim → redispatch as attempt 2 from the last heartbeat received.
+
+```
+$ ./demos/up.sh 2 2 && ./demos/reclaim.sh
+== 1. submit one long task ==
+job job-c250f9a955b61c26
+== 2. wait for a worker to be RUNNING it ==
+victim w-1 is RUNNING job-c250f9a955b61c26/0000
+2 free slot(s) elsewhere
+== 3. SIGKILL w-1 ==
+killed w-1 (pid 32545)
+t=0 = last heartbeat received = 1793757145676ms (lease 1793757147676 - 2000ms TTL), on the committed clock
+== 4. lease expiry, reclaim, redispatch ==
+reclaimed        2087ms after last heartbeat (±10ms poll)
+redispatched     to w-2, 2087ms after last heartbeat
+== 5. the attempt number is the idempotency key ==
+w-1    cap=2  held=[]
+w-2    cap=2  held=[('c26/0000', 'ASSIGNED', 'attempt 2')]
+reclaimed in 2087ms, redispatched in 2087ms — consistent with the ~2250ms budget (lease 2000 + tick 200 + commit)
+```
+
+*One trial on one host, pasted as it ran.* Reclaim and redispatch report the same figure because they landed in the same 10ms poll — reassignment follows release by roughly 15ms.
+The distribution is **p50 2121ms / p95 2217ms / max 2246ms over 100 trials** in [results/2026-11-01-day11-reclaim-failover/](results/2026-11-01-day11-reclaim-failover/).
 
 ---
 
@@ -370,7 +409,7 @@ CPU contention is specifically *not* implicated: scheduler overshoot overlapped 
 | `internal/raftnode` | the Ready loop, WAL, snapshots, stall detection |
 | `internal/server` | gRPC service, raft wiring, coordinator lifecycle |
 | `proto/` | three independently versioned schemas: API, log commands, snapshots |
-| `demos/` | the two failure demos, their harness, and the VHS tapes that record them |
+| `demos/` | the two failure demos and their cluster harness |
 | `docs/writeup.md` | the four problems that were actually hard, read once, start to finish |
 | `docs/architecture.md` | the design, decision by decision, with what each one cost |
 | `docs/roadmap.md` | how it was built, day by day, including what each day got wrong |

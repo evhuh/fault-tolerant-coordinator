@@ -1,4 +1,4 @@
-.PHONY: proto test race vet build bin sweeps repro fsync-gate release-check demos
+.PHONY: proto test race vet build bin sweeps repro fsync-gate release-check
 
 # Regenerate both schemas. Run from proto/ so `source:` in the generated headers stays stable; --go_opt=module strips the package prefix so files land in proto/commandpb and proto/schedulerpb rather than a nested tree
 PROTO_MODULE := github.com/evazheng/fault-tolerant-coordinator/proto
