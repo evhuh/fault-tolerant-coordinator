@@ -6,8 +6,8 @@
 // That property predates this package and does not depend on it.
 //
 // This is for the DRIVERS: the raft ticker, the Tick proposer, long-poll
-// deadlines, worker heartbeats. Those read real time, and until Day 8 they
-// read it directly, which left the simulator no way to compress a run or to
+// deadlines, worker heartbeats. Those read real time, and until the simulator
+// they read it directly, which left the simulator no way to compress a run or to
 // know what time the system thought it was.
 //
 // # What a Clock does and does not buy
@@ -63,8 +63,8 @@ func (r realTicker) Stop()               { r.t.Stop() }
 //
 // Every Config holds a nil Clock by default, so callers that never heard of
 // this package keep working unchanged. That matters: the alternative is
-// threading a clock through every constructor in the codebase on the day the
-// simulator lands.
+// threading a clock through every constructor in the codebase the moment
+// the simulator lands.
 func OrReal(c Clock) Clock {
 	if c == nil {
 		return Real{}

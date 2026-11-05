@@ -23,8 +23,8 @@ import (
 )
 
 // testClock replaces the coordinator's only wall-clock read, so tests advance
-// time explicitly instead of sleeping. Day 8 generalizes this into the
-// injected Clock the whole simulator depends on.
+// time explicitly instead of sleeping. The simulator generalizes this into
+// the injected Clock the whole simulator depends on.
 type testClock struct{ ms atomic.Int64 }
 
 func (c *testClock) now() time.Time  { return time.UnixMilli(c.ms.Load()) }
@@ -32,7 +32,7 @@ func (c *testClock) advance(d int64) { c.ms.Add(d) }
 func (c *testClock) set(ms int64)    { c.ms.Store(ms) }
 
 // newTestService starts the full leader-only pipeline: broker, planner, and
-// scheduler workers. Day 4 inverted the control flow — assignment no longer
+// scheduler workers. The planner inverted the control flow — assignment no longer
 // happens on a worker's poll, it happens when an eval fires — so a test that
 // does not run the pipeline will see nothing dispatched, ever.
 //
@@ -255,7 +255,7 @@ func TestRequestTaskRefusesUnknownWorker(t *testing.T) {
 	awaitNoTask(t, s, "ghost")
 }
 
-// The Day 3 checkpoint, without the subprocesses: a worker goes away, its
+// The worker-kill checkpoint, without the subprocesses: a worker goes away, its
 // lease lapses, Tick reclaims the task, and another worker picks it up as the
 // NEXT attempt.
 func TestLeaseExpiryRedispatchesToAnotherWorker(t *testing.T) {
@@ -331,7 +331,7 @@ func TestStaleReportFromEvictedWorkerIsIgnored(t *testing.T) {
 	}
 }
 
-// The reason this package owns a mutex at all, restated for Day 4.
+// The reason this package owns a mutex at all, restated for the planner.
 //
 // StateStore has no lock and is correct only under a single writer, while
 // gRPC hands every RPC its own goroutine AND the scheduler now runs N more.
@@ -436,7 +436,7 @@ func awaitAllTerminal(t *testing.T, s *Service, want int, within time.Duration) 
 }
 
 // ---------------------------------------------------------------------------
-// Day 4 checkpoints
+// Planner and eval-broker checkpoints
 // ---------------------------------------------------------------------------
 
 // THE BATCHING CHECKPOINT: one plan carrying 100 assignments commits as ONE
@@ -640,7 +640,7 @@ func TestBlockedEvalWakesWhenAWorkerJoins(t *testing.T) {
 // DERIVED, NOT REPLICATED: a new leader rebuilds the broker by SCANNING
 // COMMITTED STATE, with none of the previous leader's in-memory queue.
 //
-// This simulates the failover Day 6 makes real: tear the pipeline down
+// This simulates the failover the Raft cluster makes real: tear the pipeline down
 // (losing every queued and blocked eval) and start a fresh one.
 func TestBrokerRebuildsFromCommittedState(t *testing.T) {
 	s, _ := newTestService(t)
@@ -698,7 +698,7 @@ func awaitAllTerminalAfterCompleting(t *testing.T, s *Service, workerID string, 
 }
 
 // ---------------------------------------------------------------------------
-// Day 5 checkpoints
+// Retry, backoff and idempotency checkpoints
 // ---------------------------------------------------------------------------
 
 // THE CHECKPOINT: the same request submitted 5× CONCURRENTLY yields exactly
@@ -757,7 +757,7 @@ func TestConcurrentIdenticalSubmitsYieldOneJob(t *testing.T) {
 
 // A retryable failure must not redispatch instantly. Without a backoff a
 // fast-failing task burns its whole attempt budget in milliseconds, which is
-// exactly what Day 8's fault injection would surface as a spin.
+// exactly what the simulator's fault injection would surface as a spin.
 func TestRetryIsDelayedByBackoff(t *testing.T) {
 	s, clk := newTestService(t)
 	register(t, s, "w-1", 1)

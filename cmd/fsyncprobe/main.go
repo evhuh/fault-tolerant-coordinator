@@ -5,7 +5,7 @@
 // Ready-loop stall, an election that should have happened, a lease that
 // should have lapsed — is measured against a clock compressed to a 250ms
 // election timeout and a 25ms tick. Disk I/O does not compress with it. When
-// the host's fsync latency climbs, runs stop completing: Day 10 measured
+// the host's fsync latency climbs, runs stop completing: the chaos checkpoint measured
 // fsyncs of 1 to 13 MINUTES in `persist` on a machine running back-to-back
 // race suites, and 20 of 25 reproducibility checkpoints skipped because every
 // run logged only a prefix of its schedule.
@@ -54,7 +54,7 @@ func main() {
 	// about whether a trial is usable belongs to whatever analyses the
 	// trials. The gate's own behaviour, below, is unchanged.
 	//
-	// Day 11 needed this because the batching sweep had no probes: when one
+	// The benchmarks needed this because the batching sweep had no probes: when one
 	// run came in at 93.9s against 60.2s and 62.1s, its commit latency could
 	// be reported but the slower disk behind it could not be attributed.
 	if *asJSON {

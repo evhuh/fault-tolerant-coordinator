@@ -97,7 +97,7 @@ func (EvalTrigger) EnumDescriptor() ([]byte, []int) {
 	return file_command_proto_rawDescGZIP(), []int{0}
 }
 
-// Envelope written to the Raft log. `version` exists so Day 7 can add new
+// Envelope written to the Raft log. `version` exists so a later build can add new
 // command shapes while old decoders still understand yesterday's entries.
 type Command struct {
 	state   protoimpl.MessageState `protogen:"open.v1"`
@@ -868,7 +868,7 @@ type RegisterWorker struct {
 	// Tasks this worker reports itself actively executing, carried up by the Heartbeat RPC. This is what promotes ASSIGNED -> RUNNING: there is no separate ack command, because the command set stays closed and RequestTask must remain a pure read
 	// Added after fields 1-3 were already in logs. A new number is always safe
 	RunningTaskIds []string `protobuf:"bytes,4,rep,name=running_task_ids,json=runningTaskIds,proto3" json:"running_task_ids,omitempty"`
-	// How many tasks this worker runs at once. Day 3 did not need it: workers PULLED, so they self-limited. Day 4's planner assigns PROACTIVELY, so it must know how much room a worker has to verify "worker already busy". Reported by the worker at registration
+	// How many tasks this worker runs at once. The pull-based first version did not need it: workers PULLED, so they self-limited. The planner assigns PROACTIVELY, so it must know how much room a worker has to verify "worker already busy". Reported by the worker at registration
 	Capacity      int32 `protobuf:"varint,5,opt,name=capacity,proto3" json:"capacity,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache

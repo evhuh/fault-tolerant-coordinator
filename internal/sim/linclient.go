@@ -267,7 +267,7 @@ func (s *Sim) linGet(ctx context.Context, n *node, client int, rng *rand.Rand, w
 // establish that — a read concurrent with its write may legally miss it,
 // which is exactly the case the model accepts.
 //
-// This is the deterministic scenario from Day 9, driven continuously under
+// This is the deterministic stale-read scenario, driven continuously under
 // the seeded schedule instead of once by hand.
 func (s *Sim) targetStaleRead(ctx context.Context, client int, seq *int) bool {
 	majority, cutOff := s.splitBrainPair()

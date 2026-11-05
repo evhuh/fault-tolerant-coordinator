@@ -121,8 +121,8 @@ func (w *Worker) Run(ctx context.Context) error {
 }
 
 func (w *Worker) register(ctx context.Context) error {
-	// Declaring capacity is what lets the planner assign proactively. Day 3
-	// did not need it: workers pulled, so they self-limited by construction.
+	// Declaring capacity is what lets the planner assign proactively. The
+	// pull-based first version did not need it: workers pulled, so they self-limited by construction.
 	return w.pool.Do(func(c schedulerpb.SchedulerClient) error {
 		_, err := c.RegisterWorker(ctx, &schedulerpb.RegisterWorkerRequest{
 			WorkerId: w.cfg.WorkerID,

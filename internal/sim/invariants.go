@@ -15,7 +15,7 @@ import (
 
 // Invariants checked after every fault step.
 //
-// Day 10 grows this into the full checker over an effect ledger. What is here
+// The effect ledger (ledger.go) is the full checker. What is here
 // is the subset that can be read straight off coordinator state, and the
 // point of checking it EVERY STEP is attribution: a violation names the seed
 // and the step, which is the difference between a bug you can reproduce and
@@ -105,7 +105,8 @@ func (s *Sim) checkInvariants(step int) []Violation {
 	// stalled step is ordinary; several in a row with a leader present is
 	// not. At ~3 ticks per step, this is roughly 15 consecutive missed ticks.
 	//
-	// A CUT-OFF leader is exempt, and Day 9 is what made that necessary. The
+	// A CUT-OFF leader is exempt, and the held leader partitions added for the
+	// stale-read hunt are what made that necessary. The
 	// streak was calibrated against partitions that the next quiet step
 	// healed; held leader partitions keep a minority leader in place for
 	// several steps, and a minority leader's clock is frozen because its
@@ -158,7 +159,7 @@ func (s *Sim) checkInvariants(step int) []Violation {
 			// TickFailures(), which is the node's LIFETIME total, next to a
 			// six-step condition as though it measured the window — and it
 			// counts failures only, so a tick that committed and was clamped
-			// was invisible to it. Day 10's checkpoint fired four times and
+			// was invisible to it. The chaos checkpoint fired four times and
 			// reported "ticks are being dropped silently" on that basis,
 			// which named a mechanism the number could not establish.
 			add("leader's state-machine clock stuck at %d for %d consecutive steps — %s",

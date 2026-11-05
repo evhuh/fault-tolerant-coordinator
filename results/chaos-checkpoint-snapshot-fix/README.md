@@ -16,7 +16,7 @@ FTC_CHECKPOINT_STEPS=600 \
 FTC_CHECKPOINT_MIN_OVERLAPS=160 \
 FTC_CHECKPOINT_MIN_STALE=200 \
 FTC_CHECKPOINT_OUT=/tmp/ftc-checkpoint/rows.jsonl \
-  go test -count=1 ./internal/sim/ -run TestDay10Checkpoint -v -timeout 300m
+  go test -count=1 ./internal/sim/ -run TestChaosCheckpoint -v -timeout 300m
 ```
 
 Run under `caffeinate -dimsu` with nothing else on the machine.

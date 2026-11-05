@@ -19,7 +19,7 @@ import "sort"
 // Everything here is a VALUE, not a pointer into live state, so a snapshot
 // cannot observe a mutation that happened after it was taken.
 //
-// Day 7 reuses this for Raft snapshots: serializing the state machine and
+// Raft snapshots reuse this: serializing the state machine and
 // serializing a Snapshot are the same problem.
 type Snapshot struct {
 	NowMs int64

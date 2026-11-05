@@ -1,5 +1,5 @@
 #!/bin/bash
-# Day 5: a flaky task retries with exponential backoff and deterministic
+# A flaky task retries with exponential backoff and deterministic
 # jitter, and a task that keeps failing goes terminally FAILED.
 source "$(dirname "$0")/common.sh"
 build

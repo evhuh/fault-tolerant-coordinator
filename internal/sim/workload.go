@@ -235,7 +235,7 @@ func (s *Sim) wrapSpec(cmd string, slow bool, maxAttempts int32) *schedulerpb.Ta
 // workload that only produced one of them would say nothing about the other.
 //
 // Hashed on (seed, step, job, task) and never drawn from the fault RNG, per
-// the Day 8 rule: a timing-dependent number of draws would destroy schedule
+// the simulator's rule: a timing-dependent number of draws would destroy schedule
 // reproducibility.
 func (s *Sim) commandFor(step, job, task int) string {
 	if !s.cfg.RealWorkers || s.cfg.FailureRate <= 0 {
@@ -255,7 +255,7 @@ func (s *Sim) commandFor(step, job, task int) string {
 //
 // /bin/true HAS NOW BITTEN TWICE, through two different spec builders, and
 // both times it was silent in the same direction. The workload shipped it
-// from Day 3 and nothing ran it until real workers arrived, at which point
+// from the start and nothing ran it until real workers arrived, at which point
 // every task reported "fork/exec /bin/true: no such file or directory" —
 // there is no /bin/true on this host, only /usr/bin/true. Then the recorded
 // clients turned out to carry their own copy of the same literal, which made

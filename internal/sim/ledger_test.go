@@ -7,7 +7,7 @@ import (
 
 // THE FIRST LEDGER RESULT.
 //
-// This is the assertion Day 5's effectively-once design rests on and nothing
+// This is the assertion the effectively-once design rests on and nothing
 // tested until now: across however many attempts executed, exactly ONE had
 // its result committed, it was the attempt the coordinator recorded as
 // completing, and its result directory is on that worker's disk.

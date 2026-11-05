@@ -1,6 +1,6 @@
 package sim
 
-// A deterministic reproduction of the bug Day 9 exists to find, built by hand
+// A deterministic reproduction of the stale-read bug, built by hand
 // rather than waited for.
 //
 // The seeded schedule CAN produce this, but relying on it is a mistake: a

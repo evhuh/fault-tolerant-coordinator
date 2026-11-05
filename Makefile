@@ -70,7 +70,7 @@ sweeps:
 #
 # Repetition is the point. These are timing-sensitive, and a single green pass
 # is not evidence about them: one clean `go test -race` pass was reported as
-# "race clean" during Day 10, and eight runs then put the real failure rate
+# "race clean" during the chaos checkpoint work, and eight runs then put the real failure rate
 # near 2 in 8. One pass is a sample.
 #
 # The skip budget is the other half. A checkpoint skips when it could not be
@@ -98,7 +98,7 @@ repro:
 	scripts/loop-test.sh ./internal/sim/ 'TestReplayWindowReproducesTheRealizedWindow' 10 20
 	FTC_SWEEPS=1 scripts/loop-test.sh ./internal/sim/ 'TestReplayWorkerPauseReproducesTheRealizedPause' 10 20
 
-# The Day 10 checkpoint, into a RUN-STAMPED directory.
+# The chaos checkpoint, into a RUN-STAMPED directory.
 #
 # The stamp is the point. Two sweeps were once read off a stale log because a
 # second run wrote to the same path and failed before overwriting it — the
@@ -134,7 +134,7 @@ checkpoint: fsync-gate
 	FTC_CHECKPOINT_MIN_OVERLAPS=$(MIN_OVERLAPS) \
 	FTC_CHECKPOINT_MIN_STALE=$(MIN_STALE) \
 	FTC_CHECKPOINT_OUT=$(DIR)/rows.jsonl \
-	  caffeinate -dimsu go test -count=1 ./internal/sim/ -run TestDay10Checkpoint \
+	  caffeinate -dimsu go test -count=1 ./internal/sim/ -run TestChaosCheckpoint \
 	    -v -timeout 300m > $(DIR)/run.log 2>&1
 
 # Is this host capable of supporting the claim at all?

@@ -1,9 +1,9 @@
 // Package state implements the coordinator's replicated state machine
 
 /*
-StateStore is PURE. Apply is a deterministic function of (current state, command): it never reads the wall clock, never performs I/O, never consults randomness, and never lets Go's randomized map iteration order influence the resulting state. Two replicas that apply the same log prefix must reach identical state, and a replica replaying that log off disk days later mustreach the same state again.
+StateStore is PURE. Apply is a deterministic function of (current state, command): it never reads the wall clock, never performs I/O, never consults randomness, and never lets Go's randomized map iteration order influence the resulting state. Two replicas that apply the same log prefix must reach identical state, and a replica replaying that log off disk much later must reach the same state again.
 
-Every mutation enters through Apply, and Apply accepts exactly the seven commands in commandpb.Command. There is no other way to change state. That property is what lets Day 6 swap direct calls for Raft proposals without a rewrite.
+Every mutation enters through Apply, and Apply accepts exactly the seven commands in commandpb.Command. There is no other way to change state. That property is what let the Raft integration swap direct calls for Raft proposals without a rewrite.
 */
 
 package state
@@ -49,7 +49,7 @@ const (
 	//
 	// The same situation as the ApplyPlan change above, arriving the same
 	// way — from having operated the thing. NO PROTO FIELD CHANGED: the fix
-	// reads running_task_ids, which RegisterWorker has carried since Day 3.
+	// reads running_task_ids, which RegisterWorker has carried since the first version.
 	// What changed is what an entry MEANS. Under version 2 a heartbeat
 	// renewed every task the worker held; under version 3 it renews a
 	// RUNNING task only if the worker still names it.
@@ -303,7 +303,7 @@ type Result struct {
 	// ahead of the committed one. The second is a silent no-op — the clamp
 	// below is deliberate and correct, since a clock that moved backwards
 	// could un-expire a lease — but a verifier that cannot tell it from a
-	// failed proposal will diagnose the wrong defect. Day 10's checkpoint
+	// failed proposal will diagnose the wrong defect. The chaos checkpoint
 	// reported "ticks are being dropped silently" from a counter that only
 	// ever counted failures, so a clamp would have been invisible to it.
 	TickAdvanced bool
@@ -316,7 +316,7 @@ type Result struct {
 	// effect per task" is true of tasks that finished by REPORTING; a task
 	// whose attempts all died without a report has zero, by design, and a
 	// checker that cannot tell the two apart fires on correct behaviour.
-	// Day 10's ledger did exactly that until this field existed.
+	// The effect ledger did exactly that until this field existed.
 	FailedByBudget []string
 	// DuplicateReport is true when the attempt WAS the live one but the task
 	// had already reached a terminal state — a redelivery of the report that
@@ -479,7 +479,7 @@ type StateStore struct {
 	// unbounded leak in an always-on coordinator, and a TasksHeldBy whose
 	// cost grows with completion count rather than with concurrency. The
 	// full scan this replaced was immune because it filtered on state.
-	// Day 11's reclaim benchmark found it by timing out.
+	// The reclaim benchmark found it by timing out.
 	//
 	// It exists because answering "which task does worker W hold" used to
 	// sort EVERY task id in the store. That sort ran on the RequestTask long
@@ -1443,8 +1443,8 @@ const (
 //
 // SAMPLED from committed state rather than tracked incrementally, so the
 // gauge cannot drift out of agreement with the state machine. An incremented
-// counter and a state machine are two sources of truth, and the Day 10
-// lesson about counters that only ever counted failures applies here too.
+// counter and a state machine are two sources of truth, and the chaos
+// checkpoint's lesson about counters that only ever counted failures applies here too.
 func (s *StateStore) TaskStateCounts() map[TaskState]int {
 	out := make(map[TaskState]int, 3)
 	for _, t := range s.tasks {

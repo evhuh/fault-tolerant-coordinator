@@ -20,7 +20,7 @@ import (
 // included, and deadlock the coordinator within one poll. So the shape is:
 // take the lock, look, release, sleep, repeat.
 //
-// Day 4 makes this mostly moot — the planner assigns proactively, so the
+// The planner makes this mostly moot — it assigns proactively, so the
 // first look usually succeeds.
 const pollInterval = 50 * time.Millisecond
 
@@ -42,8 +42,8 @@ func NewService(c *Coordinator) *Service { return &Service{c: c} }
 // Reads go through this too. A follower's state is a prefix of the leader's,
 // so serving a read from one would be stale by construction — and the LEADER
 // serving reads from local state is itself non-linearizable on the minority
-// side of a partition. That is Day 9's bug to hunt, and the fix (a ReadIndex
-// barrier) lands in Coordinator.read.
+// side of a partition. That was the stale-read bug, and the fix (a ReadIndex
+// barrier) lives in Coordinator.read.
 func (s *Service) notLeader() error {
 	if addr, ok := s.c.LeaderAddr(); ok {
 		return status.Errorf(codes.FailedPrecondition, "NOT_LEADER: leader is at %s", addr)
@@ -153,7 +153,7 @@ func (s *Service) SubmitJob(ctx context.Context, req *schedulerpb.SubmitJobReque
 // The ORDER matters: the barrier runs before NOT_FOUND is decided. Deciding
 // absence from local state and then confirming leadership would answer
 // NOT_FOUND for a job the cluster had already committed — which is precisely
-// the Day 9 violation, moved one line later.
+// the stale-read violation, moved one line later.
 func (s *Service) GetJob(ctx context.Context, req *schedulerpb.GetJobRequest) (*schedulerpb.GetJobResponse, error) {
 	if err := s.requireLeader(); err != nil {
 		return nil, err
@@ -218,8 +218,8 @@ func (s *Service) RegisterWorker(ctx context.Context, req *schedulerpb.RegisterW
 		return nil, status.Error(codes.InvalidArgument, "empty worker_id")
 	}
 	// The worker declares how many tasks it runs at once. The planner needs
-	// it to answer "does this worker have room" — Day 3 did not, because
-	// workers pulled and self-limited.
+	// it to answer "does this worker have room" — the pull-based first version
+	// did not, because workers pulled and self-limited.
 	if _, err := s.c.propose(s.c.registerWorkerCmd(req.GetWorkerId(), nil, req.GetCapacity())); err != nil {
 		return nil, s.proposeError(err, "register worker")
 	}
@@ -258,9 +258,9 @@ func (s *Service) Heartbeat(ctx context.Context, req *schedulerpb.HeartbeatReque
 // ApplyPlan. Delivering a decision is not making one, so this RPC mutates
 // nothing — which is why there is no eighth command for it.
 //
-// This is what the Day 3 seam became. That version had a second clause that
-// called assign() inline, scanning for a PENDING task and dispatching it on
-// the worker's poll. Day 4 deleted it: the planner now produces ASSIGNED
+// This is what the pull-based seam became. That version had a second clause
+// that called assign() inline, scanning for a PENDING task and dispatching it
+// on the worker's poll. The planner deleted it: the planner now produces ASSIGNED
 // tasks proactively, so the handler keeps only its read half. The worker
 // binary, the executor, and the ApplyPlan command did not move.
 func (s *Service) RequestTask(ctx context.Context, req *schedulerpb.RequestTaskRequest) (*schedulerpb.RequestTaskResponse, error) {

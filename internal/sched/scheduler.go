@@ -55,7 +55,7 @@ type Snapshotter interface {
 // Config tunes the scheduler workers.
 type Config struct {
 	// Workers is how many evals are decided concurrently. This is the knob
-	// Day 11's contention sweep moves: more schedulers help at low
+	// the contention sweep moves: more schedulers help at low
 	// contention and manufacture rejections at high contention.
 	Workers int
 	// LeaseTTLMs is how long an assignment's lease runs.
@@ -90,7 +90,7 @@ func NewScheduler(cfg Config, b *Broker, s Snapshotter, p Planner) *Scheduler {
 	return &Scheduler{cfg: cfg, broker: b, snaps: s, planner: p}
 }
 
-// Start launches the worker goroutines. Day 6 calls this from
+// Start launches the worker goroutines. It is called from
 // establishLeadership.
 func (s *Scheduler) Start(ctx context.Context) {
 	for i := 0; i < s.cfg.Workers; i++ {

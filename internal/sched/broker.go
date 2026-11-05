@@ -4,7 +4,7 @@
 // before they commit.
 //
 // Everything in this package is LEADER-ONLY and IN-MEMORY. None of it is
-// replicated. On Day 6 it starts on election and stops on leadership loss.
+// replicated. Under Raft it starts on election and stops on leadership loss.
 package sched
 
 import (
@@ -192,7 +192,7 @@ func (b *Broker) Rebuild(snap *state.Snapshot, idFor func(jobID string) string) 
 	return n
 }
 
-// Close wakes every waiting scheduler worker. Day 6 calls it on leadership
+// Close wakes every waiting scheduler worker. It is called on leadership
 // loss: stopping cleanly is what prevents two leaders scheduling at once.
 func (b *Broker) Close() {
 	b.mu.Lock()

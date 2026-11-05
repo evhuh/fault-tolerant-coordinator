@@ -226,7 +226,7 @@ func withCapacity(cmd *commandpb.Command, capacity int32) *commandpb.Command {
 
 // THE READ PATH MUST BE FLAT IN STATE SIZE.
 //
-// This is the regression test for the defect the Day 11 profile found:
+// This is the regression test for the defect the scale profile found:
 // answering "which task does worker W hold" used to sort every task id in the
 // store, on every pass of the RequestTask long poll, under the apply lock.
 // At 10,000 tasks with 256 pollers that produced 540-695ms Ready-loop stalls
@@ -309,7 +309,7 @@ func storeWithTasks(t *testing.T, n int) *StateStore {
 //
 // The regression this pins: tasksByWorker retained every completed task, so
 // the map grew without bound and TasksHeldBy reported finished work as held.
-// Day 11's reclaim benchmark hit it as a timeout — the harness waited for a
+// The reclaim benchmark hit it as a timeout — the harness waited for a
 // task to stop being attributed to a dead worker, and it never did.
 func TestTerminalTasksLeaveTheIndexButKeepTheirWorker(t *testing.T) {
 	s := New()

@@ -136,8 +136,8 @@ type Network struct {
 	//
 	// A DROPPED MsgSnap IS NOT LIKE A DROPPED MsgApp. raft retries an append
 	// on its own, but it holds the follower in StateSnapshot until the
-	// APPLICATION reports the snapshot's outcome — and until Day 10 nothing
-	// in this build ever did. The follower then acks nothing while its
+	// APPLICATION reports the snapshot's outcome — and until the chaos checkpoint
+	// nothing in this build ever did. The follower then acks nothing while its
 	// heartbeat responses keep it RecentActive, so the leader keeps a term it
 	// cannot commit in. Counting these separately is what lets a frozen-clock
 	// window be traced to a cause instead of correlated with a symptom.
@@ -257,7 +257,7 @@ func (n *Network) PartitionedIDs() []uint64 {
 //
 // The ordinary adversary drops MsgSnap too, at the configured rate; this
 // exists so a deterministic test can show the causal chain rather than sample
-// for it. Day 10 sampled 24 seeds for a frozen-clock window and found none,
+// for it. The chaos checkpoint sampled 24 seeds for a frozen-clock window and found none,
 // which at a ~6% per-run rate is a one-in-four outcome and settles nothing.
 func (n *Network) DropSnapshotsTo(id uint64, count int) {
 	n.mu.Lock()

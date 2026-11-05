@@ -630,7 +630,7 @@ func TestApplyPlanBatchesManyAssignmentsAsOneEntry(t *testing.T) {
 	for i := 1; i <= n; i++ {
 		assigns = append(assigns, assign{fmt.Sprintf("task-%d", i), "w-1", 1, 5000})
 	}
-	// One command, 100 assignments — one Raft entry once Day 6 wires it up.
+	// One command, 100 assignments — one Raft entry under consensus.
 	mustApply(t, s, applyPlanCmd("eval-1", assigns))
 
 	for i := 1; i <= n; i++ {
@@ -1143,7 +1143,7 @@ func TestMalformedCommandsAreRejected(t *testing.T) {
 	}
 }
 
-// Day 5 — backoff, session bounding, effect semantics
+// Backoff, session bounding, effect semantics
 
 // Jitter must be DETERMINISTIC. apply runs on every replica, so a real random
 // roll would place the same task at different times on different nodes — the
@@ -1310,7 +1310,7 @@ func TestSessionsExpireOnTTL(t *testing.T) {
 	}
 }
 
-// THE DAY 5 CHECKPOINT, state-machine half: the same request applied five
+// THE IDEMPOTENCY CHECKPOINT, state-machine half: the same request applied five
 // times yields exactly one job. (The concurrent version lives in the server
 // tests, where propose() is what serializes them.)
 func TestRepeatedSubmitYieldsExactlyOneJob(t *testing.T) {
@@ -1329,7 +1329,7 @@ func TestRepeatedSubmitYieldsExactlyOneJob(t *testing.T) {
 	}
 }
 
-// THE DAY 5 CHECKPOINT, the effect half: a worker that does the work and dies
+// THE IDEMPOTENCY CHECKPOINT, the effect half: a worker that does the work and dies
 // before reporting leaves exactly ONE committed result, not two.
 //
 // Both attempts genuinely ran — that is at-least-once delivery, and the
@@ -1363,7 +1363,7 @@ func TestWorkDoneButNotReportedYieldsOneCommittedResult(t *testing.T) {
 	}
 }
 
-// Day 7 — snapshot serialization
+// Snapshot serialization
 
 // A snapshot must round-trip the ENTIRE state machine. The test compares
 // dumps rather than fields, so anything added to StateStore later and
@@ -1514,7 +1514,7 @@ func TestRestoreRefusesNewerSnapshotVersion(t *testing.T) {
 	}
 }
 
-// Day 7 — schema versioning
+// Schema versioning
 
 // THE CHECKPOINT: a log written under yesterday's meaning must replay under
 // yesterday's rule.
@@ -1760,8 +1760,8 @@ func TestDifferentPoliciesDivergeOnTheSameLog(t *testing.T) {
 // rule it was written with.
 //
 // The renewal change took NO proto field — running_task_ids has been there
-// since Day 3 — so nothing about the wire format moved. What moved is what an
-// entry MEANS, which is the harder kind of schema change and the one Day 7's
+// since the first version — so nothing about the wire format moved. What moved is what an
+// entry MEANS, which is the harder kind of schema change and the one the
 // version field exists for: a node replaying its own log has to reach the
 // state the cluster actually had, and under the old rule that state includes
 // a task left RUNNING on a worker that stopped claiming it.
@@ -1871,7 +1871,7 @@ func TestApplyRefusesACommandFromANewerBuild(t *testing.T) {
 //
 // This is the one terminal path with NO report behind it: the lease lapses,
 // the budget is already spent, and the task goes FAILED without any attempt
-// ever having reported a result. Day 10's effect ledger asserted "exactly one
+// ever having reported a result. The effect ledger once asserted "exactly one
 // committed effect per task" and went red on precisely this, twice, over a
 // task that failed the way the attempt budget says it should — so the state
 // machine has to say when it did it, or a checker cannot tell a MISSING

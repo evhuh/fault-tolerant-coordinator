@@ -25,9 +25,9 @@ import (
 // decided each task's outcome by hashing. That drives the coordinator fine,
 // and it is why the worker's own code — the executor's (taskID, attempt)
 // result tree, the local claim dedup, heartbeat-as-re-registration — has been
-// covered only by its unit tests since Day 8.
+// covered only by its unit tests since the simulator arrived.
 //
-// Day 10's effect ledger is a claim about precisely that code: one committed
+// The effect ledger is a claim about precisely that code: one committed
 // effect per taskID, across attempts. Checking it against a simulated worker
 // would check the simulator. So the real worker runs here, against the real
 // client.Pool, over bufconn.
@@ -214,7 +214,7 @@ func (p *realWorkerPool) stop() {
 // output, where -v shows them and a quiet run does not.
 // It goes to WorkerOut rather than the standard logger or Out: on stderr
 // these bury the finding, and in Out they would break the byte-for-byte
-// schedule comparison the Day 8 checkpoint makes.
+// schedule comparison the reproducibility checkpoint makes.
 func (s *Sim) workerLogf(format string, args ...any) {
 	if s.cfg.WorkerOut == nil {
 		return

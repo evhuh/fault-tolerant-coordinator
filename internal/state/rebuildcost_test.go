@@ -13,7 +13,7 @@ import (
 //
 // The rebuild runs on the READY LOOP goroutine — StartScheduling is called
 // from the leadership-change handler — so whatever it costs is time the node
-// processes no raft messages. Day 10's 600-step calibration recorded 131ms
+// processes no raft messages. The 600-step chaos calibration recorded 131ms
 // and 187ms stalls in that phase on a healthy disk, which raised the question
 // this answers: does the rebuild's cost grow with state, and which part of it
 // is expensive?

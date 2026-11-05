@@ -22,7 +22,7 @@ import (
 // CheckQuorum: a leader cut off from the majority must STOP believing it
 // leads, within about one election timeout.
 //
-// This is the liveness half of the Day 9 story. It is not the correctness
+// This is the liveness half of the stale-read story. It is not the correctness
 // fix — a read served inside the step-down window is still stale, which is
 // what the ReadIndex barrier is for — but a leader that never steps down
 // keeps a stale answer available indefinitely, and shrinking that from

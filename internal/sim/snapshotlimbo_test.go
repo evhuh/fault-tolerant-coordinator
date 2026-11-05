@@ -26,7 +26,7 @@ import (
 // other follower down, the result is a leader in one term, with a nominal
 // majority, committing nothing.
 //
-// That MATCHES the shape of the five frozen-clock windows Day 10's checkpoint
+// That MATCHES the shape of the five frozen-clock windows the chaos checkpoint
 // recorded — same leader, same term, zero leadership transitions, 2.6 seconds
 // of "proposal lost" — but a matching shape is not an attribution. Those
 // windows were captured before the raft progress table was instrumented, so

@@ -27,7 +27,7 @@ import (
 // A 3-node cluster, in one process, talking real Raft over real sockets.
 //
 // In-process rather than three binaries on purpose: it runs in CI, it works
-// under -race, and it is the harness Day 8's simulator grows out of. The only
+// under -race, and it is the harness the simulator grew out of. The only
 // thing it fakes is the clock, and only for the state machine.
 
 type clusterNode struct {
@@ -52,7 +52,7 @@ type cluster struct {
 
 // freePort asks the kernel for an unused port. Hardcoding them makes tests
 // collide with each other and with anything else on the machine — a lesson
-// the Day 3 demo taught the hard way.
+// the first single-node demo taught the hard way.
 func freePort(t *testing.T) int {
 	t.Helper()
 	l, err := net.Listen("tcp", "127.0.0.1:0")
@@ -253,7 +253,7 @@ func TestClusterReplicatesStateToFollowers(t *testing.T) {
 	}
 }
 
-// THE DAY 6 CHECKPOINT: kill the leader mid-flight, and a new one takes over
+// THE FAILOVER CHECKPOINT: kill the leader mid-flight, and a new one takes over
 // with the work intact.
 //
 // The new leader rebuilds its eval broker by SCANNING COMMITTED STATE — it
@@ -510,7 +510,7 @@ func TestClientPoolFollowsRedirectFromFollower(t *testing.T) {
 // THE ONE THAT MATTERS: after a leader dies, a client that was talking to it
 // finds the new leader by itself.
 //
-// This is what the Day 6 demo script was faking by restarting the worker
+// This is what the leader-kill demo script was faking by restarting the worker
 // against the new address by hand.
 func TestClientPoolRecoversFromLeaderFailure(t *testing.T) {
 	c := newCluster(t, 3)
@@ -625,7 +625,7 @@ func TestRedirectedRetryStillDedups(t *testing.T) {
 
 // An unrecoverable node error must halt THAT NODE, not the process.
 //
-// Three nodes share this test binary, and Day 8's simulator runs a whole
+// Three nodes share this test binary, and the simulator runs a whole
 // cluster in one. A log.Fatal in the Ready loop would take down the healthy
 // peers and the harness, leaving you debugging the wrong failure.
 func TestFatalHaltsOneNodeNotTheProcess(t *testing.T) {
@@ -660,7 +660,7 @@ func TestFatalHaltsOneNodeNotTheProcess(t *testing.T) {
 	}
 }
 
-// THE SECOND HALF OF THE DAY 6 CHECKPOINT: restart the node that was KILLED
+// THE SECOND HALF OF THE FAILOVER CHECKPOINT: restart the node that was KILLED
 // WHILE LEADING, and watch it catch up and rejoin.
 //
 // This is a different case from restarting a follower, and the harder one.
@@ -741,7 +741,7 @@ func TestKilledLeaderRestartsAsFollowerAndCatchesUp(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Day 7: snapshots, compaction, restart
+// Snapshots, compaction, restart
 // ---------------------------------------------------------------------------
 
 // snapshotCount reports how many nodes have written a snapshot to disk.
@@ -799,7 +799,7 @@ func TestNodesSnapshotAndCompact(t *testing.T) {
 	}
 }
 
-// THE DAY 7 CHECKPOINT: kill ALL THREE nodes, restart them from disk, and the
+// THE COLD-RESTART CHECKPOINT: kill ALL THREE nodes, restart them from disk, and the
 // state is intact.
 //
 // With a low snapshot threshold most of the history is in the snapshot rather
@@ -996,7 +996,7 @@ func TestRevocationDoesNotBlock(t *testing.T) {
 
 // Leadership revocation must release a proposal that is already in flight.
 //
-// THE DAY 8 DEADLOCK CLASS, INCOMPLETELY FIXED. revokeLeadership fails
+// THE LEADERSHIP-REVOCATION DEADLOCK CLASS, INCOMPLETELY FIXED. revokeLeadership fails
 // pending proposals first and only then waits for the scheduler, precisely so
 // the Ready loop never waits on a worker that is waiting on the Ready loop.
 // But failAll releases REGISTERED WAITERS, and a worker blocked inside
@@ -1006,8 +1006,8 @@ func TestRevocationDoesNotBlock(t *testing.T) {
 // cancelling the leader context did not touch it either.
 //
 // The symptom is not a hang. It self-heals when the proposal timeout fires,
-// which is why it showed up as a 131ms and a 187ms Ready-loop stall in Day
-// 10's 600-step calibration — both just under the 250ms timeout in force
+// which is why it showed up as a 131ms and a 187ms Ready-loop stall in the
+// 600-step chaos calibration — both just under the 250ms timeout in force
 // there — and why it was invisible at the 5s production default, where it
 // would instead look like a node that processes no raft messages for five
 // seconds on every leadership change.
@@ -1115,10 +1115,10 @@ func TestRevocationReleasesAnInFlightPropose(t *testing.T) {
 // THE TRAP, THREE TIMES. raft.Status reaches Term through an embedded
 // *raftpb.HardState whose field is itself a *uint64, so `st.Term`
 // nil-dereferences when there is no hard state and compares pointer
-// addresses when two are compared. Day 8's MsgHup experiment compared
+// addresses when two are compared. The simulator's MsgHup experiment compared
 // addresses and concluded a term had not moved. The fix for that wrote the
-// correct idiom in a comment directly above raftnode.Status. Day 10 then
-// segfaulted a diagnostic run on the nil pointer anyway, in a helper written
+// correct idiom in a comment directly above raftnode.Status. The chaos
+// checkpoint work then segfaulted a diagnostic run on the nil pointer anyway, in a helper written
 // without reading that comment — and took two runs of a three-hour
 // checkpoint with it.
 //

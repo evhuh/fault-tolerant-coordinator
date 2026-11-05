@@ -4,11 +4,11 @@
 `go build ./...` and `go test ./...` at the repo root do not compile or test
 it. Nothing in the coordinator imports it.
 
-It was the Day 1 exercise: a three-node replicated counter, built to get the
+It was the first exercise: a three-node replicated counter, built to get the
 `etcd/raft` `Ready` contract right before a real state machine could make
 failures ambiguous.
 
-On Day 6 its three pieces were promoted into
+When Raft was wired into the coordinator, its three pieces were promoted into
 [`internal/raftnode`](../../internal/raftnode/) essentially unchanged — the
 contract etcd/raft requires did not care that the state machine grew from an
 integer into a coordinator:
@@ -20,7 +20,7 @@ integer into a coordinator:
 | the `Ready` loop: persist → send → apply → Advance | `internal/raftnode/node.go` |
 
 Two things changed in the promotion, both because a cluster now runs inside a
-single process (the tests, and Day 8's simulator):
+single process (the tests, and the simulator):
 
 - `log.Fatalf` on a WAL or storage error became `Handler.Fatal`, so one node's
   failure halts that node rather than the whole process.

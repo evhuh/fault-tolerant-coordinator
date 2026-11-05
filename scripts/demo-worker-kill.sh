@@ -1,5 +1,5 @@
 #!/bin/bash
-# Day 3 checkpoint, part 2: SIGKILL a worker mid-task; its task's lease
+# Single-node checkpoint, part 2: SIGKILL a worker mid-task; its task's lease
 # expires, Tick reclaims it, and another worker finishes it as attempt 2.
 source "$(dirname "$0")/common.sh"
 build

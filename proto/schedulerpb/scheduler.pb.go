@@ -394,7 +394,7 @@ func (x *Job) GetCreatedMs() int64 {
 }
 
 // (client_id, request_id) is the dedup key: a retried SubmitJob returns the
-// original response rather than creating a second job. See Day 5.
+// original response rather than creating a second job.
 type SubmitJobRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	ClientId      string                 `protobuf:"bytes,1,opt,name=client_id,json=clientId,proto3" json:"client_id,omitempty"`
@@ -687,7 +687,7 @@ type RegisterWorkerRequest struct {
 	state    protoimpl.MessageState `protogen:"open.v1"`
 	WorkerId string                 `protobuf:"bytes,1,opt,name=worker_id,json=workerId,proto3" json:"worker_id,omitempty"`
 	// How many tasks this worker runs at once. The planner needs it to decide
-	// whether a worker has room, because Day 4 assigns proactively rather than
+	// whether a worker has room, because it assigns proactively rather than
 	// waiting for the worker to pull.
 	Capacity      int32 `protobuf:"varint,2,opt,name=capacity,proto3" json:"capacity,omitempty"`
 	unknownFields protoimpl.UnknownFields

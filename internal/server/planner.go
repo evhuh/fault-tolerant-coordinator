@@ -28,7 +28,7 @@ type Planner struct {
 
 	plannerMu sync.Mutex
 
-	// Counters for Day 11. A rejection is an optimistic-concurrency conflict:
+	// Counters for the metrics endpoint. A rejection is an optimistic-concurrency conflict:
 	// two schedulers reached for the same task from the same snapshot, and
 	// the second one lost. Watching this rise with contention is the second
 	// benchmark experiment.
@@ -227,7 +227,7 @@ func (p *Planner) record(accepted, rejected, planSize int) {
 	}
 }
 
-// Stats reports the counters Day 11 turns into Prometheus metrics.
+// Stats reports the counters the metrics package turns into Prometheus metrics.
 func (p *Planner) Stats() (plans, accepted, rejected, largest int) {
 	p.statsMu.Lock()
 	defer p.statsMu.Unlock()

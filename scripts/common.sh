@@ -1,4 +1,4 @@
-# Shared setup for the Day 3 demos. Builds the three binaries into a scratch
+# Shared setup for the demo scripts. Builds the three binaries into a scratch
 # directory, starts a coordinator and N workers there, and cleans up on exit.
 set -u
 

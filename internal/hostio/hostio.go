@@ -83,7 +83,7 @@ func Fsync(dir string, n int) (Probe, error) {
 // CPU is one measurement of whether this host is still giving the process the
 // compute and scheduling it had at the start of a long run.
 //
-// THE FSYNC PROBE ONLY MEASURES DISK, and Day 10's checkpoint produced four
+// THE FSYNC PROBE ONLY MEASURES DISK, and the chaos checkpoint produced four
 // frozen-clock findings that clustered in the last fifth of a 2.5-hour run
 // and did not reproduce when their seeds ran alone. That pattern points at
 // run-duration effects — thermal throttling, GC pressure, memory the process

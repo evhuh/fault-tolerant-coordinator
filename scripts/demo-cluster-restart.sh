@@ -1,5 +1,5 @@
 #!/bin/bash
-# Day 7: snapshots, compaction, and a COLD RESTART of the whole cluster.
+# Snapshots, compaction, and a COLD RESTART of the whole cluster.
 # A deliberately low snapshot threshold so Restore is genuinely exercised.
 source "$(dirname "$0")/common.sh"
 build

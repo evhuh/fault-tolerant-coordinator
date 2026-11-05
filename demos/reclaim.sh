@@ -49,7 +49,7 @@ ok "$free free slot(s) elsewhere"
 
 # t=0, from the POST-KILL lease. The value read now is stale by up to one
 # heartbeat interval, and using it overstated this figure by 606ms in the
-# Day 11 trials; once the worker is dead the lease stops moving, so the last
+# reclaim trials; once the worker is dead the lease stops moving, so the last
 # observed value IS last-heartbeat + TTL by definition.
 say "== 3. SIGKILL $victim =="
 PID=$(cat "$RUN/${victim/w-/worker-}.pid" 2>/dev/null)

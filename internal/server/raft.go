@@ -225,7 +225,7 @@ func (c *Coordinator) applyCommitted(index uint64, data []byte) {
 	cmd := &commandpb.Command{}
 	if err := proto.Unmarshal(data, cmd); err != nil {
 		// A command this build cannot decode is a schema-evolution failure,
-		// which Day 7 exists to prevent. Halting this node is correct:
+		// which command versioning exists to prevent. Halting this node is correct:
 		// skipping the entry would silently diverge it from every replica
 		// that could decode it, and a diverged replica is worse than a dead
 		// one. It halts ALONE — see Coordinator.fatal.
@@ -326,7 +326,7 @@ func (c *Coordinator) proposeRaft(cmd *commandpb.Command) (state.Result, error) 
 	// and this caller never reached its waiter.
 	//
 	// With Background() the cycle broke only when the proposal timeout fired
-	// — measured as 131ms and 187ms Ready-loop stalls in Day 10's
+	// — measured as 131ms and 187ms Ready-loop stalls in the chaos
 	// calibration against a 250ms timeout, and at the 5s production default
 	// it would be a node that processes no raft messages for five seconds on
 	// every leadership change. Deriving from the leader context makes
@@ -400,7 +400,7 @@ func (c *Coordinator) proposeRaft(cmd *commandpb.Command) (state.Result, error) 
 // the broker is derived, so a new leader rediscovers the work by scanning.
 func (c *Coordinator) proposeAsync(cmd *commandpb.Command) {
 	if c.proposer == nil || c.proposer.node == nil {
-		// Raft not wired (tests, Day 5 and earlier): apply directly.
+		// Raft not wired (single-node tests): apply directly.
 		if _, err := c.proposeLocal(cmd); err != nil {
 			return
 		}
@@ -432,7 +432,7 @@ func (c *Coordinator) onLeadershipChanged(isLeader bool) {
 	// constant. StartScheduling rebuilds the eval broker by SCANNING
 	// COMMITTED STATE — it serializes the whole state machine through
 	// c.Snapshot() — so the loop is blocked for as long as that takes, and
-	// that grows with the number of jobs. Day 10's 600-step calibration
+	// that grows with the number of jobs. The 600-step chaos calibration
 	// recorded 131ms and 187ms stalls in this phase against a 125ms
 	// threshold, on a healthy disk, which is what sent anyone looking.
 	//
@@ -546,7 +546,7 @@ func (c *Coordinator) LeaderAddr() (string, bool) {
 //
 // It does NOT exit the process. A standalone binary wants to exit, and
 // cmd/coordinator does that by watching RaftDone — but the cluster tests and
-// Day 8's simulator run every node in one process, and there a single node's
+// the simulator run every node in one process, and there a single node's
 // failure must not take down its peers and the harness with it.
 //
 // The stop is asynchronous because fatal can be called from inside the Ready
@@ -669,7 +669,7 @@ func (c *Coordinator) RaftStatus() RaftInfo {
 // RecentActive true, so CheckQuorum is satisfied and the leader keeps its
 // term while committing nothing.
 //
-// That matches the shape of every frozen-clock window Day 10's checkpoint
+// That matches the shape of every frozen-clock window the chaos checkpoint
 // recorded: one leader, one term, quorum "available", 2.6 seconds of
 // proposals lost. Which of the two a given window was — a follower in limbo
 // or something else — is only visible here, and no window captured before
@@ -690,8 +690,8 @@ type FollowerProgress struct {
 // embedded *raftpb.HardState, and the field behind it is itself a *uint64, so
 // `st.Term` both nil-dereferences when there is no hard state and compares
 // pointer addresses when two are compared. That trap has now been walked into
-// three times in this repo: Day 8's MsgHup experiment compared addresses, and
-// Day 10 segfaulted a diagnostic run on the nil pointer — after the fix for
+// three times in this repo: the simulator's MsgHup experiment compared
+// addresses, and the chaos checkpoint work segfaulted a diagnostic run on the nil pointer — after the fix for
 // the first one had written the correct idiom in a comment directly above
 // Status().
 //
@@ -774,7 +774,7 @@ func (c *Coordinator) onStalled(st raftnode.Stall) {
 // threshold, which no single log line can say.
 func (c *Coordinator) onSnapshotted(st raftnode.SnapshotStat) {
 	// Cost AND size together, so a slow snapshot of a small state — a disk
-	// tail, which is what Day 10 found — is distinguishable from a slow
+	// tail, which is what the chaos checkpoint found — is distinguishable from a slow
 	// snapshot of a large one.
 	metrics.ObserveSnapshot(st.Bytes, st.Duration)
 	c.stallMu.Lock()

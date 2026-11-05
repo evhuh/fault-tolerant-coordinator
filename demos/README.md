@@ -40,7 +40,7 @@ Only the task count varies between runs of the failover demo; keep `TASKS` small
 ## What the demos do and do not establish
 
 They are **one trial each, on one host**.
-The distributions are in [`results/2026-11-01-day11-reclaim-failover/`](../results/2026-11-01-day11-reclaim-failover/): failover p50 1441ms / p95 2090ms over 55 trials, reclaim p50 2121ms / max 2246ms over 100 trials.
+The distributions are in [`results/reclaim-failover/`](../results/reclaim-failover/): failover p50 1441ms / p95 2090ms over 55 trials, reclaim p50 2121ms / max 2246ms over 100 trials.
 The demo prints its single measurement and says so in its last line.
 
 Three things the scripts check rather than assume, because each one has a failure mode that looks like success:
@@ -51,5 +51,5 @@ Three things the scripts check rather than assume, because each one has a failur
 
 Two measurement notes the scripts print inline:
 
-- **t=0 for reclaim is the last heartbeat RECEIVED**, derived as `lease_expiry_ms - 2000ms` from committed state *after* the kill. Read before the kill it is stale by up to one heartbeat interval, which overstated this figure by 606ms in the Day 11 trials.
+- **t=0 for reclaim is the last heartbeat RECEIVED**, derived as `lease_expiry_ms - 2000ms` from committed state *after* the kill. Read before the kill it is stale by up to one heartbeat interval, which overstated this figure by 606ms in the reclaim trials.
 - **Everything is polled**, at 10ms, so every number carries ±10ms. Reclaim and redispatch can land in the same poll iteration, because reassignment follows release by roughly 15ms.

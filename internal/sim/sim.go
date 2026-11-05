@@ -141,7 +141,7 @@ type Config struct {
 	// nothing and every ordinary run had its kills suppressed.
 	//
 	// Second, and worse, INJECTING the window breaks schedule
-	// reproducibility, which is the Day 8 checkpoint. The injection has to
+	// reproducibility, which is the reproducibility checkpoint. The injection has to
 	// find the current leader and defers when there is none, so whether and
 	// when it fires depends on timing rather than on the seed — two runs of
 	// one seed logged different schedules, intermittently.
@@ -216,7 +216,7 @@ type Config struct {
 	//
 	// Off by default, for cost rather than doubt: every attempt is a
 	// fork/exec, which is wall-clock time that clock compression cannot
-	// remove. It is what Day 10's effect ledger needs, because a ledger
+	// remove. It is what the effect ledger needs, because a ledger
 	// written by a simulated worker is evidence about the simulator.
 	RealWorkers bool
 	// ReplayWorkerPause forces the worker pause onto a recorded victim at a
@@ -275,7 +275,7 @@ type Config struct {
 	// mid-chaos are the EXPECTED outcome and arrive in the thousands.
 	//
 	// A SEPARATE writer from Out, and that separation is load-bearing: Out
-	// carries the fault schedule, which the Day 8 checkpoint compares byte
+	// carries the fault schedule, which the reproducibility checkpoint compares byte
 	// for byte across two runs of one seed. Worker chatter is timing
 	// dependent by nature, so mixing it into that log would make the
 	// reproducibility claim fail for a reason that has nothing to do with
@@ -704,7 +704,7 @@ type Sim struct {
 
 	// nodesMu guards nodes.
 	//
-	// Until Day 9 the map was touched only by the Run goroutine and needed
+	// Until the stale-read hunt the map was touched only by the Run goroutine and needed
 	// no lock. The recorded clients changed that: they run continuously, in
 	// parallel with applyFault, which is the whole point — an operation that
 	// straddles a kill or a partition is the interesting one.
@@ -790,12 +790,12 @@ type Sim struct {
 	// cmdOK and cmdFail are the task commands, resolved against THIS HOST's
 	// PATH rather than hardcoded.
 	//
-	// The workload shipped "/bin/true" from Day 3, and nothing ever ran it:
+	// The workload shipped "/bin/true" from the start, and nothing ever ran it:
 	// the simulator played the worker pool and decided outcomes by hashing,
 	// so the command string was inert. The first real worker reported
 	// "fork/exec /bin/true: no such file or directory" on every task —
-	// /bin/true does not exist on this machine, only /usr/bin/true. Three
-	// days of runs had been submitting a command the host cannot execute,
+	// /bin/true does not exist on this machine, only /usr/bin/true. Every
+	// run until then had been submitting a command the host cannot execute,
 	// which is exactly the class of gap "the simulator does not run the
 	// worker" was always going to be hiding.
 	cmdOK   string
@@ -1268,18 +1268,18 @@ func ClassifyDiskStall(phase string, hostProbesHealthy bool) ViolationKind {
 // about the system if 2m43s was ever a meaningful duration in this run, and a
 // host-io stall says it was not: at a 250ms election timeout, an fsync of
 // minutes means every node was seeing spurious elections and every goroutine
-// was queued behind the disk. Day 10 measured exactly that pair — a schedule
+// was queued behind the disk. The chaos checkpoint measured exactly that pair — a schedule
 // checkpoint reporting "stalled 2m43.149s in send (blocking call)" in a sweep
 // whose other runs were recording 13-MINUTE fsyncs in persist.
 //
-// Attributing the first to the system while excusing the second is the Day 9
-// mistake in reverse: there the invariant called a slow disk a concurrency
+// Attributing the first to the system while excusing the second is the
+// stale-read hunt's mistake in reverse: there the invariant called a slow disk a concurrency
 // bug directly, here it does it one step removed, by blaming the pileup the
 // slow disk caused.
 //
 // Not a blanket exemption. A blocking-call stall in a run whose disk kept up
 // stays a VIOLATION, which is the case worth catching — the leadership
-// revocation deadlock that Day 8 found presented exactly that way.
+// revocation deadlock that the simulator found presented exactly that way.
 func downgradeStallsOnBrokenPremise(vs []Violation) (out []Violation, hostIO, downgraded int) {
 	for _, v := range vs {
 		if v.Kind == KindHostIO {
@@ -1541,7 +1541,7 @@ func (s *Sim) nodeAt(id uint64) (*node, bool) {
 
 // pickLeaderClaimant chooses, at random, a node that BELIEVES it leads.
 //
-// This is the routing decision Day 9 turns on, and it sits between the two
+// This is the routing decision the stale-read hunt turns on, and it sits between the two
 // obvious choices, both of which are wrong here.
 //
 // s.leader() — what the rest of the workload uses — returns nil unless
@@ -1619,8 +1619,8 @@ func (s *Sim) pickLeaderClaimant(rng *rand.Rand) (*node, bool) {
 // never allowed to make progress proves nothing. The interesting bugs live
 // in RECOVERY, which needs the system to get far enough to have something to
 // recover.
-// Day 9 changed this mix, and therefore changed what every seed replays. A
-// seed from before Day 9 no longer reproduces the schedule it used to; the
+// The stale-read hunt changed this mix, and therefore changed what every seed
+// replays. A seed from before that change no longer reproduces the schedule it used to; the
 // property that survives is the one that matters, that a seed reproduces ITS
 // OWN schedule.
 func (s *Sim) applyFault(step int) {
@@ -1653,7 +1653,7 @@ func (s *Sim) applyFault(step int) {
 			return
 		}
 		// PARTITION THE LEADER, and hold it. This is the targeted adversary
-		// Day 9 needs, and the reason it had to be added: a random victim is
+		// the stale-read hunt needs, and the reason it had to be added: a random victim is
 		// the leader one time in three, and the first linearizability runs
 		// recorded ZERO operations against a cut-off leader across a whole
 		// 25-step schedule. The verdict was Ok and meant nothing.

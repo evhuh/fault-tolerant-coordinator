@@ -4,7 +4,7 @@
 //	schedctl status <jobID>
 //	schedctl list
 //
-// Day 3 has submit and status; `watch` is deferred, since polling status
+// It has submit and status; `watch` was never added, since polling status
 // demonstrates the same thing.
 package main
 

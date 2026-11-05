@@ -1,7 +1,7 @@
 // Package raftnode hosts etcd/raft: it implements the storage, transport, and
 // apply contract the library requires, and nothing else.
 //
-// This is the Day 1 spike promoted into the product. The library implements
+// This is the raft spike (spike/counter) promoted into the product. The library implements
 // the algorithm and hands back a Ready struct; everything in this package is
 // the host side of that contract:
 //
@@ -50,7 +50,7 @@ type Config struct {
 	// code, and exactly one caller sets one.
 	//
 	// That caller is the negative control reproducing the configuration the
-	// Day 9 stale read lived in. Without CheckQuorum a cut-off leader keeps
+	// stale read lived in. Without CheckQuorum a cut-off leader keeps
 	// its term indefinitely and keeps answering reads; with it, the leader
 	// steps down after an election timeout. The regression test needs the
 	// former to prove the linearizability checker can still see a stale
@@ -143,7 +143,7 @@ type Handler struct {
 	//
 	// It is a callback rather than a log.Fatal because the right response
 	// depends on who is hosting. A standalone binary should exit. But the
-	// cluster tests and Day 8's simulator run every node in ONE PROCESS, and
+	// cluster tests and the simulator run every node in ONE PROCESS, and
 	// there one node's disk error must not take down its peers and the
 	// harness with it — you would end up debugging the wrong failure.
 	//
@@ -221,7 +221,7 @@ type Stall struct {
 	//
 	// A stall in apply, leadership-change or send is the thing the invariant
 	// was actually built to catch: something on that goroutine blocking on
-	// work the goroutine itself serves. Day 8's leadership-revocation
+	// work the goroutine itself serves. The leadership-revocation
 	// deadlock was exactly this, in leadership-change.
 	//
 	// Conflating them means a slow disk gets reported as a concurrency bug,
@@ -764,7 +764,7 @@ type SnapshotStat struct {
 // send delivers one message and REPORTS THE OUTCOME BACK TO RAFT.
 //
 // THE REPORT IS THE WHOLE POINT, and its absence was a liveness defect that
-// survived until Day 10. raft puts a follower in StateSnapshot when it sends
+// survived until the chaos checkpoint. raft puts a follower in StateSnapshot when it sends
 // a snapshot and pauses every log probe to it — Progress.IsPaused() is
 // unconditionally true in that state — until the application calls
 // ReportSnapshot. Nothing here ever did, in either transport, and raft's own
@@ -780,7 +780,7 @@ type SnapshotStat struct {
 // below and passes with it.
 //
 // WHAT IS AND IS NOT CLAIMED. The mechanism above is proven and matches the
-// shape of all five frozen-clock windows Day 10's checkpoint recorded — one
+// shape of all five frozen-clock windows the chaos checkpoint recorded — one
 // leader, one term, no transitions, nominal quorum, proposals lost. It is NOT
 // established that those five windows were this: they were captured before
 // the raft-view instrumentation existed, so no window has a progress table

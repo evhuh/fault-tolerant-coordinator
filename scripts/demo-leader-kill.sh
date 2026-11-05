@@ -1,5 +1,5 @@
 #!/bin/bash
-# Day 6: a real 3-node Raft cluster. SIGKILL the leader mid-flight; a new one
+# A real 3-node Raft cluster. SIGKILL the leader mid-flight; a new one
 # rebuilds its eval broker from committed state and keeps going.
 source "$(dirname "$0")/common.sh"
 build

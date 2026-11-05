@@ -22,7 +22,7 @@ import (
 // message. A malformed message is dropped, because feeding garbage into the
 // consensus module is how you turn a network fault into a safety violation.
 //
-// Day 8 replaces this with a shim that can drop, delay, and partition on a
+// The simulator replaces this with a shim that can drop, delay, and partition on a
 // seeded schedule. That is why sending goes through a struct rather than a
 // package-level function.
 type Transport interface {
@@ -64,7 +64,7 @@ func newHTTPTransport(selfID uint64, peers map[uint64]string) *httpTransport {
 //
 // A dedicated mux, never http.DefaultServeMux: the global one would panic on
 // double registration the moment two nodes share a process, which is exactly
-// what Day 8's simulator does.
+// what the simulator does.
 func (t *httpTransport) Listen(selfURL string, step func(context.Context, *raftpb.Message) error) error {
 	u, err := url.Parse(selfURL)
 	if err != nil {

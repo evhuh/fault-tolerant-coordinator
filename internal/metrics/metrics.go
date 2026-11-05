@@ -1,6 +1,6 @@
 // Package metrics is the coordinator's Prometheus instrumentation.
 //
-// Day 11's benchmarks need numbers that come from the SERVER rather than from
+// The benchmarks need numbers that come from the SERVER rather than from
 // the load generator, for the reason the roadmap gives about closed-loop
 // clients: a generator can only report what it observed, and what it observed
 // includes itself. Throughput measured as "completed tasks per second at the
@@ -37,7 +37,7 @@ import (
 var commitBuckets = prometheus.ExponentialBuckets(0.001, 2, 14)
 
 // Stall buckets start at 1ms and reach ~16s. The 8-to-31-second Ready-loop
-// stalls Day 10 measured under -race are the reason the top is not 1s: a
+// stalls the chaos checkpoint measured under -race are the reason the top is not 1s: a
 // histogram whose last finite bucket is below the worst observation reports
 // every disaster identically.
 var stallBuckets = prometheus.ExponentialBuckets(0.001, 2, 15)
@@ -113,11 +113,11 @@ var (
 		Help: "Times this node became leader.",
 	})
 
-	// ReadyStall is PHASE-LABELLED, which is the whole value of it. Day 10
-	// found a 133ms stall in snapshot+compact on a healthy disk, and an
+	// ReadyStall is PHASE-LABELLED, which is the whole value of it. The chaos
+	// checkpoint found a 133ms stall in snapshot+compact on a healthy disk, and an
 	// unlabelled stall histogram would have reported that identically to a
-	// blocking call in the apply path — the conflation that cost Day 9 an
-	// afternoon. The phases are raftnode's own: persist, apply, send,
+	// blocking call in the apply path — the conflation that cost the stale-read
+	// hunt an afternoon. The phases are raftnode's own: persist, apply, send,
 	// leadership-change, snapshot+compact, snapshot-in.
 	ReadyStall = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "raft_ready_stall_seconds",

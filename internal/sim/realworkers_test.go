@@ -89,7 +89,7 @@ func TestRealWorkersExecuteThroughTheRealPool(t *testing.T) {
 	t.Logf("TOTAL across three seeds: accepted reports=%d attempt directories=%d", totalOK, totalAttempts)
 }
 
-// THE DAY 8 CHECKPOINT, WITH THE REAL WORKER IN THE LOOP.
+// THE REPRODUCIBILITY CHECKPOINT, WITH THE REAL WORKER IN THE LOOP.
 //
 // This is the gate before anything is built on the seam, and it is the thing
 // most likely to break: three real workers poll, execute and report on their
@@ -99,7 +99,7 @@ func TestRealWorkersExecuteThroughTheRealPool(t *testing.T) {
 // The claim is the same narrow one as always — the same seed drives the same
 // FAULT SCHEDULE, not the same execution. What protects it is that nothing
 // the workers do draws from the fault RNG: their task outcomes are hashed
-// from (seed, step, job, task) at submit time, per the Day 8 rule, and their
+// from (seed, step, job, task) at submit time, per the simulator's rule, and their
 // notices go to WorkerOut rather than into the schedule log.
 //
 // If this is red, the seam is not usable: a failure found with real workers
@@ -138,7 +138,7 @@ func TestSameSeedReproducesTheFaultScheduleWithRealWorkers(t *testing.T) {
 	// and went red on Net.DroppedPartition (63 against 0) — the number of
 	// messages that happened to be in flight when the partition landed, which
 	// is timing and was never part of the claim. Comparing it asserts
-	// identical execution, which the Day 8 checkpoint explicitly does not.
+	// identical execution, which the reproducibility checkpoint explicitly does not.
 	if countsA.NodeKills != countsB.NodeKills ||
 		countsA.NodeRestarts != countsB.NodeRestarts ||
 		countsA.Partitions != countsB.Partitions ||

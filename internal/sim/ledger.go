@@ -14,7 +14,7 @@ import (
 
 // THE EFFECT LEDGER.
 //
-// Day 5's design claims effectively-once EFFECTS over at-least-once DELIVERY,
+// The idempotency design claims effectively-once EFFECTS over at-least-once DELIVERY,
 // and until now nothing tested it. The claim is NOT that a task executes once
 // — several attempts may execute, and the simulator now has real workers so
 // they really do. The claim is that exactly one of them ever has its result
@@ -307,7 +307,7 @@ func (s *Sim) undrained() int {
 
 // stuckTasks describes every non-terminal task, field by field.
 //
-// "2 tasks did not drain" is not a diagnosis, and this day's lesson is that
+// "2 tasks did not drain" is not a diagnosis, and the ledger's lesson is that
 // every healthy-looking aggregate was hiding something that only the per-item
 // columns revealed. A stuck task's STATE is the whole question: PENDING with
 // a live backoff is waiting, PENDING without one is unscheduled, ASSIGNED to
@@ -542,7 +542,7 @@ func (s *Sim) checkLedger() []Violation {
 	}
 
 	// COVERAGE, measured and reported, never asserted on. Both of these are
-	// zeros that mean "the scenario did not happen", and by the Day 9 and 10
+	// zeros that mean "the scenario did not happen", and by the coverage
 	// rule that makes the claim inconclusive for this run rather than
 	// confirmed.
 	if s.ledger.Overlaps == 0 {

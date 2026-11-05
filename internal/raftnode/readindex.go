@@ -4,7 +4,7 @@ package raftnode
 //
 // # What it is for
 //
-// Day 9 found, and a test now pins, that a leader on the minority side of a
+// The stale-read hunt found, and a test now pins, that a leader on the minority side of a
 // partition answers reads from its own state and so serves data that is
 // already stale. The leader believes it leads because nothing told it
 // otherwise — raft only revokes leadership when a higher term shows up, and a
@@ -101,7 +101,7 @@ func (b *readBarrier) forget(tok uint64) {
 // Non-blocking, because it runs ON THE READY LOOP. A waiter that has already
 // given up leaves a buffered channel nobody reads, and blocking here to tell
 // it so would stall the loop — the same shape as the leadership-revocation
-// deadlock Day 8 found.
+// deadlock the simulator found.
 func (b *readBarrier) deliver(tok, index uint64) {
 	b.mu.Lock()
 	ch, ok := b.pending[tok]

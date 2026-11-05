@@ -17,7 +17,7 @@ import (
 // — re-proposing after an ambiguous outcome and minting a second job — is
 // covered for SubmitJob by (clientID, requestID) dedup in the state machine.
 //
-// Day 4 needs a different answer for eval ids, which have no such dedup key
+// Eval ids need a different answer, which have no such dedup key
 // and must therefore be DERIVED from what triggered them.
 //
 // The SOURCE of that randomness is injectable (Config.Rand) for one reason:

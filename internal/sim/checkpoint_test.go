@@ -16,7 +16,7 @@ import (
 	"github.com/evazheng/fault-tolerant-coordinator/internal/hostio"
 )
 
-// THE DAY 10 CHECKPOINT: hours of seeded chaos, with the ledger watching.
+// THE CHAOS CHECKPOINT: hours of seeded chaos, with the ledger watching.
 //
 // BREADTH, NOT DEPTH, and that is a measured decision rather than a
 // preference. A single multi-hour run is not available: maybeSnapshot
@@ -53,9 +53,9 @@ import (
 // Superseded figures: 160 and 200, calibrated at 0.85 and 1.17 per 100
 // run-steps against the REPLACE adversary, which cancelled its own
 // partitions.
-func TestDay10Checkpoint(t *testing.T) {
+func TestChaosCheckpoint(t *testing.T) {
 	if os.Getenv("FTC_CHECKPOINT") != "1" {
-		t.Skip("the Day 10 checkpoint: set FTC_CHECKPOINT=1 (hours, and it must have a quiet host)")
+		t.Skip("the chaos checkpoint: set FTC_CHECKPOINT=1 (hours, and it must have a quiet host)")
 	}
 	out := os.Getenv("FTC_CHECKPOINT_OUT")
 	if out == "" {
@@ -161,7 +161,7 @@ type checkpointRow struct {
 	FsyncAfterWorstUs int64 `json:"fsync_after_worst_us"`
 
 	// THE HOST, NOT JUST ITS DISK. The fsync probe cannot see thermal
-	// throttling, GC pressure or a process that has grown, and Day 10's
+	// throttling, GC pressure or a process that has grown, and the checkpoint's
 	// frozen-clock findings clustered in the last fifth of a 2.5-hour run
 	// while not reproducing per-seed — which is what run-duration effects
 	// look like. StartedAtMs gives position in the run, so a correlation can
@@ -377,7 +377,7 @@ func reportCheckpoint(t *testing.T, rows map[int64]checkpointRow, steps, minOver
 	}
 
 	n := len(seeds)
-	t.Logf("=== DAY 10 CHECKPOINT: %d seeds x %d steps, %s of cumulative run time ===",
+	t.Logf("=== CHAOS CHECKPOINT: %d seeds x %d steps, %s of cumulative run time ===",
 		n, steps, (time.Duration(wallMs) * time.Millisecond).Round(time.Second))
 	// WHICH RUN IS THIS, AND WHAT DID IT READ. Say it in the report itself,
 	// not only in the shell that launched it: the report is what gets pasted
@@ -520,7 +520,7 @@ func envInt(t *testing.T, name string, def int) int {
 // hostDriftTable shows the host probes against position in the run, in
 // quarters, with the findings counted per quarter.
 //
-// It exists because Day 10's four frozen-clock findings landed at seeds 23,
+// It exists because the checkpoint's four frozen-clock findings landed at seeds 23,
 // 50, 58 and 59 — three of them in the last fifth — and did not reproduce
 // when those seeds ran alone. That is the shape of a host degrading over
 // hours rather than a schedule finding a bug, and the two have opposite

@@ -177,7 +177,7 @@ func TestShortRunCompletes(t *testing.T) {
 		res.Faults.Partitions, res.Faults.Heals, res.Jobs, res.Tasks)
 }
 
-// THE DAY 8 CHECKPOINT: a seed reproduces the same fault schedule.
+// THE REPRODUCIBILITY CHECKPOINT: a seed reproduces the same fault schedule.
 //
 // Note precisely what is asserted — the SCHEDULE, not the execution. Two runs
 // of one seed kill the same nodes at the same steps, partition the same
@@ -249,7 +249,7 @@ func TestSameSeedReproducesTheFaultSchedule(t *testing.T) {
 	t.Logf("seed 1234 schedule:\n%s", scheduleA)
 }
 
-// A sweep of seeds, each short. This is the shape Day 10 scales up: breadth
+// A sweep of seeds, each short. This is the shape the chaos checkpoint scales up: breadth
 // across adversaries beats depth on one.
 //
 // Unlike every other test here, this one is a DETECTOR and fails on any kind
@@ -279,8 +279,8 @@ func TestSameSeedReproducesTheFaultSchedule(t *testing.T) {
 //
 // The real remedy is more STEPS per run, not more seeds — 12-step runs are
 // conclusive about 87% of the time against 47% here, because a short run
-// often never rolls a leader partition at all. That is deferred to Day 10,
-// and until then this is a wide-and-shallow detector that says so.
+// often never rolls a leader partition at all. That is left to the chaos
+// checkpoint, and this is a wide-and-shallow detector that says so.
 var (
 	seedSweepRuns       int64 = 16
 	seedSweepMinChecked       = 3
@@ -544,7 +544,7 @@ func TestRunExercisesTheFailurePaths(t *testing.T) {
 // Both judgements measure TIME against a compressed election timeout. A
 // host-io stall says that timescale was not valid in this run, so a
 // "stalled 2m43s in send" from the same run cannot be charged to the system
-// — it is the pileup behind the disk. Day 10 measured exactly that pair: a
+// — it is the pileup behind the disk. The chaos checkpoint measured exactly that pair: a
 // schedule checkpoint failing on a 2m43s send-phase stall during a sweep
 // whose other runs were recording 13-minute fsyncs.
 //
@@ -557,7 +557,7 @@ func TestStallIsNotAttributableWhenTheHostBrokeThePremise(t *testing.T) {
 		What: "node 3 Ready loop waited 13m21s in persist (host I/O)"}
 
 	// On its own it stays a violation: this is the case worth catching, and
-	// the Day 8 leadership-revocation deadlock presented exactly this way.
+	// the leadership-revocation deadlock presented exactly this way.
 	only, hostIOCount, downgraded := downgradeStallsOnBrokenPremise([]Violation{stall})
 	if len(only) != 1 || only[0].Inconclusive {
 		t.Errorf("a stall in a healthy-disk run must stay a VIOLATION, got %+v", only)

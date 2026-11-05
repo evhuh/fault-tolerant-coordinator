@@ -18,7 +18,7 @@ import (
 //	[4-byte big-endian length][1 type byte][proto payload]
 //
 // Two record types: a log entry, and a HardState. Promoted unchanged from the
-// Day 1 spike — the storage contract etcd/raft requires did not need to
+// raft spike (spike/counter) — the storage contract etcd/raft requires did not need to
 // change to host a coordinator rather than a counter.
 const (
 	recEntry     byte = 1

@@ -1,9 +1,9 @@
 // Command coordinator serves the scheduler API over gRPC.
 //
-// Day 3: one node, no Raft. The StateStore is mutated directly through
-// Coordinator.propose. Day 6 replaces that body with node.Propose() and adds
-// the Ready loop, the peer transport, and NOT_LEADER redirection — this
-// binary grows flags for peers and a data directory then.
+// Without -id it is one node with no Raft, and the StateStore is mutated
+// directly through Coordinator.propose. With -id, propose goes through
+// node.Propose(), and the binary adds the Ready loop, the peer transport,
+// NOT_LEADER redirection, and flags for peers and a data directory.
 package main
 
 import (
@@ -58,8 +58,8 @@ func main() {
 	cfg.Sched.MaxPlanSize = *maxPlanSize
 	cfg.Sched.LeaseTTLMs = leaseTTL.Milliseconds()
 
-	// Raft is opt-in by -id, so the single-node path every earlier day
-	// depended on still works unchanged.
+	// Raft is opt-in by -id, so the single-node path the pre-Raft tests
+	// depend on still works unchanged.
 	raftEnabled := *raftID != 0
 	var peers map[uint64]string
 	var dir string
@@ -120,7 +120,7 @@ func main() {
 		//
 		// Worker reclaim latency is measured from the last heartbeat
 		// RECEIVED, which is `lease_expiry_ms - leaseTTL` in committed state.
-		// Nothing outside the process could read that, so the Day 11 trial
+		// Nothing outside the process could read that, so the reclaim trials
 		// would have had to infer t=0 instead of knowing it.
 		//
 		// Read-only, and on the private listener rather than the client API:
@@ -305,7 +305,7 @@ func main() {
 	gs := grpc.NewServer()
 	schedulerpb.RegisterSchedulerServer(gs, svc)
 
-	// The ticker is the state machine's only clock. On Day 6 it starts on
+	// The ticker is the state machine's only clock. Under Raft it starts on
 	// election and stops on loss, alongside the eval broker and the planner.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

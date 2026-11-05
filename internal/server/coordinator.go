@@ -6,9 +6,9 @@
 // a gRPC server puts N concurrent handler goroutines in front of it, so the
 // serialization has to live here.
 //
-// propose is also the Day 6 seam. Today its body is a direct Apply. On Day 6
-// the body becomes node.Propose() plus a wait for the entry to come back
-// through rd.CommittedEntries — and no caller moves.
+// propose is also the Raft seam. Without Raft its body is a direct Apply;
+// with Raft it is node.Propose() plus a wait for the entry to come back
+// through rd.CommittedEntries — and no caller had to move.
 package server
 
 import (
@@ -30,7 +30,7 @@ import (
 	"github.com/evazheng/fault-tolerant-coordinator/internal/metrics"
 )
 
-// Config carries the timing budget. The defaults are the ones Day 11 has to
+// Config carries the timing budget. The defaults are the ones the benchmarks
 // validate: a worker missing 4 heartbeats loses its lease, and the reclaim is
 // visible within one Tick after that.
 type Config struct {
@@ -120,7 +120,7 @@ func DefaultConfig() Config {
 //
 // It is a switch rather than a constant because the two modes are the
 // evidence for each other. ReadLocal is kept — and kept TESTED — because the
-// Day 9 regression test runs under it and asserts the history is Illegal:
+// stale-read regression test runs under it and asserts the history is Illegal:
 // that is the proof the linearizability checker can still see the bug it was
 // built to find. A checker that only ever runs against the fixed
 // configuration cannot distinguish "correct" from "no longer looking", and a
@@ -132,7 +132,7 @@ const (
 	// ReadLocal serves reads from the leader's own state machine with no
 	// quorum check. Fast, and NOT LINEARIZABLE: a leader on the minority
 	// side of a partition keeps answering from state the cluster has
-	// already moved past. This was the behaviour Day 9 found and it is
+	// already moved past. This was the stale-read behaviour, and it is
 	// retained only as the negative control.
 	ReadLocal ReadMode = iota
 	// ReadIndexBarrier takes a ReadIndex barrier before serving: a quorum
@@ -194,7 +194,7 @@ type Coordinator struct {
 	// schedMu guards these three POINTERS, not the objects behind them.
 	// StartScheduling and StopScheduling run on the Ready-loop goroutine
 	// (leadership changes are delivered from there), while BrokerStats and
-	// Planner are read by RPC handlers and, from Day 11, a metrics endpoint.
+	// Planner are read by RPC handlers and by the metrics endpoint.
 	// Different goroutines, so the pointers need a lock even though nothing
 	// in the current tests happens to exercise both paths at once.
 	schedMu   sync.Mutex
@@ -203,7 +203,7 @@ type Coordinator struct {
 	scheduler *sched.Scheduler
 
 	// Raft. Nil until StartRaft, which keeps the whole stack runnable as a
-	// single node — every test below Day 6 depends on that.
+	// single node — every pre-Raft test depends on that.
 	raft     *raftnode.Node
 	proposer *raftProposer
 	// leaderCtx is alive for exactly as long as this node leads, and
@@ -261,8 +261,9 @@ func (c *Coordinator) nowMs() int64 { return c.now().UnixMilli() }
 
 // propose is the single mutation path. Every gRPC handler funnels through it.
 //
-// Day 6: replace the body with node.Propose(encoded) and block until the
-// entry is applied from rd.CommittedEntries. The signature stays.
+// With Raft it proposes through node.Propose and blocks until the entry is
+// applied from rd.CommittedEntries; without, it applies directly. Callers
+// cannot tell which.
 func (c *Coordinator) propose(cmd *commandpb.Command) (state.Result, error) {
 	if c.raft != nil {
 		// Through consensus: the entry commits, comes back via
@@ -274,9 +275,9 @@ func (c *Coordinator) propose(cmd *commandpb.Command) (state.Result, error) {
 
 // proposeLocal applies directly, with no consensus.
 //
-// This is what propose() was through Day 5, and it stays because the state
-// machine, the scheduler, and every test below Day 6 are meaningful without
-// Raft. Day 6 did not delete the single-node path; it added a second one.
+// This is what propose() was before Raft, and it stays because the state
+// machine, the scheduler, and every pre-Raft test are meaningful without it.
+// Adding Raft did not delete the single-node path; it added a second one.
 func (c *Coordinator) proposeLocal(cmd *commandpb.Command) (state.Result, error) {
 	cmd.Version = c.cfg.CommandVersion
 	c.mu.Lock()
@@ -297,8 +298,8 @@ func (c *Coordinator) proposeLocal(cmd *commandpb.Command) (state.Result, error)
 // identical Result and discard it — that is why the state machine returns
 // EvalTriggers instead of acting on them.
 //
-// Day 6 moves this to the Ready loop, where it runs on committed entries
-// rather than on a direct Apply, guarded by whether this node leads.
+// Under Raft it runs from the Ready loop, on committed entries rather than
+// on a direct Apply, guarded by whether this node leads.
 func (c *Coordinator) afterApply(cmd *commandpb.Command, res state.Result) {
 	broker := c.brokerRef()
 	if broker == nil {
@@ -398,9 +399,9 @@ func (c *Coordinator) Snapshot() *state.Snapshot {
 func (c *Coordinator) ReadState(fn func(s *state.StateStore)) { c.read(fn) }
 
 // read runs fn under the same lock as propose. Every read of the store goes
-// through it, so there is one place to change on Day 6 if reads need a
-// ReadIndex barrier (see Day 9: a partitioned leader serving local reads is a
-// linearizability violation, and this is where the fix would land).
+// through it, so there was one place to change when reads needed a
+// ReadIndex barrier (a partitioned leader serving local reads is a
+// linearizability violation). Client reads now go through readClient.
 func (c *Coordinator) read(fn func(s *state.StateStore)) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -410,7 +411,7 @@ func (c *Coordinator) read(fn func(s *state.StateStore)) {
 // readClient serves a CLIENT read, taking whatever barrier ReadMode requires
 // before touching local state.
 //
-// This is where Day 9's decision landed, and the split from read() is the
+// This is where the stale-read fix landed, and the split from read() is the
 // important part. read() is the local, unbarriered accessor, and it still has
 // callers that must stay local: the invariant checker reads FOLLOWERS to
 // compare replicas, and the worker RPCs read state they are about to propose
@@ -425,7 +426,7 @@ func (c *Coordinator) read(fn func(s *state.StateStore)) {
 // The barrier runs OUTSIDE c.mu. Holding the apply lock across a quorum
 // round-trip would block every proposal on the node — including the
 // heartbeats the barrier itself is waiting for, which is a deadlock of
-// exactly the shape Day 8 found in leadership revocation.
+// exactly the shape the simulator found in leadership revocation.
 func (c *Coordinator) readClient(ctx context.Context, fn func(s *state.StateStore)) error {
 	if c.cfg.ReadMode == ReadIndexBarrier {
 		if err := c.readBarrier(ctx); err != nil {
@@ -468,10 +469,10 @@ func (c *Coordinator) readBarrier(ctx context.Context) error {
 
 // RunTicker proposes Tick{nowMs} until ctx is cancelled. It is the ONLY
 // producer of time inside the state machine: lease expiry reads the timestamp
-// carried in the committed entry, never time.Now(), so on Day 6 every replica
+// carried in the committed entry, never time.Now(), so under Raft every replica
 // expires the same leases at the same log position.
 //
-// Day 6 moves this under establishLeadership/revokeLeadership. Two leaders
+// Under Raft it runs under establishLeadership/revokeLeadership. Two leaders
 // ticking concurrently is exactly the split-brain that stopping cleanly
 // prevents.
 func (c *Coordinator) RunTicker(ctx context.Context) {
@@ -504,7 +505,7 @@ func (c *Coordinator) RunTicker(ctx context.Context) {
 		// A frozen state-machine clock has two causes that look the same from
 		// outside — ticks that never commit, and ticks that commit without
 		// advancing anything because their timestamp was clamped — and the
-		// cumulative failure counter could not tell them apart. Day 10's
+		// cumulative failure counter could not tell them apart. The chaos
 		// checkpoint printed that counter next to a six-step frozen-clock
 		// condition as though it measured the window; it measures the node's
 		// lifetime. See noteTick.
@@ -606,7 +607,7 @@ func evalReasonToProto(r state.EvalReason) commandpb.EvalTrigger {
 }
 
 // ---------------------------------------------------------------------------
-// Leader-only lifecycle. Day 6 calls these from establishLeadership and
+// Leader-only lifecycle. Raft calls these from establishLeadership and
 // revokeLeadership; stopping cleanly is what prevents split-brain scheduling.
 // ---------------------------------------------------------------------------
 

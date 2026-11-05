@@ -1,5 +1,5 @@
 #!/bin/bash
-# Day 3 checkpoint, part 1: 100 tasks across 3 workers all complete.
+# Single-node checkpoint, part 1: 100 tasks across 3 workers all complete.
 source "$(dirname "$0")/common.sh"
 build
 start_coordinator

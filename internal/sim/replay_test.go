@@ -5,7 +5,7 @@ package sim
 // A DriveWindow run is not reproducible from its seed: the injection has to
 // find the current leader and defers when there is none, so the step it lands
 // on and the node it hits depend on timing. That is a real weakening of the
-// Day 8 checkpoint and the reason Result.Window exists — the seed reproduces
+// reproducibility checkpoint and the reason Result.Window exists — the seed reproduces
 // the adversary's INTENT, the plan reproduces its REALIZATION.
 //
 // This pins the part that must hold: feeding a realized plan back produces

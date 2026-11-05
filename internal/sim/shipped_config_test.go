@@ -6,7 +6,7 @@ package sim
 // turn them off. The risk they carry is not that they are wrong but that
 // they are reachable: an option disabled by accident in a default, or
 // exposed as a flag someone sets in production, would silently restore the
-// behaviour the Day 9 work removed. Nothing in cmd/ exposes them, and this
+// behaviour the stale-read fix removed. Nothing in cmd/ exposes them, and this
 // pins the defaults so a future edit cannot quietly flip one.
 
 import (

@@ -14,7 +14,7 @@ import (
 	"github.com/evazheng/fault-tolerant-coordinator/internal/server"
 )
 
-// longRunConfig is the configuration proposed for the Day 10 checkpoint, and
+// longRunConfig is the configuration proposed for the chaos checkpoint, and
 // the one the calibration sweep measures at a tenth of the length.
 //
 // THE WORKLOAD HAS TO BE SUSTAINABLE, which the sweep configuration is not.

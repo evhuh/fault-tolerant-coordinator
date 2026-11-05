@@ -38,7 +38,7 @@ killed_at=$(python3 -I -c 'import time;print(int(time.time()*1000))')
 bad "killed node $LEAD (pid $PID) — the cluster is now 2 of 3"
 
 # t=1 is the first assignment dispatched by the NEW leader, which is the
-# quantity the Day 11 trials measured. Polled, so it carries the poll's
+# quantity the failover trials measured. Polled, so it carries the poll's
 # resolution; and read from the new leader by name, because the counter is
 # per-process and starts at zero when it wins the election.
 say "== 4. waiting for a survivor to lead and dispatch =="
