@@ -486,7 +486,7 @@ type StateStore struct {
 	// poll, under the apply lock, 256 pollers at a time: measured as 540-695ms
 	// Ready-loop stalls in apply at 10,000 tasks, with leadership changing 7
 	// to 9 times in a 30-second window. The profile is in
-	// results/2026-10-30-day11-profile/.
+	// results/scale-profile/.
 	tasksByWorker map[string]map[string]struct{}
 }
 
@@ -1563,8 +1563,8 @@ func (s *StateStore) AssignedTaskFor(workerID string) (Task, bool) {
 }
 
 // ErrRequestIDReused means one idempotency key was used for two different
-// submissions. The caller's bug, not a retry: see "Two rules for an
-// idempotency key" in docs/architecture.md.
+// submissions. The caller's bug, not a retry: see "Idempotency keys" in the
+// README.
 var ErrRequestIDReused = errors.New("request id reused for different work")
 
 // submitPayloadHash fingerprints WHAT THE CLIENT ASKED FOR.

@@ -50,58 +50,67 @@ It is a control plane: task *output* never enters the Raft log, only a reference
 ```mermaid
 flowchart LR
     subgraph CLIENT["Client / schedctl / loadgen"]
-        C["SubmitJob<br/>clientID + requestID"]
+        C["SubmitJob · GetJob · ListJobs<br/>clientID + requestID<br/>redirect pool: follow NOT_LEADER,<br/>rotate past a dead node"]
     end
 
     subgraph WORKERS["Workers × N"]
-        WK["subprocess executor<br/>output → worker local disk<br/>idempotent on taskID + attempt"]
+        WK["heartbeat every 500ms<br/>runs each task as a subprocess<br/>env FTC_TASK_ID, FTC_ATTEMPT"]
+        WD[("local disk<br/>taskID / attempt /")]
     end
 
-    subgraph LEADER["Coordinator — LEADER"]
-        GRPC["gRPC server"]
+    subgraph LEADER["Coordinator node — LEADER (1 of 3)"]
+        GRPC["gRPC server<br/>propose(): one funnel for every write<br/>readClient(): ReadIndex, then read"]
 
-        subgraph LO["leader-only — starts on election, stops on loss"]
+        subgraph LO["leader-only — started on election, stopped on loss, rebuilt from committed state"]
             BROKER["EvalBroker<br/>priority queue<br/>DERIVED, NOT REPLICATED"]
             SCHED["Scheduler workers × N<br/>concurrent, share nothing"]
-            PLAN["Planner — single-threaded<br/>optimistic concurrency"]
-            TICK["Tick proposer<br/>every 200ms"]
+            PLAN["Planner — single-threaded<br/>optimistic concurrency<br/>accept / partial / reject"]
+            EVC["Eval creator<br/>EvalTrigger → CreateEval"]
+            TICK["Tick proposer<br/>every 200ms, at once on election"]
         end
 
-        STATE["StateStore<br/>written ONLY by apply"]
-        RAFT["etcd/raft Ready loop<br/>persist → send → apply → Advance"]
-        WAL1[("WAL + snapshots")]
+        RAFT["etcd/raft Ready loop<br/>① persist → ② send → ③ apply → ④ Advance<br/>CheckQuorum + PreVote on"]
+        STATE["StateStore<br/>jobs · tasks · workers · evals · sessions<br/>written ONLY by Apply"]
+        WAL1[("own WAL, fsync per batch<br/>snapshot every 10,000 entries")]
+        OBS["Observability<br/>Prometheus · pprof<br/>debug/workers · debug/tasks"]
     end
 
     subgraph FOLLOWERS["Followers × 2 — same binary, leader-only parts idle"]
         RAFT2["etcd/raft"]
         STATE2["StateStore"]
-        WAL2[("WAL")]
+        WAL2[("own WAL")]
     end
 
     C -->|gRPC| GRPC
     GRPC -.->|"NOT_LEADER + leader address"| C
-    WK -->|"RequestTask long-poll, Heartbeat, ReportResult"| GRPC
+    WK -->|"RegisterWorker · Heartbeat<br/>RequestTask long-poll · ReportResult"| GRPC
     GRPC -.->|"assignment rides the long-poll response<br/>the coordinator NEVER dials out"| WK
+    WK --> WD
 
-    GRPC ==>|"Propose SubmitJob, CompleteTask, FailTask, RegisterWorker"| RAFT
-    TICK ==>|"Propose Tick{nowMs}<br/>lease expiry reads THIS timestamp"| RAFT
+    GRPC ==>|"Propose SubmitJob, RegisterWorker,<br/>CompleteTask, FailTask"| RAFT
+    TICK ==>|"Propose Tick nowMs<br/>lease expiry reads THIS timestamp"| RAFT
     PLAN ==>|"Propose ApplyPlan<br/>many assignments, one entry"| RAFT
+    EVC ==>|"Propose CreateEval"| RAFT
 
-    RAFT ==>|"CommittedEntries → apply<br/>THE ONLY WRITER"| STATE
+    RAFT -->|"① persist BEFORE send"| WAL1
+    RAFT <==>|"② replicate: entries, snapshots ⇄ acks"| RAFT2
+    RAFT ==>|"③ CommittedEntries → Apply<br/>THE ONLY WRITER"| STATE
 
-    STATE -->|"pending evaluations"| BROKER
+    STATE -->|"EvalTriggers, leader acts on them"| EVC
+    STATE -->|"committed evals enqueue<br/>rebuilt by scanning PENDING on election"| BROKER
     BROKER -->|"dequeue by priority"| SCHED
-    STATE -.->|"snapshot — read-only, concurrent"| SCHED
+    STATE -.->|"immutable snapshot"| SCHED
     SCHED -->|"Plan: assignments + stops"| PLAN
     STATE -.->|"verify against CURRENT state"| PLAN
+    GRPC -.->|"ReadIndex barrier, client reads only"| RAFT
+    GRPC -.->|reads| STATE
+    STATE -.-> OBS
 
-    RAFT <==>|"replicate + acks"| RAFT2
-    RAFT --> WAL1
     RAFT2 --> WAL2
     RAFT2 ==>|apply| STATE2
 ```
 
-**Heavy arrows are the mutation path**, and every one converges on raft; exactly one leaves it into the `StateStore`.
+**Thick arrows are the mutation path**, and every one converges on raft; exactly one leaves it into the `StateStore`.
 That single-writer property is the load-bearing invariant of the whole design.
 
 **Dashed arrows are reads**, and two of them matter: scheduler workers read a *snapshot*, which is what lets N of them run concurrently touching nothing shared, and the planner reads *current* state to verify a plan built against a possibly-stale one.
@@ -114,7 +123,49 @@ That second read is the optimistic-concurrency check.
 **The subtlest constraint in the system:** the apply path runs on every replica and must be deterministic, so it cannot read the wall clock.
 Lease expiry is therefore driven by a timestamp the leader writes into the log itself, as a `Tick` command.
 
-Full design notes, including the command set, the task state machine and every decision's reasoning, are in [docs/architecture.md](docs/architecture.md).
+### The task state machine
+
+```mermaid
+stateDiagram-v2
+    [*] --> PENDING : SubmitJob
+    PENDING --> InFlight : ApplyPlan · Attempt := N+1
+    state "IN FLIGHT — holds a lease" as InFlight {
+        [*] --> ASSIGNED
+        ASSIGNED --> RUNNING : a heartbeat lists it in running_task_ids
+    }
+    InFlight --> COMPLETE : CompleteTask, live attempt only
+    InFlight --> PENDING : FailTask retryable, attempts left · sets NotBeforeMs backoff
+    InFlight --> PENDING : Tick, lease lapsed or worker LOST, attempts left · no backoff
+    InFlight --> FAILED : FailTask not retryable or exhausted · Tick, lease lapsed at Max
+    COMPLETE --> [*]
+    FAILED --> [*]
+```
+
+- **`Attempt` is a dispatch counter, and only `ApplyPlan` increments it.** That is what makes a slow worker's late report detectably stale rather than a duplicate.
+- **`COMPLETE` and `FAILED` are terminal.** A retryable failure goes straight back to `PENDING` and never passes through `FAILED`; every later report for a terminal task is a no-op on every replica.
+- **Failure backs off; lease expiry does not.** A failed task may be crash-looping, so it waits out an exponential, deterministically jittered `NotBeforeMs` (capped at 30s), and `Tick` emits a `BACKOFF_ELAPSED` eval when it passes. A reclaimed task never got its chance, and the reclaim budget has no room for a delay.
+- **Every path back to `PENDING` respects the attempt budget**, or a capped task would be pending and undispatchable forever.
+- **Job state is derived, never set:** `RUNNING` on the first assignment, then `COMPLETE`, or `FAILED` if any task failed, once every task is terminal.
+
+### The command set
+
+Every state mutation is one of seven commands, and the `oneof` in `proto/command.proto` makes the set closed:
+
+```
+SubmitJob{clientID, requestID, jobID, tasks[], priority, createdMs}
+CreateEval{evalID, jobID, priority, triggeredBy, createdMs}
+ApplyPlan{evalID, assignments[], stops[]}
+CompleteTask{taskID, attempt, workerID, resultRef, exitCode, completedMs}
+FailTask{taskID, attempt, workerID, err, retryable, exitCode, failedMs}
+RegisterWorker{workerID, registeredMs, leaseExpiryMs, runningTaskIDs[], capacity}
+Tick{nowMs}
+```
+
+**An RPC is a request; a command is a decided fact.** A client's `SubmitJobRequest` carries no job id: the leader assigns ids, timestamps and any other nondeterministic value, then proposes a command containing them, because `Apply` must reach the same answer on every replica.
+There is no `Heartbeat` command — renewal is re-registration through `RegisterWorker` — and `RequestTask` writes nothing, because it only delivers a decision an `ApplyPlan` already committed.
+
+**When a command's meaning changes, it gets a version**, and each entry replays under the rules of the version it was written with: `ApplyPlan` went from all-or-nothing to deterministic partial apply (version 2), lease renewal started following the worker's claim (3), and dedup sessions gained a payload hash (4).
+A node that meets an entry from a newer build halts before applying it, because a divergent replica is the one failure here with no recovery.
 
 ---
 
@@ -168,7 +219,7 @@ job-7fdaa9ae6623a426  COMPLETE  tasks=24  pending=0 assigned=0 running=0 complet
 24 task(s) terminal, 24 submitted — nothing lost, nothing duplicated
 ```
 
-*One trial on one host, pasted as it ran.* The distribution is **p50 1441ms / p95 2090ms / max 2584ms over 55 trials** in [results/2026-11-01-day11-reclaim-failover/](results/2026-11-01-day11-reclaim-failover/); a single 1109ms observation is not the number to quote.
+*One trial on one host, pasted as it ran.* The distribution is **p50 1441ms / p95 2090ms / max 2584ms over 55 trials** in [results/reclaim-failover/](results/reclaim-failover/); a single 1109ms observation is not the number to quote.
 
 #### A worker dies mid-task
 
@@ -194,7 +245,7 @@ reclaimed in 2087ms, redispatched in 2087ms — consistent with the ~2250ms budg
 ```
 
 *One trial on one host, pasted as it ran.* Reclaim and redispatch report the same figure because they landed in the same 10ms poll — reassignment follows release by roughly 15ms.
-The distribution is **p50 2121ms / p95 2217ms / max 2246ms over 100 trials** in [results/2026-11-01-day11-reclaim-failover/](results/2026-11-01-day11-reclaim-failover/).
+The distribution is **p50 2121ms / p95 2217ms / max 2246ms over 100 trials** in [results/reclaim-failover/](results/reclaim-failover/).
 
 ---
 
@@ -221,7 +272,7 @@ Host: Apple M3 Pro, 11 cores, go1.26.5, darwin/arm64, **fsync always on** (there
 | Synchronous snapshot, worst observed | 133ms at 1,601KB | 64 simulator seeds | stall threshold 125ms | An **fsync tail**, not state size: serialization is ~6.5ms/MB, so 1.6MB accounts for ~10ms. Two worst-case observations, not a growth trend |
 | Steady state, no kills | **0 stalls** on all three nodes | 10 minutes, 27,000 task records | shipped default | Establishes that there is no unexplained steady-state apply stall: every real-cluster stall recorded here traces to restart replay or the snapshot fsync tail |
 
-Raw rows, harnesses and per-run READMEs: [results/2026-10-30-day11-batching/](results/2026-10-30-day11-batching/), [results/2026-10-30-day11-profile/](results/2026-10-30-day11-profile/), [results/2026-11-01-day11-reclaim-failover/](results/2026-11-01-day11-reclaim-failover/).
+Raw rows, harnesses and per-run READMEs: [results/plan-batching/](results/plan-batching/), [results/scale-profile/](results/scale-profile/), [results/reclaim-failover/](results/reclaim-failover/).
 
 ### The two findings the benchmarks produced
 
@@ -242,12 +293,26 @@ Compaction **bounds** this and does not remove it: under the shipped 10,000 the 
 ## Verification
 
 Three tiers, each checking something the cheaper ones structurally cannot.
-The table of which property is checked by which tier is in [docs/architecture.md](docs/architecture.md#which-safety-properties-are-checked-and-when); the point of keeping it is to prevent believing Porcupine covered something only a per-step invariant looked at.
+Which property each tier checks, so nobody believes Porcupine covered something only a per-step invariant looked at:
+
+| Property | Per-step invariants | Convergence | Porcupine | Effect ledger |
+|---|---|---|---|---|
+| A task holds at most one worker | ✅ | | | ✅ |
+| Attempt never exceeds `MaxAttempts` | ✅ | | | ✅ |
+| `COMPLETE` implies a result ref | ✅ | | | ✅ |
+| Job state agrees with its tasks | ✅ | | | ✅ |
+| Replicas agree at the same applied index | | ✅ | | ✅ |
+| The Ready loop never blocks on its own goroutine | ✅ | | | ✅ |
+| Client operations are linearizable; no stale read | | | ✅ | |
+| Exactly one committed effect per task | | | | ✅ |
+| Two workers executing one task (measured, not asserted) | | | | ✅ |
+
+The per-step checks read coordinator state, so they see only what the state machine believes; linearizability is a property of the history of client operations, and effects happen on worker disks.
 
 ### The Day 10 checkpoint — 64 seeds × 600 steps
 
 Commit `e633366`, against the additive-isolation adversary, 2h47m38s of cumulative run time.
-Full record and per-seed rows: [results/2026-10-30-checkpoint-additive/](results/2026-10-30-checkpoint-additive/).
+Full record and per-seed rows: [results/chaos-checkpoint/](results/chaos-checkpoint/).
 
 ```
 FAULTS INDUCED: 1770 kills, 1770 restarts, 7986 partitions, 3063 leader partitions, 3587 heals
@@ -362,6 +427,14 @@ The rejection is definitive — nothing was created, and retrying cannot help �
 
 The verification is the most valuable part of this project, which is exactly why its limits are stated rather than left to be discovered.
 
+**The limits, in one paragraph.**
+Correct and stall-free to at least 150,000 tasks, usefully fast to about 50,000.
+Failover is ~1.4s p50 on the shipped configuration, and that figure is **bounded by log compaction, not made safe by it**: a restarting node applies its backlog inside the Ready loop and can neither vote nor acknowledge for the whole window — 6.3 seconds for ~23,500 entries with compaction disabled.
+Snapshots are synchronous and expose the Ready loop to disk tail latency.
+Every "max" is an observed worst case from a finite trial count on one host, never a bound.
+One simulator red remains attributed to host degradation by rate comparison, with no mechanism found and none claimed.
+The subsections below are the detail behind each sentence.
+
 **Seeded fault injection is not deterministic simulation testing.**
 Faults are injected **between steps, not mid-apply**: the simulator kills, restarts, partitions, drops, delays, corrupts and pauses, but it cannot stop a node halfway through applying an entry, because the state machine has no such hook.
 Time is compressed rather than virtualized, so the runs are sensitive to the host — which is why every checkpoint brackets itself with fsync and CPU probes and refuses to quote rates from a run whose host broke the premise.
@@ -390,7 +463,16 @@ Worker reclaim's 2246ms worst case sits at the edge of its own ~2250ms budget, w
 A `ready-loop-stall` violation appeared on one simulator seed 2 times in 9 runs on a host six hours into benchmarking, and then 0 times in 40 interleaved runs on a rested one — a 0.65% outcome at the observed rate, which is why it is attributed to host degradation **by rate comparison, with no mechanism claimed**.
 CPU contention is specifically *not* implicated: scheduler overshoot overlapped between the two hosts (242µs failing, 139–274µs passing). The clear differences were fsync mean 5.9ms versus ≤3.85ms, and hours of sustained prior load.
 
-**Known gaps are listed, not hidden.** [docs/architecture.md § Known gaps carried forward](docs/architecture.md#known-gaps-carried-forward) carries the full list, including the unbounded snapshot, the `ApplyPlan` stop that does not respect the attempt budget, and the eval broker's over-broad unblock.
+**Known gaps are listed, not hidden.**
+
+- **Snapshots are synchronous and unbounded.** `maybeSnapshot` serializes, fsyncs and compacts inside the Ready loop, and the whole state is one message held in memory twice. The fix is to move apply off the Ready loop, as etcd does, which also removes restart replay's cost.
+- **Terminal tasks are never collected**, so state grows with throughput. A retention policy has to outlive `GetJob` readers, the dedup sessions that name those tasks, and the linearizability model.
+- **Plan size saturates near 7** because every completion re-plans its own job; eval coalescing (one pending eval per job) is the follow-up.
+- **The scheduler's per-plan scans dominate beyond ~50,000 tasks**: an in-flight index and a cheaper planning snapshot would fix it.
+- **An `ApplyPlan` stop does not respect the attempt budget.** Latent: nothing emits stops.
+- **`Unblock` releases every blocked eval**, not only the one a freed slot suits.
+- **`proposalTimeout` is 5s against a 1s election timeout.** Safe, because `applyPlan` rejects an expired lease, but tighter would be better.
+- **No cluster membership changes; the simulator never kills below quorum; faults land between steps, never mid-apply.**
 
 ---
 
@@ -410,7 +492,4 @@ CPU contention is specifically *not* implicated: scheduler overshoot overlapped 
 | `internal/server` | gRPC service, raft wiring, coordinator lifecycle |
 | `proto/` | three independently versioned schemas: API, log commands, snapshots |
 | `demos/` | the two failure demos and their cluster harness |
-| `docs/writeup.md` | the four problems that were actually hard, read once, start to finish |
-| `docs/architecture.md` | the design, decision by decision, with what each one cost |
-| `docs/roadmap.md` | how it was built, day by day, including what each day got wrong |
 | `results/` | every quoted number, with its rows, its harness and its run-stamped README |

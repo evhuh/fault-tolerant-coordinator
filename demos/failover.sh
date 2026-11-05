@@ -7,7 +7,7 @@
 #
 # What it deliberately does NOT claim: the timing printed here is one trial on
 # one host. The measured distribution is 1441ms p50 / 2090ms p95 over 55
-# trials, in results/2026-11-01-day11-reclaim-failover/.
+# trials, in results/reclaim-failover/.
 
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
@@ -93,4 +93,4 @@ else
   bad "$total terminal against $TASKS submitted"
   exit 1
 fi
-note "one trial on one host; the distribution is in results/2026-11-01-day11-reclaim-failover/"
+note "one trial on one host; the distribution is in results/reclaim-failover/"

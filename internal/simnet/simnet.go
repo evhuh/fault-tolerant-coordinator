@@ -203,7 +203,6 @@ func (n *Network) Transport(id uint64) raftnode.Transport {
 // mean "heal everything", and letting that spelling survive as a silent no-op
 // would convert any missed call site into an adversary that never partitions
 // anything — a strictly quieter run that still reports its fault counts.
-// See "Partition semantics" in docs/architecture.md.
 func (n *Network) Partition(ids ...uint64) {
 	if len(ids) == 0 {
 		panic("simnet: Partition() with no ids; use HealAll to release everything")

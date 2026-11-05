@@ -250,7 +250,7 @@ func (c *Coordinator) applyCommitted(index uint64, data []byte) {
 	// Halting alone is also what frees the ROLLOUT ORDER. A build that stops
 	// on a version it does not know can be upgraded in any order, because
 	// the worst case is a node that refuses to continue — loud, local, and
-	// recoverable by upgrading it. See architecture.md.
+	// recoverable by upgrading it.
 	if v := cmd.GetVersion(); v > state.CommandVersionCurrent {
 		c.fatal(fmt.Errorf("committed entry at command version %d, this build understands %d: "+
 			"halting rather than guessing at its meaning", v, state.CommandVersionCurrent))

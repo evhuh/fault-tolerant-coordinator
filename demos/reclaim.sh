@@ -95,4 +95,4 @@ if [ -n "$reassigned" ]; then
 else
   warn "reclaimed in ${released}ms; no redispatch observed (the task may have exhausted its attempts, which is lawful)"
 fi
-note "one trial on one host; 100-trial percentiles are in results/2026-11-01-day11-reclaim-failover/"
+note "one trial on one host; 100-trial percentiles are in results/reclaim-failover/"

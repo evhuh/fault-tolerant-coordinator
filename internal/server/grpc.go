@@ -310,8 +310,8 @@ func (s *Service) RequestTask(ctx context.Context, req *schedulerpb.RequestTaskR
 // worker's capacity rather than by the size of the cluster's task map. It used
 // to sort EVERY task id in the store, on every pass of the long poll, under
 // the apply lock — 540-695ms Ready-loop stalls in apply at 10,000 tasks with
-// 256 pollers. See "No O(state) work under the apply lock on an RPC path" in
-// docs/architecture.md.
+// 256 pollers. The rule it produced: no O(state) work under the apply lock on
+// an RPC path.
 //
 // The index returns ids SORTED, so the answer never depends on map iteration
 // order. A worker holding several tasks (capacity > 1) gets the lowest-sorted
